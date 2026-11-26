@@ -1,0 +1,19 @@
+
+# cargo-vet audits file
+
+[criteria.agent-safe-to-deploy]
+description = """
+Reviewed by an AI coding agent (not a human auditor) to the safe-to-deploy standard:
+no serious security vulnerability to production software exposed to untrusted input.
+Does not imply built-in safe-to-deploy, so downstream importers opt in explicitly via criteria-map.
+"""
+implies = "agent-safe-to-run"
+
+[criteria.agent-safe-to-run]
+description = """
+Reviewed by an AI coding agent (not a human auditor) to the safe-to-run standard:
+safe to compile and run in development, test, or build environments.
+Does not imply built-in safe-to-run, so downstream importers opt in explicitly via criteria-map.
+"""
+
+[audits]

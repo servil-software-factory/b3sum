@@ -1,13 +1,14 @@
 #!/bin/sh
-# Install hash-verified CI binaries (cargo-nextest 0.9.152, cargo-c 0.10.26)
-# into ${DEST:-${CARGO_HOME:-$HOME/.cargo}/bin}, dropping third-party
-# installer actions.
+# Install hash-verified CI binaries (cargo-nextest 0.9.152, cargo-c 0.10.26,
+# cargo-deny 0.22.0, cargo-vet 0.10.4) into ${DEST:-${CARGO_HOME:-$HOME/.cargo}/bin},
+# dropping third-party installer actions.
 #
-#     sh tools/ci-tools.sh nextest [cargo-c]
+#     sh tools/ci-tools.sh nextest [cargo-c] [cargo-deny] [cargo-vet]
 set -eu
 DEST=${DEST:-"${CARGO_HOME:-$HOME/.cargo}/bin"}
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 if [ "$#" -eq 0 ]; then
-  echo "usage: sh tools/ci-tools.sh nextest|cargo-c ..." >&2
+  echo "usage: sh tools/ci-tools.sh nextest|cargo-c|cargo-deny|cargo-vet ..." >&2
   exit 2
 fi
 
@@ -20,6 +21,16 @@ verify_sha256() {
     shasum -a 256 -c "$sum"
   else
     sha256sum -c "$sum"
+  fi
+}
+
+verify_blake3() {
+  expected=$1
+  file=$2
+  actual=$(python3 "$SCRIPT_DIR/blake3_ref.py" "$file" | awk '{print $1}')
+  if [ "$actual" != "$expected" ]; then
+    echo "ci-tools: BLAKE3 mismatch for $file: expected $expected, got $actual" >&2
+    exit 1
   fi
 }
 
@@ -87,6 +98,48 @@ install_cargo_c() {
   "$DEST/cargo-cinstall" --version
 }
 
+install_cargo_deny() {
+  ver=0.22.0
+  case "$(uname -sm)" in
+    "Linux x86_64")
+      asset=cargo-deny-${ver}-x86_64-unknown-linux-musl.tar.gz
+      sha=98c56e6a408bfa5c3c60744b6015aaa6aa08f743fdeb88386d06fca035bb1786
+      b3=fae8c1378eb583fa5a13f9b8c6c4250f8c83fdc64acc8377a45ecf10d89a12db
+      ;;
+    *) echo "ci-tools: no cargo-deny binary named for $(uname -sm)" >&2; exit 1 ;;
+  esac
+  archive="$tmp/$asset"
+  curl --proto '=https' --tlsv1.2 -sSfL -o "$archive" \
+    "https://github.com/EmbarkStudios/cargo-deny/releases/download/${ver}/${asset}"
+  verify_sha256 "$sha" "$archive"
+  verify_blake3 "$b3" "$archive"
+  mkdir -p "$DEST"
+  tar -xzf "$archive" -C "$tmp" --strip-components=1 --wildcards '*/cargo-deny'
+  install -m 755 "$tmp/cargo-deny" "$DEST/cargo-deny"
+  "$DEST/cargo-deny" --version
+}
+
+install_cargo_vet() {
+  ver=0.10.4
+  case "$(uname -sm)" in
+    "Linux x86_64")
+      asset=cargo-vet-x86_64-unknown-linux-gnu.tar.xz
+      sha=e367f8ac156208711511274abab0c309e19ed0f11ef2bbe8a7b0294f824cb032
+      b3=aa72ea77963e2134b4b6b36f18ec73645c28c99a0a3ee61595d67ec22411f8d3
+      ;;
+    *) echo "ci-tools: no cargo-vet binary named for $(uname -sm)" >&2; exit 1 ;;
+  esac
+  archive="$tmp/$asset"
+  curl --proto '=https' --tlsv1.2 -sSfL -o "$archive" \
+    "https://github.com/mozilla/cargo-vet/releases/download/v${ver}/${asset}"
+  verify_sha256 "$sha" "$archive"
+  verify_blake3 "$b3" "$archive"
+  mkdir -p "$DEST"
+  tar -xJf "$archive" -C "$tmp" --strip-components=1 --wildcards '*/cargo-vet'
+  install -m 755 "$tmp/cargo-vet" "$DEST/cargo-vet"
+  "$DEST/cargo-vet" --version
+}
+
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 
@@ -94,6 +147,8 @@ for tool in "$@"; do
   case "$tool" in
     nextest) install_nextest ;;
     cargo-c) install_cargo_c ;;
-    *) echo "ci-tools: unknown tool $tool (nextest, cargo-c)" >&2; exit 2 ;;
+    cargo-deny) install_cargo_deny ;;
+    cargo-vet) install_cargo_vet ;;
+    *) echo "ci-tools: unknown tool $tool (nextest, cargo-c, cargo-deny, cargo-vet)" >&2; exit 2 ;;
   esac
 done
