@@ -35,14 +35,12 @@ fn git(dir: &Path, args: &[&str], index: Option<&Path>) -> Option<String> {
     out.status.success().then(|| String::from_utf8_lossy(&out.stdout).trim().to_owned())
 }
 
-/// The build version of the version crate at `krate`, whose source version
-/// is `version`, and the paths whose change changes it (for
-/// rerun-if-changed).
+/// The build version of this standalone crate at `krate` (the repository
+/// root), whose source version is `version`, and the paths whose change
+/// changes it (for rerun-if-changed).
 pub fn build_version(krate: &Path, version: &str, scratch: &Path) -> (String, Vec<PathBuf>) {
     let package = || (from_package_info(krate, version), vec![krate.join(".cargo_vcs_info.json")]);
-    let Some(dir) = krate.parent() else {
-        return package();
-    };
+    let dir = krate;
     // Everything Git is asked once, in one process: each costs a few ms,
     // paid on every edit.
     let Some(answers) = git(dir, &["rev-parse", "--show-toplevel", "--git-dir", "--git-common-dir", "--git-path", "index", "HEAD", "HEAD^{tree}"], None) else {
