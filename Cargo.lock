@@ -13,6 +13,7 @@ dependencies = [
 [[package]]
 name = "blake3-servil"
 version = "0.11.0+dev"
+source = "git+https://github.com/servil-software-factory/BLAKE3?rev=d332acb52bd38ed2f758087efca2e5d520db7c2d#d332acb52bd38ed2f758087efca2e5d520db7c2d"
 dependencies = [
  "blake3-servil-core",
 ]
@@ -20,6 +21,7 @@ dependencies = [
 [[package]]
 name = "blake3-servil-core"
 version = "0.11.0+dev"
+source = "git+https://github.com/servil-software-factory/BLAKE3?rev=d332acb52bd38ed2f758087efca2e5d520db7c2d#d332acb52bd38ed2f758087efca2e5d520db7c2d"
 dependencies = [
  "blake3-servil-version",
 ]
@@ -27,9 +29,10 @@ dependencies = [
 [[package]]
 name = "blake3-servil-version"
 version = "0.11.0+dev"
+source = "git+https://github.com/servil-software-factory/BLAKE3?rev=d332acb52bd38ed2f758087efca2e5d520db7c2d#d332acb52bd38ed2f758087efca2e5d520db7c2d"
 
 [[package]]
 name = "libc"
-version = "0.2.189"
+version = "0.2.191"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
+checksum = "65cd87c9a6d60536580b316ad985726104730a5151c99845f2490428ef91240a"

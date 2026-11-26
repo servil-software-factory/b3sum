@@ -5,7 +5,7 @@ name = "b3sums"
 version = "0.11.0+dev"
 authors = ["Jack O'Connor <oconnor663@gmail.com>", "John Servil"]
 description = "b3sum, the BLAKE3 command-line hasher, on blake3-servil: the same digests, faster"
-repository = "https://github.com/servil-software-factory/BLAKE3"
+repository = "https://github.com/servil-software-factory/b3sum"
 license = "MIT OR Apache-2.0 OR TGPPL-1.0" # OR BOSL-1.0, see LICENSE-BOSL.txt
 readme = "README.md"
 edition = "2024"
@@ -17,7 +17,7 @@ path = "src/main.rs"
 [features]
 
 [dependencies]
-blake3 = { version = "=0.11.0+dev", path = "../threads", package = "blake3-servil" }
+blake3 = { git = "https://github.com/servil-software-factory/BLAKE3", rev = "d332acb52bd38ed2f758087efca2e5d520db7c2d", package = "blake3-servil" }
 
 # Unix syscalls: memory-mapped reads, direct I/O, io_uring, signals, fstat.
 [target.'cfg(unix)'.dependencies]

@@ -53,6 +53,8 @@ mod direct;
 mod file_end;
 #[cfg(target_os = "linux")]
 mod linux_pipe;
+#[cfg(target_os = "linux")]
+mod numa;
 mod outboard;
 #[cfg(target_os = "linux")]
 mod uring;
@@ -698,19 +700,27 @@ fn hash_path(args: &Args, path: &Path, stdin_ctx: &StdinContext) -> err::Result<
     Ok(output_reader)
 }
 
-pub(crate) const HOLD_PAGES: u64 = 1 << 18;
+const HOLD_PAGES: u64 = 1 << 18;
+static HELD_PAGES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 pub(crate) fn hold(map: mmap::Mmap) {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static HELD: AtomicU64 = AtomicU64::new(0);
+    use std::sync::atomic::Ordering;
     // Sound: a query with no memory argument.
     let page = u64::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).expect("the page size is positive");
     let pages = (map.len() as u64).div_ceil(page);
-    if HELD.fetch_add(pages, Ordering::Relaxed) + pages <= HOLD_PAGES {
+    if HELD_PAGES.fetch_add(pages, Ordering::Relaxed) + pages <= HOLD_PAGES {
         std::mem::forget(map);
     } else {
-        HELD.fetch_sub(pages, Ordering::Relaxed);
+        HELD_PAGES.fetch_sub(pages, Ordering::Relaxed);
     }
+}
+
+/// Reserve all but `remaining_pages` of `HOLD_PAGES` in tests without mapping
+/// a multi-GiB sparse filler (`RLIMIT_AS`-safe on 4 KiB and 64 KiB kernels; #568).
+#[cfg(test)]
+pub(crate) fn set_hold_budget_remaining_for_test(remaining_pages: u64) {
+    assert!(remaining_pages <= HOLD_PAGES);
+    HELD_PAGES.store(HOLD_PAGES - remaining_pages, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// The files this process has mapped (`Args::map`). Atomic so multi-threaded
@@ -828,7 +838,7 @@ fn confine_cli_once() {
     CONFINED.call_once(|| {
         #[cfg(test)]
         CONFINEMENT_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        blake3::__confine_cli_to_one_node();
+        numa::confine_cli_to_one_node();
     });
 }
 
