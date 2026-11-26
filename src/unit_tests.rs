@@ -474,6 +474,7 @@ fn record_oriented_sockets_and_packet_pipes_are_rejected() {
     #[cfg(target_os = "macos")]
     {
         use std::io::{Seek, SeekFrom};
+        use std::os::fd::AsRawFd;
         let dir = crate::tempfile::tempdir().unwrap();
         let path = dir.path().join("abc.txt");
         std::fs::write(&path, b"abc").unwrap();
