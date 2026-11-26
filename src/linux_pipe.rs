@@ -2134,6 +2134,7 @@ mod test {
 
     #[test]
     fn multi_reader_stops_claiming_new_operands_after_sink_closes() {
+        use std::sync::{Arc, Condvar, Mutex};
         blake3::initialize();
         crate::THREADS.set(std::num::NonZeroUsize::new(4).unwrap()).expect("fresh test process");
         let dir = crate::tempfile::tempdir().unwrap();
@@ -2146,15 +2147,33 @@ mod test {
         let mut paths = Vec::with_capacity(256);
         paths.push(head.clone());
         paths.push(head);
-        paths.extend(std::iter::repeat_n(body, 254));
+        paths.extend(std::iter::repeat_n(body.clone(), 254));
+
+        // Hold helper readers on their first `body` open until `on_ordered(0)`
+        // returns `false` so the test deterministically checks cancellation
+        // regardless of runner scheduling speed.
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let gate_hook = Arc::clone(&gate);
+        let body_hook = body.clone();
+        *super::AFTER_OPEN.lock().unwrap() = Some(Box::new(move |p: &std::path::Path| {
+            if p == body_hook {
+                let (lock, cvar) = &*gate_hook;
+                let guard = lock.lock().unwrap();
+                let _ = cvar.wait_timeout_while(guard, std::time::Duration::from_secs(2), |done| !*done);
+            }
+        }));
 
         let args = crate::Args::for_test_plain_threads(paths.clone(), 4);
         super::FILES_CLAIMED.store(0, Ordering::Relaxed);
         let mut emitted = Vec::new();
         super::hash_paths_inner(&args, &paths, None, true, &mut |idx, res| {
             emitted.push((idx, res.unwrap()));
+            let (lock, cvar) = &*gate;
+            *lock.lock().unwrap() = true;
+            cvar.notify_all();
             false
         });
+        *super::AFTER_OPEN.lock().unwrap() = None;
         assert_eq!(emitted, vec![(0, blake3::convenience::hash(&head_data))]);
         let claimed = super::FILES_CLAIMED.load(Ordering::Relaxed);
         assert!(
