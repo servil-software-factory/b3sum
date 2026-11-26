@@ -222,21 +222,16 @@ class Programs(Repository):
     def test_a_program_of_no_such_release_is_not_clean(self):
         self.assertEqual(ra.program_problems(b"\x7fELF b3sums 0.2.0", self.release), [f"holds no build version of {self.version}: not a build of this release"])
 
-    def test_an_archives_libraries_are_each_checked(self):
-        clean = tar_gz({"usr/lib/libb3_servil.so.0.3.0": self.program(), "usr/lib/libb3_servil.a": self.program(), "usr/include/b3.h": b"/* no version */"})
-        self.assertEqual(ra.archive_problems(clean, self.release), [])
-        dirty = tar_gz({"usr/lib/libb3_servil.so.0.3.0": self.program(), "usr/lib/libb3_servil.a": self.program(f".{self.commit}.dirty")})
-        self.assertEqual(len(ra.archive_problems(dirty, self.release)), 1)
-        self.assertTrue(ra.archive_problems(dirty, self.release)[0].startswith("usr/lib/libb3_servil.a: its build version is "))
-        self.assertEqual(ra.archive_problems(tar_gz({"usr/include/b3.h": b""}), self.release), ["holds no library (*.so, *.a, *.dylib)"])
-
     def test_each_kind_goes_to_its_check_and_an_unknown_kind_is_a_problem(self):
         self.assertEqual(ra.problems(f"b3sum-{self.tag}-x86_64-unknown-linux-gnu", self.program(), self.release), [])
-        self.assertEqual(ra.problems("libb3_servil.0.3.0.dylib", self.program(), self.release), [])
         self.assertEqual(ra.problems(f"top-crate-{self.version}.crate", self.crate(""), self.release), [])
-        self.assertEqual(ra.problems("lib.tar.gz", tar_gz({"libb3_servil.a": self.program()}), self.release), [])
         self.assertEqual(len(ra.problems(f"b3sum-{self.tag}-x86_64-unknown-linux-gnu", self.program(".dirty"), self.release)), 1)
-        self.assertEqual(ra.problems("notes.txt", b"", self.release), ["an artifact of a kind this check does not know (a program, a library, a .tar.gz of libraries, a .crate)"])
+        unknown = ["an artifact of a kind this check does not know (a b3sum program, a .crate)"]
+        self.assertEqual(ra.problems("notes.txt", b"", self.release), unknown)
+        # Standalone b3sum ships no C libraries or tarballs; reject them instead of skipping or accepting.
+        self.assertEqual(ra.problems("libb3_servil.0.3.0.dylib", self.program(), self.release), unknown)
+        self.assertEqual(ra.problems("libb3_servil.so.0.3.0", self.program(), self.release), unknown)
+        self.assertEqual(ra.problems("lib.tar.gz", tar_gz({"libb3_servil.a": self.program()}), self.release), unknown)
 
 
 class Releases(Repository):
@@ -432,11 +427,10 @@ class Published(Repository):
                 program + ".sha256": self.digest(program),
                 program + ".b3": self.b3_digest(program),
                 program: self.program(),
-                "lib.tar.gz": tar_gz({"libb3_servil.a": self.program()}),
             })
         )
         self.assertEqual(bad, 0, lines)
-        self.assertEqual(len(lines), 6)
+        self.assertEqual(len(lines), 5)
         self.assertTrue(all(line.startswith("clean      ") for line in lines), lines)
 
     def test_a_digest_file_of_other_bytes_or_of_nothing_here_or_of_another_kind_fails(self):
@@ -541,7 +535,8 @@ class Rebuilt(Gathered):
             name = f"b3sum-{self.tag}-aarch64-unknown-linux-gnu"
             with open(os.path.join(folder, name), "ab") as f:
                 f.write(b"and one byte more")
-            raw = open(os.path.join(folder, name), "rb").read()
+            with open(os.path.join(folder, name), "rb") as f:
+                raw = f.read()
             with open(os.path.join(folder, name + ".sha256"), "w") as f:
                 f.write(f"{hashlib.sha256(raw).hexdigest()}  {name}\n")
             with open(os.path.join(folder, name + ".b3"), "w") as f:
@@ -859,7 +854,275 @@ class Image(unittest.TestCase):
             other += [f"{name}: {line.strip()}" for line in runs if reads not in line]
         self.assertEqual(named, ["tools/b3sum-release.toolchain"])
         self.assertEqual(other, [])
-        self.assertEqual(commands, 5, "two pages, the script's own header, two workflows")
+        self.assertEqual(commands, 4, "README.md, the container script header, ci.yml, release-artifacts.yml")
+
+
+class StandaloneB3sum(unittest.TestCase):
+    """End-to-end checks on a standalone servil-software-factory/b3sum release
+    (one root crate `b3sums` + two Linux target binaries) using the module's
+    unpatched defaults, plus tools/crates-release.sh controls."""
+
+    def setUp(self):
+        scratch = tempfile.TemporaryDirectory()
+        self.addCleanup(scratch.cleanup)
+        self.repo = scratch.name
+        for cmd in (
+            ["init", "-q", "--initial-branch=main"],
+            ["config", "user.name", "A Test"],
+            ["config", "user.email", "test@example.invalid"],
+            ["config", "commit.gpgsign", "false"],
+            ["config", "core.hooksPath", os.path.join(self.repo, "no-hooks")],
+        ):
+            subprocess.run(["git", "-C", self.repo, *cmd], check=True, capture_output=True)
+        self.write(
+            "Cargo.toml",
+            '[package]\nname = "b3sums"\nversion = "0.12.0+dev"\nedition = "2024"\n'
+            'description = "test"\nlicense = "MIT"\n\n'
+            '[[bin]]\nname = "b3sum"\npath = "src/main.rs"\n',
+        )
+        self.write("src/main.rs", "fn main() {}\n")
+        self.write("README.md", "# b3sum\n")
+        self.git("add", ".")
+        self.git("commit", "-qm", "code")
+        self.code = self.git("rev-parse", "HEAD")
+        self.version = "0.12.0+" + self.code
+        self.write("Cargo.toml", self.read("Cargo.toml").replace("0.12.0+dev", self.version))
+        self.git("commit", "-qam", "Version " + self.version)
+        self.commit = self.git("rev-parse", "HEAD")
+        self.tag = "v" + self.version
+        self.git("tag", self.tag)
+        self.release = ra.Release(self.tag, self.repo)
+
+    def git(self, *args):
+        return subprocess.run(["git", "-C", self.repo, *args], check=True, capture_output=True, text=True).stdout.strip()
+
+    def write(self, path, text):
+        full = os.path.join(self.repo, path)
+        os.makedirs(os.path.dirname(full), exist_ok=True)
+        with open(full, "w", encoding="utf-8") as f:
+            f.write(text)
+
+    def read(self, path):
+        with open(os.path.join(self.repo, path), encoding="utf-8") as f:
+            return f.read()
+
+    def _crate_bytes(self):
+        prefix = f"b3sums-{self.version}"
+        return tar_gz({
+            f"{prefix}/.cargo_vcs_info.json": json.dumps({"git": {"sha1": self.commit}, "path_in_vcs": ""}).encode(),
+            f"{prefix}/Cargo.toml.orig": self.release.file("Cargo.toml"),
+            f"{prefix}/Cargo.toml": b"[package]\nname = \"b3sums\"\n",
+            f"{prefix}/Cargo.lock": b"# lock\n",
+            f"{prefix}/src/main.rs": self.release.file("src/main.rs"),
+            f"{prefix}/README.md": self.release.file("README.md"),
+        })
+
+    def _program_bytes(self, target):
+        return b"\x7fELF\0" + target.encode() + b"\0b3sums " + self.version.encode() + b"\0"
+
+    def test_defaults_published_and_named_builders_for_standalone_b3sum(self):
+        self.assertEqual(ra.REPO, "servil-software-factory/b3sum")
+        self.assertEqual(ra.CRATE_DIRS, ("",))
+        self.assertEqual(ra.B3SUM_TARGETS, ("x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"))
+        # Must read [package].name ("b3sums"), never [[bin]].name ("b3sum").
+        self.assertEqual(self.release.crate(""), "b3sums")
+
+        x64 = f"b3sum-{self.tag}-x86_64-unknown-linux-gnu"
+        arm = f"b3sum-{self.tag}-aarch64-unknown-linux-gnu"
+        crate = f"b3sums-{self.version}.crate"
+        self.assertEqual(ra.expected(self.release), [x64, arm, crate])
+        self.assertEqual(
+            ra.expected_program_digests(self.release),
+            [x64 + ".sha256", x64 + ".b3", arm + ".sha256", arm + ".b3"],
+        )
+
+        x64_bytes = self._program_bytes("x86_64-unknown-linux-gnu")
+        arm_bytes = self._program_bytes("aarch64-unknown-linux-gnu")
+        crate_bytes = self._crate_bytes()
+
+        def sidecars(name, data):
+            return {
+                name + ".sha256": f"{hashlib.sha256(data).hexdigest()}  {name}\n".encode(),
+                name + ".b3": f"{ra.blake3_ref.blake3_hex(data)}  {name}\n".encode(),
+            }
+
+        assets = {
+            x64: x64_bytes,
+            **sidecars(x64, x64_bytes),
+            arm: arm_bytes,
+            **sidecars(arm, arm_bytes),
+        }
+        quoted = self.version.replace("+", "%2B")
+        crate_url = f"https://static.crates.io/crates/b3sums/b3sums-{quoted}.crate"
+        api_url = f"https://api.github.com/repos/servil-software-factory/b3sum/releases/tags/v{quoted}"
+        served = {
+            crate_url: crate_bytes,
+            api_url: json.dumps({"assets": [{"name": n, "browser_download_url": "https://github.invalid/" + n} for n in assets]}).encode(),
+            **{"https://github.invalid/" + n: d for n, d in assets.items()},
+        }
+        fetched = []
+
+        def fake_fetch(url):
+            fetched.append(url)
+            if url not in served:
+                raise not_found(url)
+            return served[url]
+
+        builders = ["b3sum-X64=x86_64-unknown-linux-gnu", "b3sum-ARM64=aarch64-unknown-linux-gnu"]
+        with tempfile.TemporaryDirectory() as rebuilt:
+            for folder, prog_name, prog_bytes in (
+                ("b3sum-X64", x64, x64_bytes),
+                ("b3sum-ARM64", arm, arm_bytes),
+            ):
+                bdir = os.path.join(rebuilt, folder)
+                os.mkdir(bdir)
+                for name, data in {prog_name: prog_bytes, **sidecars(prog_name, prog_bytes), crate: crate_bytes, **sidecars(crate, crate_bytes)}.items():
+                    with open(os.path.join(bdir, name), "wb") as f:
+                        f.write(data)
+
+            out = io.StringIO()
+            with patch.object(ra, "fetch", fake_fetch):
+                bad = ra.check(ra.published(self.release), self.release, out=out, rebuilt=rebuilt, builders=builders)
+            self.assertEqual(bad, 0, out.getvalue())
+            # Exact fetch count: 1 crates.io tarball + 1 GitHub API call + 6 GitHub assets.
+            self.assertEqual(len(fetched), 8, fetched)
+            self.assertEqual(fetched[0], crate_url)
+            self.assertEqual(fetched[1], api_url)
+
+            # Planted fault: modifying b3sums.crate in one builder must fail verification.
+            with open(os.path.join(rebuilt, "b3sum-ARM64", crate), "ab") as f:
+                f.write(b"x")
+            out = io.StringIO()
+            with patch.object(ra, "fetch", fake_fetch):
+                bad = ra.check(ra.published(self.release), self.release, out=out, rebuilt=rebuilt, builders=builders)
+            self.assertEqual(bad, 1, out.getvalue())
+            self.assertIn("NOT CLEAN  crates.io: " + crate, out.getvalue())
+
+            # Planted fault: removing b3sums.crate from one builder must fail verification.
+            os.remove(os.path.join(rebuilt, "b3sum-ARM64", crate))
+            out = io.StringIO()
+            with patch.object(ra, "fetch", fake_fetch):
+                bad = ra.check(ra.published(self.release), self.release, out=out, rebuilt=rebuilt, builders=builders)
+            self.assertEqual(bad, 1, out.getvalue())
+            self.assertIn("does not hold this crate", out.getvalue())
+
+    @unittest.skipUnless(shutil.which("cargo") and shutil.which("rustc"), "cargo and rustc required")
+    def test_crates_release_script_packages_reproducibly_and_catches_faults(self):
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        rustc_ver = subprocess.check_output(["rustc", "-V"], text=True).split()[1]
+        with tempfile.TemporaryDirectory() as tmp:
+            for cmd in (
+                ["init", "-q", "--initial-branch=main"],
+                ["config", "user.name", "A Test"],
+                ["config", "user.email", "test@example.invalid"],
+                ["config", "commit.gpgsign", "false"],
+                ["config", "core.hooksPath", os.path.join(tmp, "no-hooks")],
+            ):
+                subprocess.run(["git", "-C", tmp, *cmd], check=True, capture_output=True)
+            os.makedirs(os.path.join(tmp, "src"))
+            os.makedirs(os.path.join(tmp, "tools"))
+            for tool in ("crates-release.sh", "release_artifacts.py", "blake3_ref.py"):
+                shutil.copy2(os.path.join(root, "tools", tool), os.path.join(tmp, "tools", tool))
+            with open(os.path.join(tmp, ".gitignore"), "w", encoding="utf-8") as f:
+                f.write("/target/\n/dist/\n__pycache__/\n!Cargo.lock\n")
+            with open(os.path.join(tmp, "tools", "b3sum-release.toolchain"), "w", encoding="utf-8") as f:
+                f.write(f"rustc {rustc_ver}\n")
+            with open(os.path.join(tmp, "Cargo.toml"), "w", encoding="utf-8") as f:
+                # Put a table with a `version` key before `[package]` to prove
+                # crates-release.sh reads `[package].version` (not first regex match).
+                f.write(
+                    '[package.metadata.note]\nversion = "9.9.9"\n\n'
+                    '[package]\nname = "b3sums"\nversion = "0.12.0+dev"\nedition = "2024"\n'
+                    'description = "test"\nlicense = "MIT"\n\n'
+                    '[[bin]]\nname = "b3sum"\npath = "src/main.rs"\n'
+                )
+            with open(os.path.join(tmp, "src", "main.rs"), "w", encoding="utf-8") as f:
+                f.write("fn main() {}\n")
+            subprocess.run(["cargo", "generate-lockfile", "--manifest-path", os.path.join(tmp, "Cargo.toml")], check=True, capture_output=True)
+            subprocess.run(["git", "-C", tmp, "add", "."], check=True, capture_output=True)
+            subprocess.run(["git", "-C", tmp, "commit", "-qm", "code"], check=True, capture_output=True)
+            code = subprocess.check_output(["git", "-C", tmp, "rev-parse", "HEAD"], text=True).strip()
+
+            # Control 1: non-version commit must fail.
+            bad_head = subprocess.run(["sh", "tools/crates-release.sh", "--no-verify"], cwd=tmp, capture_output=True, text=True)
+            self.assertEqual(bad_head.returncode, 1, bad_head.stderr)
+            self.assertIn("HEAD is no version commit", bad_head.stderr)
+
+            # Stamp version commit (Cargo.toml + Cargo.lock).
+            version = "0.12.0+" + code
+            for rel in ("Cargo.toml", "Cargo.lock"):
+                path = os.path.join(tmp, rel)
+                with open(path, encoding="utf-8") as f:
+                    text = f.read().replace("0.12.0+dev", version)
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(text)
+            subprocess.run(["git", "-C", tmp, "commit", "-qam", "Version " + version], check=True, capture_output=True)
+            commit = subprocess.check_output(["git", "-C", tmp, "rev-parse", "HEAD"], text=True).strip()
+
+            # Control 2: toolchain mismatch in committed toolchain file must fail.
+            with open(os.path.join(tmp, "tools", "b3sum-release.toolchain"), "w", encoding="utf-8") as f:
+                f.write("rustc 0.0.0\n")
+            subprocess.run(["git", "-C", tmp, "commit", "-qam", "wrong toolchain"], check=True, capture_output=True)
+            bad_tc = subprocess.run(
+                ["sh", "tools/crates-release.sh", "--no-verify"],
+                cwd=tmp,
+                env={**os.environ, "RELEASE_ANY_COMMIT": "1"},
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(bad_tc.returncode, 1, bad_tc.stderr)
+            self.assertIn("packaged with exactly that", bad_tc.stderr)
+            subprocess.run(["git", "-C", tmp, "reset", "--hard", commit], check=True, capture_output=True)
+
+            # Dirty working tree edits (reverting [package].version to +dev,
+            # corrupting the toolchain pin, and adding a poisoned caller-only
+            # .cargo/config.toml) must all be ignored because crates-release.sh
+            # runs Cargo inside a fresh staged clone outside the caller's tree.
+            with open(os.path.join(tmp, "Cargo.toml"), encoding="utf-8") as f:
+                dirty_manifest = f.read().replace(version, "0.12.0+dev")
+            with open(os.path.join(tmp, "Cargo.toml"), "w", encoding="utf-8") as f:
+                f.write(dirty_manifest)
+            with open(os.path.join(tmp, "tools", "b3sum-release.toolchain"), "w", encoding="utf-8") as f:
+                f.write("rustc 0.0.0\n")
+            os.makedirs(os.path.join(tmp, ".cargo"), exist_ok=True)
+            with open(os.path.join(tmp, ".cargo", "config.toml"), "w", encoding="utf-8") as f:
+                f.write('[build]\nrustc = "/nonexistent/poison-rustc"\n')
+
+            # Positive run #1: packages clean reproducible .crate + .sha256 + .b3 and self-verifies.
+            ok1 = subprocess.run(["sh", "tools/crates-release.sh", "--no-verify"], cwd=tmp, capture_output=True, text=True)
+            self.assertEqual(ok1.returncode, 0, ok1.stdout + ok1.stderr)
+            crate_name = f"b3sums-{version}.crate"
+            crate_path = os.path.join(tmp, "dist", crate_name)
+            with open(crate_path, "rb") as f:
+                first_bytes = f.read()
+            with open(crate_path + ".sha256", "rb") as f:
+                sha_bytes = f.read()
+            with open(crate_path + ".b3", "rb") as f:
+                b3_bytes = f.read()
+            rel = ra.Release("v" + version, tmp, commit)
+            self.assertEqual(ra.crate_problems(first_bytes, rel), [])
+            self.assertEqual(ra.digest_problems(crate_name + ".sha256", sha_bytes, {crate_name: first_bytes}), [])
+            self.assertEqual(ra.digest_problems(crate_name + ".b3", b3_bytes, {crate_name: first_bytes}), [])
+
+            # Positive run #2: second packaging must match byte for byte (and ignore a shadowed fake cargo on PATH).
+            shutil.rmtree(os.path.join(tmp, "dist"))
+            fake_bin = os.path.join(tmp, "fake-bin")
+            os.mkdir(fake_bin)
+            fake_cargo = os.path.join(fake_bin, "cargo")
+            with open(fake_cargo, "w", encoding="utf-8") as f:
+                f.write("#!/bin/sh\necho 'fake cargo invoked' >&2\nexit 99\n")
+            os.chmod(fake_cargo, 0o755)
+            ok2 = subprocess.run(
+                ["sh", "tools/crates-release.sh", "--no-verify"],
+                cwd=tmp,
+                env={**os.environ, "PATH": fake_bin + os.pathsep + os.environ["PATH"]},
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(ok2.returncode, 0, ok2.stdout + ok2.stderr)
+            with open(crate_path, "rb") as f:
+                second_bytes = f.read()
+            self.assertEqual(first_bytes, second_bytes)
 
 
 if __name__ == "__main__":
