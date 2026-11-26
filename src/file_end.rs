@@ -313,7 +313,11 @@ fn is_verified_darwin_regular_dev_fd(path: &Path) -> bool {
 /// AND file type (`S_IFMT`) as `target` (preserving symlinks, `..`, and trailing
 /// directory requirements), excluding cloning PTY master devices.
 pub(crate) fn path_matches_fd_meta(path: &Path, target: FdMeta) -> bool {
+    use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::MetadataExt;
+    if path.as_os_str().as_bytes().ends_with(b"/") {
+        return false;
+    }
     std::fs::metadata(path).is_ok_and(|meta| {
         let mode_type = meta.mode() & u32::from(libc::S_IFMT);
         #[cfg(target_os = "linux")]
@@ -327,7 +331,11 @@ pub(crate) fn path_matches_fd_meta(path: &Path, target: FdMeta) -> bool {
 /// Whether `path` currently resolves via OS `stat` to a stream matching `stream`
 /// (excluding cloning PTY master devices).
 pub(crate) fn path_matches_stream(path: &Path, stream: StreamId) -> bool {
+    use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::MetadataExt;
+    if path.as_os_str().as_bytes().ends_with(b"/") {
+        return false;
+    }
     std::fs::metadata(path).is_ok_and(|meta| {
         let mode_type = meta.mode() & u32::from(libc::S_IFMT);
         #[cfg(target_os = "linux")]
