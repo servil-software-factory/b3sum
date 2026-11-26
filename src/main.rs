@@ -2064,7 +2064,7 @@ fn main() -> err::Result<()> {
 
 #[cfg(test)]
 mod test {
-    include!("../../tools/require_nextest.rs");
+    include!("../tools/require_nextest.rs");
     use crate::args::{ParseOutcome, parse_from};
 
     #[test]
