@@ -368,6 +368,7 @@ fn cloning_ptmx_is_not_classified_as_stream_alias() {
 
 #[test]
 fn record_oriented_sockets_and_packet_pipes_are_rejected() {
+    blake3::initialize();
     use std::os::fd::FromRawFd;
     // SOCK_STREAM must be accepted.
     let mut sv = [-1 as libc::c_int; 2];
