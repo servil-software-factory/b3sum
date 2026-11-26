@@ -1585,10 +1585,26 @@ fn test_low_nofile_budget_makes_progress_through_ring() {
 fn test_lexical_dev_stdin_does_not_override_os_stat() {
     blake3::initialize();
 
-    // 1. Trailing slash on `/dev/stdin/` must fail (not silently read stdin).
+    // 1. Trailing slash on `/dev/stdin/` must obey OS path resolution (never
+    //    lexically alias `/dev/stdin/` to fd 0 when the OS rejects it). On
+    //    Linux and newer macOS, `open("/dev/stdin/")` fails with ENOTDIR;
+    //    older macOS (15) fdescfs accepts a trailing slash on `/dev/stdin/`.
+    let os_rejects_trailing_slash = cmd!("sh", "-c", "printf from-stdin | (exec < /dev/stdin/) 2>/dev/null")
+        .stdout_capture()
+        .stderr_capture()
+        .unchecked()
+        .run()
+        .unwrap()
+        .status
+        .code()
+        != Some(0);
     let out = cmd!(b3sum_exe(), "/dev/stdin/").stdin_bytes("from-stdin").stdout_capture().stderr_capture().unchecked().run().unwrap();
-    assert_eq!(out.status.code(), Some(1), "trailing slash on /dev/stdin/ must fail");
-    assert!(out.stdout.is_empty(), "stdout={:?}", String::from_utf8_lossy(&out.stdout));
+    if os_rejects_trailing_slash {
+        assert_eq!(out.status.code(), Some(1), "trailing slash on /dev/stdin/ must fail when OS rejects it");
+        assert!(out.stdout.is_empty(), "stdout={:?}", String::from_utf8_lossy(&out.stdout));
+    } else {
+        assert_eq!(out.status.code(), Some(0), "when OS allows /dev/stdin/, b3sum must match OS");
+    }
 
     // 2. Linux/Unix `/dev/fd/7/../../stdin` where fd 7 is a directory two levels
     //    deep: lexical `..` collapses to `/dev/stdin`, while the OS resolves
