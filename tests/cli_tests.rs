@@ -1589,15 +1589,9 @@ fn test_lexical_dev_stdin_does_not_override_os_stat() {
     //    lexically alias `/dev/stdin/` to fd 0 when the OS rejects it). On
     //    Linux and newer macOS, `open("/dev/stdin/")` fails with ENOTDIR;
     //    older macOS (15) fdescfs accepts a trailing slash on `/dev/stdin/`.
-    let os_rejects_trailing_slash = cmd!("sh", "-c", "printf from-stdin | (exec < /dev/stdin/) 2>/dev/null")
-        .stdout_capture()
-        .stderr_capture()
-        .unchecked()
-        .run()
-        .unwrap()
-        .status
-        .code()
-        != Some(0);
+    let os_rejects_trailing_slash =
+        cmd!("sh", "-c", "printf from-stdin | (exec < /dev/stdin/) 2>/dev/null").stdout_capture().stderr_capture().unchecked().run().unwrap().status.code()
+            != Some(0);
     let out = cmd!(b3sum_exe(), "/dev/stdin/").stdin_bytes("from-stdin").stdout_capture().stderr_capture().unchecked().run().unwrap();
     if os_rejects_trailing_slash {
         assert_eq!(out.status.code(), Some(1), "trailing slash on /dev/stdin/ must fail when OS rejects it");
