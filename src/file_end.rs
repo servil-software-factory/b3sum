@@ -284,6 +284,9 @@ fn darwin_dev_fd_number(path: &Path) -> Option<i32> {
     if path.as_os_str().as_bytes().ends_with(b"/") {
         return None;
     }
+    // Verify the OS itself can stat `path` (preserving ENOTDIR/ENOENT for
+    // invalid traversals like `/dev/fd/0/../../stdin`).
+    let _ = std::fs::metadata(path).ok()?;
     // Resolve the parent directory via the OS kernel (`canonicalize`) so
     // symlinks and `..` follow kernel rules rather than lexical cancellation.
     let file_name = path.file_name()?;
