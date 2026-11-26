@@ -6,6 +6,25 @@ on:
   pull_request:
 
 jobs:
+  supply_chain:
+    name: dependency policy (cargo-deny + cargo-vet)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Install Rust toolchain
+        run: |
+          TOOLCHAIN=$(sed -n 's/^rustc //p' tools/b3sum-release.toolchain)
+          rustup toolchain install "$TOOLCHAIN" --profile minimal
+          rustup default "$TOOLCHAIN"
+      - name: Install hash-verified cargo-deny and cargo-vet
+        run: sh tools/ci-tools.sh cargo-deny cargo-vet
+      - name: Check path allowlist, cargo-deny, cargo-vet, and planted-fault controls
+        run: |
+          python3 tools/test_dependency_policy.py
+          python3 tools/dependency_policy.py
+          python3 tools/dependency_policy.py controls
+
   test:
     name: b3sum ${{ matrix.target.name }}
     runs-on: ${{ matrix.target.os }}

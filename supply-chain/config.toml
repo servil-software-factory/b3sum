@@ -1,0 +1,68 @@
+
+# cargo-vet config file
+
+[cargo-vet]
+version = "0.10"
+
+[imports.bytecode-alliance]
+url = "https://raw.githubusercontent.com/bytecodealliance/wasmtime/main/supply-chain/audits.toml"
+
+[imports.bytecode-alliance.criteria-map]
+safe-to-deploy = "agent-safe-to-deploy"
+safe-to-run = "agent-safe-to-run"
+
+[imports.embark-studios]
+url = "https://raw.githubusercontent.com/EmbarkStudios/rust-ecosystem/main/audits.toml"
+
+[imports.embark-studios.criteria-map]
+safe-to-deploy = "agent-safe-to-deploy"
+safe-to-run = "agent-safe-to-run"
+
+[imports.google]
+url = "https://raw.githubusercontent.com/google/supply-chain/main/audits.toml"
+
+[imports.google.criteria-map]
+safe-to-deploy = "agent-safe-to-deploy"
+safe-to-run = "agent-safe-to-run"
+
+[imports.isrg]
+url = "https://raw.githubusercontent.com/divviup/libprio-rs/main/supply-chain/audits.toml"
+
+[imports.isrg.criteria-map]
+safe-to-deploy = "agent-safe-to-deploy"
+safe-to-run = "agent-safe-to-run"
+
+[imports.mozilla]
+url = "https://raw.githubusercontent.com/mozilla/supply-chain/main/audits.toml"
+
+[imports.mozilla.criteria-map]
+safe-to-deploy = "agent-safe-to-deploy"
+safe-to-run = "agent-safe-to-run"
+
+[imports.zcash]
+url = "https://raw.githubusercontent.com/zcash/rust-ecosystem/main/supply-chain/audits.toml"
+
+[imports.zcash.criteria-map]
+safe-to-deploy = "agent-safe-to-deploy"
+safe-to-run = "agent-safe-to-run"
+
+[policy.b3sums]
+audit-as-crates-io = false
+criteria = "agent-safe-to-deploy"
+dev-criteria = "agent-safe-to-run"
+
+[policy.blake3-servil]
+audit-as-crates-io = false
+criteria = "agent-safe-to-deploy"
+
+[policy.blake3-servil-core]
+audit-as-crates-io = false
+criteria = "agent-safe-to-deploy"
+
+[policy.blake3-servil-version]
+audit-as-crates-io = false
+criteria = "agent-safe-to-deploy"
+
+[[exemptions.libc]]
+version = "0.2.191"
+criteria = "agent-safe-to-deploy"
