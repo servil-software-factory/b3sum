@@ -61,7 +61,7 @@ rm -rf "$build"
 mkdir -m 700 "$build"
 git clone --quiet --no-checkout . "$build/source"
 git -C "$build/source" checkout --quiet --detach "$commit"
-RUSTFLAGS="$flags" cargo build --release --locked --manifest-path "$build/source/b3sum/Cargo.toml" --target "$target" --target-dir "$build/target"
+RUSTFLAGS="$flags" cargo build --release --locked --manifest-path "$build/source/Cargo.toml" --target "$target" --target-dir "$build/target"
 mkdir -p dist
 out="dist/$name"
 cp "$build/target/$target/release/b3sum" "$out"

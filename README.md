@@ -4,7 +4,7 @@ A command-line tool that prints [BLAKE3](https://blake3.io) hashes of files or
 standard input, like `sha256sum` or `md5sum`. This is `blake3-servil`'s
 `b3sum` (see the repository's [README](../README.md)).
 
-<img src="../docs/images/b3sum-epyc-1000-files.svg" alt="Hashing a tree of 1000 files on an AMD EPYC 9255: b3sum on every core and on one thread, beside sha1sum, sha256sum and md5sum, in GB/s" width="720">
+<img src="docs/images/b3sum-epyc-1000-files.svg" alt="Hashing a tree of 1000 files on an AMD EPYC 9255: b3sum on every core and on one thread, beside sha1sum, sha256sum and md5sum, in GB/s" width="720">
 
 # Installation
 
@@ -100,7 +100,7 @@ Options:
   -V, --version               Print version
 
 More information: b3sum/README.md at
-https://github.com/servil-software-factory/BLAKE3/blob/main/b3sum/README.md
+https://github.com/servil-software-factory/b3sum/blob/main/README.md
 ```
 
 By default, `b3sum` uses all the CPU cores it is allowed: it hashes multiple

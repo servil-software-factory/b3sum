@@ -96,7 +96,7 @@ impl Args {
             }
             Ok(ParseOutcome::Version) => {
                 let mut stdout = io::stdout().lock();
-                if let Err(e) = writeln!(stdout, "b3sums {}", blake3::BUILD_VERSION).and_then(|()| stdout.flush()) {
+                if let Err(e) = writeln!(stdout, "b3sums {}", env!("B3SUM_BUILD_VERSION")).and_then(|()| stdout.flush()) {
                     let _ = writeln!(io::stderr().lock(), "{NAME}: {e}");
                     std::process::exit(1);
                 }

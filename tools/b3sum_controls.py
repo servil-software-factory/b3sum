@@ -28,77 +28,77 @@ READ_TO_END_NOT = "    bytes.truncate(says);\n    Ok(())\n}\n\n/// The hash of t
 CONTROLS = [
     (
         "--no-mmap maps no file (#432)",
-        "b3sum/src/main.rs",
+        "src/main.rs",
         "        if self.inner.no_mmap {\n            return None;\n        }\n",
         "",
         "test_no_mmap_maps_no_file",
     ),
     (
         "a checkfile with no line is a failure (#407)",
-        "b3sum/src/main.rs",
+        "src/main.rs",
         '    ensure!(saw_line, "{}: no checksum entries", path.display());\n',
         "    let _ = saw_line;\n",
         "test_empty_checkfile_is_failure",
     ),
     (
         "an output error is a failure (#406)",
-        "b3sum/src/main.rs",
+        "src/main.rs",
         "            Err(e) => return (written, Err(e)),",
         "            Err(_) => return (bytes.len(), Ok(())),",
         "test_output_error_is_failure",
     ),
     (
         "a direct read reads once more for the file's end (#424)",
-        "b3sum/src/direct.rs",
+        "src/direct.rs",
         "        return (more == 0).then_some(());",
         "        return Some(());",
         "a_file_read_directly_hashes_as_its_bytes_do",
     ),
     (
         "a read for a known size goes on to where a read gives no byte (#424)",
-        "b3sum/src/main.rs",
+        "src/main.rs",
         READ_TO_END,
         READ_TO_END_NOT,
         "test_a_files_size_does_not_decide_where_it_ends",
     ),
     (
         "a batched small file is held to its slot before the copy",
-        "b3sum/src/linux_pipe.rs",
+        "src/linux_pipe.rs",
         '        assert!(byte_len <= WARM_SLOT_BLOCKS * 64, "a batched file fits its slot");\n',
         "",
         "a_file_beyond_its_slot_is_refused_before_the_copy",
     ),
     (
         "a buffer is sized by what was read, not by the file's size (#440)",
-        "b3sum/src/linux_pipe.rs",
+        "src/linux_pipe.rs",
         "    let need = hint.saturating_add(1).max(prefix.len().saturating_add(4096)).min(SMALL_MEM_CAP + 1);",
         "    let need = hint.saturating_add(1).max(4096).min(SMALL_MEM_CAP + 1);",
         "a_buffer_holds_what_was_read_whatever_the_size_said",
     ),
     (
         "growing the descriptor table lands on no open descriptor (#441)",
-        "b3sum/src/linux_pipe.rs",
+        "src/linux_pipe.rs",
         "                let high = libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, target);",
         "                let high = libc::dup2(fd, target);",
         "growing_the_descriptor_table_closes_no_descriptor",
     ),
     (
         "a ring dropped with reads in flight stops the process (#442)",
-        "b3sum/src/uring.rs",
+        "src/uring.rs",
         "        if self.in_flight != 0 {\n            use std::io::Write;",
         "        if false {\n            use std::io::Write;",
         "a_ring_dropped_with_a_read_in_flight_stops_the_process",
     ),
     (
         "a failed io_uring_enter stops the process (#409)",
-        "b3sum/src/uring.rs",
+        "src/uring.rs",
         "stopping before pending reads' buffers can be released\");\n    std::process::abort()",
         "stopping before pending reads' buffers can be released\");\n    None",
         "failed_enter_stops_before_unwinding",
     ),
     (
         "the file opened is the file hashed where there is no io_uring",
-        "b3sum/src/linux_pipe.rs",
+        "src/linux_pipe.rs",
         "        } else {\n            sink.put(i, crate::hash_open_file(args, file));\n        }\n",
         "        } else {\n            drop(file);\n            let ctx = crate::file_end::StdinContext::current();\n            sink.put(i, crate::hash_path_hash(args, &paths[i], &ctx, forbidden));\n        }\n",
         "without_a_ring_the_file_opened_is_the_file_hashed",
@@ -107,7 +107,7 @@ CONTROLS = [
 
 
 def test_passes(test):
-    run = subprocess.run(["cargo", "test", "-q", "--release", "--manifest-path", "b3sum/Cargo.toml", "--", test], cwd=ROOT, capture_output=True, text=True)
+    run = subprocess.run(["cargo", "test", "-q", "--release", "--locked", "--manifest-path", "Cargo.toml", "--", test], cwd=ROOT, capture_output=True, text=True)
     ran = [line for line in run.stdout.splitlines() if line.startswith("test result:")]
     if run.returncode != 0 and not ran and "running " not in run.stdout:
         return None, run.stdout[-1500:] + run.stderr[-1500:]

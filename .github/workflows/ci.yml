@@ -37,3 +37,23 @@ jobs:
         run: cargo build --locked
         env:
           CFLAGS: -flto
+      - name: Safety controls (Linux)
+        if: runner.os == 'Linux'
+        run: python3 tools/b3sum_controls.py
+
+  b3sum_release_build:
+    name: b3sum release build (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 2
+      - name: Build static Linux binary in pinned container
+        run: |
+          image=$(sed -n 's/^image //p' tools/b3sum-release.toolchain)
+          docker run --rm -e B3SUM_RELEASE_ANY_COMMIT=1 -v "$PWD":/src -w /src "$image" sh tools/b3sum-release-container.sh

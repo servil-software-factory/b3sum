@@ -245,7 +245,16 @@ impl StdinContext {
         if self.might_be_dev_or_proc(path) {
             if let Some(stdin) = self.stdin
                 && stdin.kind == FileKind::Stream
-                && path_matches_fd_meta(path, stdin)
+                && (path_matches_fd_meta(path, stdin) || {
+                    #[cfg(target_os = "macos")]
+                    {
+                        darwin_dev_fd_number(path) == Some(0)
+                    }
+                    #[cfg(not(target_os = "macos"))]
+                    {
+                        false
+                    }
+                })
             {
                 return InputRole::StdinStreamAlias;
             }
@@ -260,39 +269,31 @@ impl StdinContext {
 
 /// Verify via OS resolution that `path` resolves to a Darwin `fd(4)` entry
 /// (`/dev/fd/<N>` or a symlink in `/dev` targeting `fd/<N>`, for any open
-/// descriptor `N`) referring to a regular file, preserving trailing-slash
-/// errors, directory-symlink `..` semantics, and OS lookup errors.
+/// descriptor `N`), preserving trailing-slash errors, directory-symlink `..`
+/// semantics, and OS lookup errors, and return `N`.
 #[cfg(target_os = "macos")]
-fn is_verified_darwin_regular_dev_fd(path: &Path) -> bool {
+fn darwin_dev_fd_number(path: &Path) -> Option<i32> {
     use std::os::unix::ffi::OsStrExt;
-    fn is_fd_number(name: &std::ffi::OsStr) -> bool {
+    fn parse_fd_number(name: &std::ffi::OsStr) -> Option<i32> {
         let bytes = name.as_bytes();
-        !bytes.is_empty() && bytes.iter().all(u8::is_ascii_digit) && std::str::from_utf8(bytes).ok().and_then(|s| s.parse::<i32>().ok()).is_some()
+        if bytes.is_empty() || !bytes.iter().all(u8::is_ascii_digit) {
+            return None;
+        }
+        std::str::from_utf8(bytes).ok()?.parse::<i32>().ok()
     }
-    // Reject trailing slash (regular file is not a directory) and verify `stat` sees a regular file.
     if path.as_os_str().as_bytes().ends_with(b"/") {
-        return false;
-    }
-    let Ok(meta) = std::fs::metadata(path) else {
-        return false;
-    };
-    if !meta.is_file() {
-        return false;
+        return None;
     }
     // Resolve the parent directory via the OS kernel (`canonicalize`) so
     // symlinks and `..` follow kernel rules rather than lexical cancellation.
-    let Some(file_name) = path.file_name() else {
-        return false;
-    };
+    let file_name = path.file_name()?;
     let parent = match path.parent() {
         Some(p) if !p.as_os_str().is_empty() => p,
         _ => Path::new("."),
     };
-    let Ok(real_parent) = std::fs::canonicalize(parent) else {
-        return false;
-    };
-    if real_parent == Path::new("/dev/fd") && is_fd_number(file_name) {
-        return true;
+    let real_parent = std::fs::canonicalize(parent).ok()?;
+    if real_parent == Path::new("/dev/fd") {
+        return parse_fd_number(file_name);
     }
     if real_parent == Path::new("/dev") {
         let entry = real_parent.join(file_name);
@@ -302,11 +303,18 @@ fn is_verified_darwin_regular_dev_fd(path: &Path) -> bool {
                 && let Some(fd_name) = rest.file_name()
                 && rest.components().count() == 1
             {
-                return is_fd_number(fd_name);
+                return parse_fd_number(fd_name);
             }
         }
     }
-    false
+    None
+}
+
+/// Verify via OS resolution that `path` resolves to a Darwin `fd(4)` entry
+/// referring to a regular file.
+#[cfg(target_os = "macos")]
+fn is_verified_darwin_regular_dev_fd(path: &Path) -> bool {
+    darwin_dev_fd_number(path).is_some() && std::fs::metadata(path).is_ok_and(|meta| meta.is_file())
 }
 
 /// Whether `path` currently resolves via OS `stat` to the exact same `(dev, ino)`

@@ -38,6 +38,3 @@ rm /tmp/rustup-init
 . "$HOME/.cargo/env"
 git config --global --add safe.directory '*'
 sh tools/b3sum-release.sh
-# The crates too, packaged as a release packages them: Cargo's build of
-# each is the release's own run's to make.
-sh tools/crates-release.sh --no-verify
