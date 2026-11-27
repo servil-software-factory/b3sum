@@ -70,6 +70,7 @@ until a user's question. No source file differed, as the trees their
 versions name showed, but only on our machines.
 """
 
+import collections
 import hashlib
 import importlib.util
 import io
@@ -333,26 +334,64 @@ def program_problems(data, release):
     return problems
 
 
-def crate_problems(data, release):
+# Hard bounds on bytes read/expanded while inspecting a single artifact so a
+# malformed or unexpectedly huge HTTP response or `.crate` archive cannot
+# exhaust memory (`b3sum` static tarballs are ~2–4 MiB; `.crate` is < 1 MiB).
+MAX_ARTIFACT_BYTES = 64 * 1024 * 1024
+MAX_CRATE_UNCOMPRESSED_BYTES = 32 * 1024 * 1024
+MAX_CRATE_MEMBERS = 4096
+_READ_CHUNK_BYTES = 64 * 1024
+
+
+def _read_bounded(stream, limit, label):
+    """Read `stream` in chunks, stopping with ValueError if it exceeds `limit` bytes."""
+    chunks = []
+    total = 0
+    while True:
+        chunk = stream.read(min(_READ_CHUNK_BYTES, limit - total + 1))
+        if not chunk:
+            return b"".join(chunks)
+        total += len(chunk)
+        if total > limit:
+            raise ValueError(f"{label} exceeds maximum allowed size ({limit} bytes)")
+        chunks.append(chunk)
+
+
+def crate_problems(data, release, max_uncompressed_bytes=MAX_CRATE_UNCOMPRESSED_BYTES):
     """Why the .crate `data` is not the version commit's files."""
     with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as archive:
         members = archive.getmembers()
+        if len(members) > MAX_CRATE_MEMBERS:
+            return [f"holds {len(members)} entries, exceeding maximum ({MAX_CRATE_MEMBERS})"]
         odd = [m.name for m in members if not (m.isfile() or m.isdir())]
+        if odd:
+            return [f"holds what is no plain file ({odd[0]})"]
         names = [m.name for m in members if m.isfile()]
-        files = {m.name.split("/", 1)[1]: archive.extractfile(m).read() for m in members if m.isfile() and "/" in m.name}
-    if odd:
-        return [f"holds what is no plain file ({odd[0]})"]
-    # Every file once, and in the one folder Cargo packs a crate into: a
-    # second entry of a name, or one outside the folder, is a file some
-    # reader of the archive sees and this check would not.
-    twice = sorted(n for n in set(names) if names.count(n) > 1)
-    if twice:
-        return [f"holds {twice[0]} more than once"]
-    folders = sorted({n.split("/", 1)[0] if "/" in n else "" for n in names} | {m.name.split("/", 1)[0] for m in members if m.isdir()})
-    if len(folders) != 1 or not folders[0]:
-        return [f"holds files outside one folder ({', '.join(f or 'the top' for f in folders)})"]
-    if any(os.path.normpath(n) != n or n.startswith("/") for n in names):
-        return ["holds a file whose path is not plain"]
+        # Every file once, and in the one folder Cargo packs a crate into: a
+        # second entry of a name, or one outside the folder, is a file some
+        # reader of the archive sees and this check would not.
+        counts = collections.Counter(names)
+        twice = sorted(n for n, c in counts.items() if c > 1)
+        if twice:
+            return [f"holds {twice[0]} more than once"]
+        folders = sorted({n.split("/", 1)[0] if "/" in n else "" for n in names} | {m.name.split("/", 1)[0] for m in members if m.isdir()})
+        if len(folders) != 1 or not folders[0]:
+            return [f"holds files outside one folder ({', '.join(f or 'the top' for f in folders)})"]
+        if any(os.path.normpath(n) != n or n.startswith("/") for n in names):
+            return ["holds a file whose path is not plain"]
+        declared_total = sum(m.size for m in members if m.isfile())
+        if declared_total > max_uncompressed_bytes:
+            return [f"expands to {declared_total} bytes, exceeding maximum ({max_uncompressed_bytes} bytes)"]
+        files = {}
+        remaining = max_uncompressed_bytes
+        for m in members:
+            if m.isfile() and "/" in m.name:
+                try:
+                    content = _read_bounded(archive.extractfile(m), remaining, m.name)
+                except ValueError:
+                    return [f"expands past maximum allowed size ({max_uncompressed_bytes} bytes)"]
+                remaining -= len(content)
+                files[m.name.split("/", 1)[1]] = content
     for cargos in (".cargo_vcs_info.json", "Cargo.toml.orig"):
         if cargos not in files:
             return [f"has no {cargos}: not as Cargo packages a crate from a Git checkout"]
@@ -417,9 +456,9 @@ def _plain_dir(path):
     return os.path.isdir(path) and not os.path.islink(path)
 
 
-def read(path):
+def read(path, max_bytes=MAX_ARTIFACT_BYTES):
     with open(path, "rb") as f:
-        return f.read()
+        return _read_bounded(f, max_bytes, path)
 
 
 DIGEST_SUFFIXES = (".sha256", ".b3")
@@ -431,29 +470,38 @@ def is_digest(name):
     return name.endswith(DIGEST_SUFFIXES)
 
 
+def _artifact_digests(data):
+    return (hashlib.sha256(data).hexdigest(), blake3_ref.blake3_hex(data))
+
+
 def digest_problems(name, data, seen):
     """Why the digest file `name` is not the SHA-256 or BLAKE3 line of the
-    artifact it is named for, among those checked before it (`seen`, by name)."""
+    artifact it is named for, among those checked before it (`seen`, mapping
+    artifact name to `(sha256_hex, blake3_hex)` or raw `bytes`)."""
     if name.endswith(".sha256"):
         of = name[: -len(".sha256")]
         if of not in seen:
             return [f"is the digest of {of}, which is no artifact here"]
-        want = f"{hashlib.sha256(seen[of]).hexdigest()}  {of}\n".encode()
+        entry = seen[of]
+        sha_hex = entry[0] if isinstance(entry, tuple) else hashlib.sha256(entry).hexdigest()
+        want = f"{sha_hex}  {of}\n".encode()
         return [] if data == want else [f"is not the SHA-256 line of {of}"]
     if name.endswith(".b3"):
         of = name[: -len(".b3")]
         if of not in seen:
             return [f"is the digest of {of}, which is no artifact here"]
-        want = f"{blake3_ref.blake3_hex(seen[of])}  {of}\n".encode()
+        entry = seen[of]
+        b3_hex = entry[1] if isinstance(entry, tuple) else blake3_ref.blake3_hex(entry)
+        want = f"{b3_hex}  {of}\n".encode()
         return [] if data == want else [f"is not the BLAKE3 line of {of}"]
     return ["is not a recognized digest file"]
 
 
-def fetch(url):
+def fetch(url, max_bytes=MAX_ARTIFACT_BYTES):
     # (A search of the whole address for GitHub's name once sent the
     # token wherever a path or a longer host held the name.)
     with urllib.request.urlopen(request_for(url), timeout=300) as response:
-        return response.read()
+        return _read_bounded(response, max_bytes, url)
 
 
 def request_for(url):
@@ -617,7 +665,7 @@ def check(items, release, out=None, rebuilt=None, builders=None):
         elif is_digest(name):
             lines = [f"NOT CLEAN  {label}: {problem}" for problem in digest_problems(name, data, seen)]
         else:
-            seen[name] = data
+            seen[name] = _artifact_digests(data)
             found = problems(name, data, release)
             if rebuilt is not None and (name.startswith("b3sum-") or name.endswith(".crate")):
                 found = found + rebuilt_problems(name, data, rebuilt, builders, release=release)

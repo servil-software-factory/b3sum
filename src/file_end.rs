@@ -135,7 +135,10 @@ pub(crate) fn validate_byte_stream_fd(fd: RawFd) -> crate::err::Result<FdMeta> {
 /// Checks that fd 2 is actually open for writing (`F_GETFL` access mode is not
 /// `O_RDONLY`), then classifies fd 2 with `fstat(2)`:
 /// - `S_IFREG`: writes directly to fd 2 (preserves the caller's file offset and
-///   `O_APPEND` mode, and regular-file writes never wait on a pipe reader).
+///   `O_APPEND` mode, and never waits on a pipe reader; on local storage this
+///   completes promptly, though a stalled FUSE or network mount can still wait
+///   on regular-file `write(2)` — an intentional trade-off so stderr redirected
+///   to a log file still captures the fatal message before `_exit`/`abort`).
 /// - `S_IFSOCK`: uses per-call `send(2, ..., MSG_DONTWAIT)` (atomic non-blocking
 ///   without mutating fd flags).
 /// - `S_IFIFO` (pipes/FIFOs have no seek offset and no `TOSTOP`/`SIGTTOU`): on
