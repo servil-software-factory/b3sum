@@ -104,7 +104,7 @@ class Reasons(unittest.TestCase):
         self.assertEqual([n for n, _ in ur.debug_assert_without_reason(split_bang)], [2])
 
     def test_cfg_test_skipping_preserves_adjacent_shipped_code_and_cfg_attr(self):
-        # Closure braces inside parens (`#[cfg(test)] NOTED.with(|n| { ... });`)
+        # Closure braces inside parens (`#[cfg(test)] NOTED.with(|n| {... });`)
         # must stop at `;` and never hide following shipped code (lanes.rs).
         closure_stmt = (
             "fn noted() {\n"
@@ -315,7 +315,7 @@ class Reasons(unittest.TestCase):
         )
         self.assertEqual([n for n, _ in ur.debug_assert_without_reason(nested_trailing)], [5])
         self.assertEqual([n for n, _ in ur.without_reason(nested_trailing)], [6])
-        # Braced test statement `#[cfg(test)] let _ = { 1 }; /* ... */` must
+        # Braced test statement `#[cfg(test)] let _ = { 1 }; /*... */` must
         # include its `;` so the trailing comment is blanked too.
         braced_init = (
             "fn f(p: *const u8) -> u8 {\n"
@@ -358,7 +358,7 @@ class Reasons(unittest.TestCase):
         )
         self.assertEqual([n for n, _ in ur.debug_assert_without_reason(const_alias)], [2])
         self.assertEqual([n for n, _ in ur.without_reason(const_alias)], [3])
-        # Braced `let` initializer with postfix `.unwrap_or(2); /* ... */` must
+        # Braced `let` initializer with postfix `.unwrap_or(2); /*... */` must
         # scan through `;` before blanking the trailing comment.
         method_after_brace = (
             "fn f(x: usize, p: *const u8) -> u8 {\n"
@@ -371,14 +371,14 @@ class Reasons(unittest.TestCase):
         self.assertEqual([n for n, _ in ur.debug_assert_without_reason(method_after_brace)], [4])
         self.assertEqual([n for n, _ in ur.without_reason(method_after_brace)], [5])
         # Multiline trailing block comment ending on the same line as a following
-        # item's `/// Sound: ...` doc comment must NOT erase the doc comment.
+        # item's `/// Sound:...` doc comment must NOT erase the doc comment.
         doc_after_block = (
             "#[cfg(test)] const X: i32 = 1; /* old fixture\n"
             "*/ /// Sound: reading from a valid shared reference.\n"
             "pub fn read(p: &u8) -> u8 { unsafe { *p } }\n"
         )
         self.assertEqual(ur.without_reason(doc_after_block), [])
-        # Inline `#[cfg(test)] const { ... }` block statement ends at `}` (no
+        # Inline `#[cfg(test)] const {... }` block statement ends at `}` (no
         # semicolon required) and must NEVER swallow the next shipped statement.
         inline_const_block = (
             "fn f(p: *const u8) -> u8 {\n"
@@ -438,7 +438,7 @@ class Reasons(unittest.TestCase):
         )
         self.assertEqual([n for n, _ in ur.without_reason(const_block_bare_range)], [3])
         # Nested generics ending with `>>>` on a test-only generic parameter
-        # (`fn bounded<#[cfg(test)] T: Into<Vec<u8>>>() { ... }`) must stop
+        # (`fn bounded<#[cfg(test)] T: Into<Vec<u8>>>() {... }`) must stop
         # before the enclosing `>` and still check the shipped function body.
         nested_generic_param = (
             "pub fn bounded<#[cfg(test)] T: Into<Vec<u8>>>(p: &u8) -> u8 {\n"
@@ -504,7 +504,7 @@ class Reasons(unittest.TestCase):
         self.assertEqual(ur.without_reason(multiline), [])
         self.assertEqual(ur.debug_assert_without_reason(multiline), [])
 
-        # Inline `#[cfg(test)] const { ... }` inside an array/tuple with postfix
+        # Inline `#[cfg(test)] const {... }` inside an array/tuple with postfix
         # `.wrapping_add(2),` must stop at `,` (never masking the next shipped
         # element), a plain `const { 1u8 }, // Sound:` must mask its trailing
         # comment, and Pattern_White_Space (`\u200E`) between `const` and `{`
@@ -537,6 +537,38 @@ class Reasons(unittest.TestCase):
         )
         self.assertEqual([n for n, _ in ur.debug_assert_without_reason(const_lrm_ws)], [3])
         self.assertEqual([n for n, _ in ur.without_reason(const_lrm_ws)], [4])
+        # A `Sound:` comment inside one function (top-level or method inside
+        # `impl`) must NEVER cross a function boundary to clear an unrelated
+        # `unsafe` in the next function, while adjacent `unsafe impl Send` /
+        # `unsafe impl Sync` lines still share one comment right above.
+        cross_fn = (
+            "fn f(p: *const u8) -> u8 {\n"
+            "    // Sound: p is valid in f.\n"
+            "    unsafe { *p }\n"
+            "}\n"
+            "fn g(q: *const u8) -> u8 {\n"
+            "    unsafe { *q }\n"
+            "}\n"
+        )
+        self.assertEqual([n for n, _ in ur.without_reason(cross_fn)], [6])
+        cross_method = (
+            "impl S {\n"
+            "    fn f(p: *const u8) -> u8 {\n"
+            "        // Sound: p is valid in f.\n"
+            "        unsafe { *p }\n"
+            "    }\n"
+            "    fn g(q: *const u8) -> u8 {\n"
+            "        unsafe { *q }\n"
+            "    }\n"
+            "}\n"
+        )
+        self.assertEqual([n for n, _ in ur.without_reason(cross_method)], [7])
+        shared_impls = (
+            "// Sound: interior mutability is synchronized.\n"
+            "unsafe impl Send for S {}\n"
+            "unsafe impl Sync for S {}\n"
+        )
+        self.assertEqual(ur.without_reason(shared_impls), [])
 
     def test_cfg_test_fn_items_are_excluded(self):
         src = (

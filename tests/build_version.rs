@@ -1,4 +1,4 @@
-//! Tests for standalone `build_version.rs` (M16, M17): clean/dirty Git
+//! Tests for standalone `build_version.rs`: clean/dirty Git
 //! checkouts, linked worktrees, zero `.git/objects` pollution on dirty trees,
 //! release commits, and `.cargo_vcs_info.json` validation.
 
@@ -61,7 +61,7 @@ fn git_checkout_clean_dirty_no_object_pollution_worktree_and_release() {
     let head = init_repo(&repo);
 
     // 1. Clean dev commit: repo root itself must NOT be in watched (avoids
-    //    Cargo recursively scanning target/ and .git/ on every build; M2),
+    //    Cargo recursively scanning target/ and.git/ on every build),
     //    while source subdirs like `src` ARE watched.
     let (clean_ver, clean_watched) = build_version::build_version(&repo, "0.11.0+dev", &scratch);
     assert_eq!(clean_ver, format!("0.11.0+dev.{head}"));
@@ -69,7 +69,7 @@ fn git_checkout_clean_dirty_no_object_pollution_worktree_and_release() {
     assert!(clean_watched.contains(&repo.join("src")), "source subdirectory must be watched");
 
     // 1b. `git update-index --assume-unchanged` must NEVER hide modified bytes
-    //     as clean (M1).
+    //     as clean.
     git(&repo, &["update-index", "--assume-unchanged", "src/main.rs"]);
     fs::write(repo.join("src/main.rs"), "fn main() { println!(\"changed\"); }\n").unwrap();
     let (assumed_dirty, _) = build_version::build_version(&repo, "0.11.0+dev", &scratch);
@@ -78,7 +78,7 @@ fn git_checkout_clean_dirty_no_object_pollution_worktree_and_release() {
     fs::write(repo.join("src/main.rs"), "fn main() {}\n").unwrap();
 
     // 1c. Force-added ignored file (`git add -f`) in the real index must also
-    //     mark the tree dirty even though HEAD does not track it (M1).
+    //     mark the tree dirty even though HEAD does not track it.
     fs::write(repo.join(".gitignore"), "ignored.rs\n").unwrap();
     git(&repo, &["add", ".gitignore"]);
     git(&repo, &["commit", "-qm", "add gitignore"]);
@@ -91,9 +91,9 @@ fn git_checkout_clean_dirty_no_object_pollution_worktree_and_release() {
     fs::remove_file(repo.join("ignored.rs")).unwrap();
 
     // 2. Dirty untracked file inside a watched source subdirectory must mark
-    //    `.dirty.<tree>` WITHOUT writing ANY object into `.git/objects` (M17),
+    //    `.dirty.<tree>` WITHOUT writing ANY object into `.git/objects`,
     //    whereas an unstaged untracked root file stays outside the incremental
-    //    stamp contract until staged (R3 M3).
+    //    stamp contract until staged.
     let objects_before = list_object_files(&repo.join(".git/objects"));
     let root_scratch = repo.join("root-scratch.txt");
     fs::write(&root_scratch, b"unstaged root note").unwrap();
@@ -118,7 +118,7 @@ fn git_checkout_clean_dirty_no_object_pollution_worktree_and_release() {
     let (colon_ver, _) = build_version::build_version(&colon_repo, "0.11.0+dev", &scratch);
     assert_eq!(colon_ver, format!("0.11.0+dev.{colon_head}"), "colon in repo path must not split GIT_ALTERNATE_OBJECT_DIRECTORIES");
 
-    // 3. Linked worktree resolves clean commit properly (M16).
+    // 3. Linked worktree resolves clean commit properly.
     let wt = root.path().join("linked-wt");
     git(&repo, &["worktree", "add", "-q", "--detach", wt.to_str().unwrap(), "HEAD"]);
     let (wt_ver, _) = build_version::build_version(&wt, "0.11.0+dev", &scratch);
@@ -143,7 +143,7 @@ fn package_vcs_info_validates_full_sha_and_dirty_flag() {
     assert_eq!(v, "0.11.0+dev");
 
     // Clean packaged dev build appends full 40-hex SHA, even alongside escaped
-    // non-BMP UTF-16 surrogate pairs in an unrelated JSON string (M3).
+    // non-BMP UTF-16 surrogate pairs in an unrelated JSON string.
     fs::write(dir.path().join(".cargo_vcs_info.json"), format!("{{\"note\":\"\\uD83D\\uDE00\",\"git\":{{\"sha1\":\"{sha}\"}},\"path_in_vcs\":\"\"}}")).unwrap();
     let (v, _) = build_version::build_version(dir.path(), "0.11.0+dev", scratch.path());
     assert_eq!(v, format!("0.11.0+dev.{sha}"));
@@ -154,7 +154,7 @@ fn package_vcs_info_validates_full_sha_and_dirty_flag() {
     assert_eq!(v, format!("0.11.0+{sha}.{sha}.dirty"));
 
     // Truncated / malformed SHA, truncated JSON, and trailing garbage report
-    // `.unverified` rather than looking like clean release provenance (M3/M16).
+    // `.unverified` rather than looking like clean release provenance.
     fs::write(dir.path().join(".cargo_vcs_info.json"), "{\"git\":{\"sha1\":\"deadbeef\"},\"path_in_vcs\":\"\"}").unwrap();
     let (v, _) = build_version::build_version(dir.path(), "0.11.0+dev", scratch.path());
     assert_eq!(v, "0.11.0+dev.unverified");
@@ -175,12 +175,12 @@ fn package_vcs_info_validates_full_sha_and_dirty_flag() {
     assert_eq!(v, format!("0.11.0+{sha}.{sha}.dirty"));
 
     // Invalid UTF-8 bytes in a present `.cargo_vcs_info.json` must report
-    // `.unverified`, NOT look like a missing file / clean provenance (M3).
+    // `.unverified`, NOT look like a missing file / clean provenance.
     fs::write(dir.path().join(".cargo_vcs_info.json"), [0xFFu8, 0xFEu8]).unwrap();
     let (v, _) = build_version::build_version(dir.path(), &format!("0.11.0+{sha}"), scratch.path());
     assert_eq!(v, format!("0.11.0+{sha}.unverified"));
 
-    // Leading `+` in a `\u` escape is not valid JSON and must report `.unverified` (M3).
+    // Leading `+` in a `\u` escape is not valid JSON and must report `.unverified`.
     fs::write(dir.path().join(".cargo_vcs_info.json"), format!("{{\"note\":\"\\u+041\",\"git\":{{\"sha1\":\"{sha}\"}}}}")).unwrap();
     let (v, _) = build_version::build_version(dir.path(), &format!("0.11.0+{sha}"), scratch.path());
     assert_eq!(v, format!("0.11.0+{sha}.unverified"));
@@ -226,7 +226,7 @@ fn incremental_cargo_build_agrees_with_fresh_build_across_root_and_subdir_change
     let v1 = assert_inc_matches_fresh("clean");
     assert_eq!(v1, format!("0.11.0+dev.{head}"));
 
-    // 2. Unstaged untracked root scratch file: both incremental and fresh stay clean (R3 M3).
+    // 2. Unstaged untracked root scratch file: both incremental and fresh stay clean.
     let scratch_root = repo.join("scratch-note.txt");
     fs::write(&scratch_root, "local root scratch\n").unwrap();
     let v2 = assert_inc_matches_fresh("unstaged root file");

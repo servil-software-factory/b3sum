@@ -22,7 +22,7 @@ Options:
       --num-threads <NUM>     The most threads hashing at once [default: as fast as b3sum can]
       --no-mmap               Read every file and map none: a file that another program shortens
                               while b3sum hashes it then cannot stop the run
-      --no-names              Omit filenames in the output
+      --no-names              Omit filenames in the output (ignores --tag)
       --raw                   Write raw output bytes to stdout, rather than hex
       --tag                   Output BSD-style checksums: BLAKE3 ([FILE]) = [HASH]
   -c, --check                 Read BLAKE3 sums from the [FILE]s and check them
@@ -37,7 +37,7 @@ More information: README.md at
 https://github.com/servil-software-factory/b3sum/blob/main/README.md
 ";
 
-/// Validated cryptographic mode chosen at the CLI boundary (L1).
+/// Validated cryptographic mode chosen at the CLI boundary.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum KeyMode {
     Plain,
@@ -45,7 +45,7 @@ pub(crate) enum KeyMode {
     DeriveKey(String),
 }
 
-/// Validated text line format for digest output (R3 L9).
+/// Validated text line format for digest output.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TextFormat {
     DigestOnly,
@@ -54,14 +54,14 @@ pub(crate) enum TextFormat {
 }
 
 /// Validated output format for `Command::Hash`; makes contradictory `--raw --tag`
-/// unrepresentable (R3 L9).
+/// unrepresentable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum OutputFormat {
     Raw,
     Text(TextFormat),
 }
 
-/// Validated mutually-exclusive CLI subcommand and its mode-specific options (L1).
+/// Validated mutually-exclusive CLI subcommand and its mode-specific options.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Command {
     Hash { length: u64, seek: u64, format: OutputFormat },
@@ -130,7 +130,7 @@ fn push_positional(file: &mut Vec<PathBuf>, arg: OsString) -> Result<(), String>
     Ok(())
 }
 
-/// Shared value consumer for both `--long` options and short `-l` (L1).
+/// Shared value consumer for both `--long` options and short `-l`.
 fn take_flag_val(flag: &str, inline: Option<OsString>, it: &mut dyn Iterator<Item = OsString>) -> Result<OsString, String> {
     match inline {
         Some(v) => Ok(v),

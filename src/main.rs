@@ -181,14 +181,11 @@ impl Args {
         }
     }
 
-    fn raw(&self) -> bool {
-        matches!(self.command, Command::Hash { format: args::OutputFormat::Raw, .. })
-    }
-
-    fn text_format(&self) -> args::TextFormat {
+    fn output_format(&self) -> args::OutputFormat {
         match self.command {
-            Command::Hash { format: args::OutputFormat::Text(tf), .. } | Command::Outboard { format: tf, .. } => tf,
-            Command::Hash { format: args::OutputFormat::Raw, .. } | Command::Check { .. } => args::TextFormat::Gnu,
+            Command::Hash { format, .. } => format,
+            Command::Outboard { format, .. } => args::OutputFormat::Text(format),
+            Command::Check { .. } => unreachable!("output_format called in --check mode"),
         }
     }
 
@@ -526,7 +523,7 @@ pub(crate) fn hash_path_hash(args: &Args, path: &Path, stdin_ctx: &StdinContext,
 /// start (`b3sum < file`): the same file, its position shared (the
 /// caller moves it past the consumed bytes once hashed). Uses `fstat(0)`
 /// and `lseek(0, 0, SEEK_CUR)` first so no spare descriptor is touched
-/// unless needed, returning the already-queried [`file_end::FdMeta`] (M5).
+/// unless needed, returning the already-queried [`file_end::FdMeta`].
 fn stdin_file() -> Option<(File, file_end::FdMeta)> {
     use std::os::fd::AsFd;
     let meta = file_end::fstat_fd(0).ok()?;
@@ -544,7 +541,7 @@ fn stdin_file() -> Option<(File, file_end::FdMeta)> {
 /// Stream an already-opened `file` sequentially to actual EOF without creating
 /// a memory mapping (used after an `O_DIRECT` read observes that the file's
 /// length changed, so a stale mapping is never hashed), using the already-
-/// queried `fd_meta` to avoid a redundant `fstat` (M5).
+/// queried `fd_meta` to avoid a redundant `fstat`.
 #[cfg(target_os = "linux")]
 pub(crate) fn hash_open_file_streaming_with_meta(args: &Args, file: File, fd_meta: file_end::FdMeta) -> err::Result<blake3::Hash> {
     use std::os::fd::AsRawFd;
@@ -569,7 +566,7 @@ pub(crate) fn hash_open_file_ex(args: &Args, file: File) -> err::Result<HashRead
     hash_open_file_with_meta(args, file, meta)
 }
 
-/// Hash an already-opened `file` using its already-queried `fd_meta` (M5),
+/// Hash an already-opened `file` using its already-queried `fd_meta`,
 /// returning the digest along with exact byte count and whether the file
 /// descriptor's cursor was advanced.
 pub(crate) fn hash_open_file_with_meta(args: &Args, mut file: File, fd_meta: file_end::FdMeta) -> err::Result<HashRead> {
@@ -630,7 +627,7 @@ pub(crate) fn hash_open_file_with_meta(args: &Args, mut file: File, fd_meta: fil
             } else {
                 // A cold file of 4 MiB or more: read past the page cache,
                 // several reads at once, each thread hashing its piece
-                // (direct.rs), even when `--no-mmap` is set (L1). Under
+                // (direct.rs), even when `--no-mmap` is set. Under
                 // `--num-threads`, concurrent file workers lease extra direct
                 // threads from one shared spare permit pool so total active
                 // threads stay within `--num-threads`.
@@ -730,7 +727,7 @@ fn hash_path(args: &Args, path: &Path, stdin_ctx: &StdinContext) -> err::Result<
 const HOLD_PAGES: u64 = 1 << 18;
 static HELD_PAGES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// Cached OS virtual memory page size, validated positive once (L5).
+/// Cached OS virtual memory page size, validated positive once.
 pub(crate) fn page_size() -> usize {
     static PAGE_SIZE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *PAGE_SIZE.get_or_init(|| {
@@ -804,7 +801,7 @@ const MAX_THREADS: usize = 1024;
 
 static POOL_ONCE: std::sync::Once = std::sync::Once::new();
 /// Actual width of the initialized global pool (0 before initialization),
-/// distinct from prospective [`pool_threads()`] budget (M27).
+/// distinct from prospective [`pool_threads()`] budget.
 static ACTUAL_POOL_THREADS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 struct ThreadBudget {
@@ -829,7 +826,7 @@ pub(crate) fn init_pool_once(n: usize) {
 /// Start the global thread pool only when the budget currently allows more than
 /// one thread, reserving the width atomically under `THREAD_BUDGET` so a
 /// temporary width of 1 (during a strict file batch or direct-I/O lease) leaves
-/// the singleton uninitialized for later parallel work (M27).
+/// the singleton uninitialized for later parallel work.
 fn try_init_parallel_pool() -> bool {
     init_pool_inner(MAX_THREADS, false) > 1
 }
@@ -860,7 +857,7 @@ fn init_pool_inner(n: usize, allow_single: bool) -> usize {
     actual_pool_threads()
 }
 
-/// Actual initialized width of the global thread pool (0 if not yet started; M27).
+/// Actual initialized width of the global thread pool (0 if not yet started).
 pub(crate) fn actual_pool_threads() -> usize {
     ACTUAL_POOL_THREADS.load(std::sync::atomic::Ordering::Acquire)
 }
@@ -1042,7 +1039,7 @@ thread_local! {
 /// Minimum read request length so Linux `pipe2(O_DIRECT)` packet-mode pipes
 /// (which buffer up to one kernel `PAGE_SIZE` per packet in `fs/pipe.c` and
 /// discard any unread tail on a short `read`) never silently truncate a packet
-/// on 4 KiB, 16 KiB, or 64 KiB page kernels (#515, L5).
+/// on 4 KiB, 16 KiB, or 64 KiB page kernels (#515).
 pub(crate) fn min_packet_read_len() -> usize {
     #[cfg(target_os = "linux")]
     {
@@ -1147,9 +1144,9 @@ fn write_hash_text(hash: &blake3::Hash, args: &Args, out: &mut OutBuf) -> err::R
 
 /// Shared GNU/BSD checkfile line formatter accepting any digest-writing
 /// callback (`write_hash_text` or `write_hex_output`), preserving the zero-
-/// allocation path for plain UTF-8 names (L2).
-fn write_formatted_line(path: &Path, args: &Args, out: &mut OutBuf, write_digest: impl FnOnce(&mut OutBuf) -> err::Result<()>) -> err::Result<()> {
-    match args.text_format() {
+/// allocation path for plain UTF-8 names.
+fn write_formatted_line(path: &Path, format: args::TextFormat, out: &mut OutBuf, write_digest: impl FnOnce(&mut OutBuf) -> err::Result<()>) -> err::Result<()> {
+    match format {
         args::TextFormat::DigestOnly => {
             write_digest(out)?;
             out.write_bytes(b"\n")?;
@@ -1182,11 +1179,10 @@ fn write_formatted_line(path: &Path, args: &Args, out: &mut OutBuf, write_digest
 
 pub(crate) fn print_hash_output(hash: blake3::Hash, path: &Path, args: &Args, out: &mut OutBuf) -> err::Result<()> {
     let take = usize::try_from(args.len()).expect("standard 32-byte mode len <= 32");
-    if args.raw() {
-        out.write_bytes(&hash.as_bytes()[..take])?;
-        return Ok(());
+    match args.output_format() {
+        args::OutputFormat::Raw => out.write_bytes(&hash.as_bytes()[..take]).map_err(Into::into),
+        args::OutputFormat::Text(format) => write_formatted_line(path, format, out, |out| write_hash_text(&hash, args, out)),
     }
-    write_formatted_line(path, args, out, |out| write_hash_text(&hash, args, out))
 }
 
 fn write_hex_output(mut output: blake3::OutputReader, args: &Args, out: &mut OutBuf) -> err::Result<()> {
@@ -1218,11 +1214,10 @@ fn write_raw_output(mut output: blake3::OutputReader, args: &Args, out: &mut Out
 }
 
 fn print_output(output: blake3::OutputReader, path: &Path, args: &Args, out: &mut OutBuf) -> err::Result<()> {
-    if args.raw() {
-        write_raw_output(output, args, out)?;
-        return Ok(());
+    match args.output_format() {
+        args::OutputFormat::Raw => write_raw_output(output, args, out),
+        args::OutputFormat::Text(format) => write_formatted_line(path, format, out, |out| write_hex_output(output, args, out)),
     }
-    write_formatted_line(path, args, out, |out| write_hex_output(output, args, out))
 }
 
 fn read_key_from_stdin() -> err::Result<[u8; blake3::KEY_LEN]> {
@@ -1414,7 +1409,7 @@ fn hash_paths_32(
 }
 
 /// Indexed out-of-order result buffer that drains a contiguous prefix in order
-/// and stops immediately on a rejected emission (L10).
+/// and stops immediately on a rejected emission.
 pub(crate) struct OrderedCollector<T> {
     results: Vec<Option<T>>,
     emitted: usize,
@@ -1453,11 +1448,11 @@ impl<T> OrderedCollector<T> {
 }
 
 /// Shared parallel ordered collector for generic plain and extended-output
-/// multi-file runs (M3): workers claim indices via `next`, send results to the
+/// multi-file runs: workers claim indices via `next`, send results to the
 /// main collector, and emit a contiguous prefix in order. When `on_ordered`
 /// returns `false`, one close path publishes `next.fetch_max(count, SeqCst)`
 /// and drops `done_rx` before joining workers so helpers stop claiming new
-/// operands immediately. Asserts `emitted == count` on normal completion (M30).
+/// operands immediately. Asserts `emitted == count` on normal completion.
 pub(crate) fn run_ordered_collector<O: Send>(count: usize, threads: usize, work: impl Fn(usize) -> O + Sync, on_ordered: impl FnMut(usize, O) -> bool) {
     run_ordered_collector_inner(count, threads, work, on_ordered, |_| {});
 }
@@ -1559,7 +1554,7 @@ fn outboard_inputs(args: &Args, dir: &Path, stdin_ctx: &StdinContext, out: &mut 
     let total = threads().get();
     // On an interactive terminal, finish writing and printing each operand
     // before opening the next so progress appears immediately and a later FIFO
-    // cannot hold back earlier lines (M4).
+    // cannot hold back earlier lines.
     if out.is_line_flushed() {
         let mut rooms = outboard::Rooms::new();
         let mut nodes = Vec::new();
@@ -1791,7 +1786,7 @@ fn hash_inputs(args: &Args, stdin_ctx: &StdinContext, out: &mut OutBuf) -> u64 {
     let _file_threads_guard = args.num_threads().map(|_| FileThreadsGuard::enter(worker_threads));
     let mut failed = 0u64;
     // On one worker thread there is no reordering problem: stream operands
-    // directly without reserving a result slot per path (M8).
+    // directly without reserving a result slot per path.
     if worker_threads <= 1 {
         for path in &args.file_args {
             if let Err(e) = hash_path(args, path, stdin_ctx).and_then(|output| print_output(output, path, args, out)) {
@@ -2005,7 +2000,7 @@ fn collect_check_batch(
 }
 
 /// Owning reader for a checkfile source, binding every positioned `pread`
-/// reader to the lifetime of its open descriptor instead of a raw fd (M6).
+/// reader to the lifetime of its open descriptor instead of a raw fd.
 enum CheckfileReader<'a> {
     File(File),
     Stdin(io::StdinLock<'a>),
@@ -2127,7 +2122,7 @@ fn check_one_checkfile(path: &Path, args: &Args, stdin_ctx: &StdinContext, files
 
     // On an interactive terminal, check and emit one entry at a time so
     // progress appears immediately and a later blocking FIFO or slow manifest
-    // cannot hold back earlier results (M4). Keep full batching for redirected
+    // cannot hold back earlier results. Keep full batching for redirected
     // output.
     let batch_limit = if out.is_line_flushed() { 1 } else { CHECK_CHUNK };
 
@@ -2185,7 +2180,7 @@ fn check_one_checkfile(path: &Path, args: &Args, stdin_ctx: &StdinContext, files
         Ok(())
     })();
     // Advance fd 0's shared offset to match all bytes consumed from the
-    // checkfile even when the loop terminated early on an I/O or write error (M2).
+    // checkfile even when the loop terminated early on an I/O or write error.
     #[cfg(target_os = "macos")]
     let seek_res = {
         let buffered = bufreader.buffer().len() as u64;

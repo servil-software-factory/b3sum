@@ -275,7 +275,7 @@ def main():
                 sys.exit(f"b3sum_controls: the place of '{name}' is not in {path} once: update this script")
 
         # Verify every named control test passes in ONE clean nextest invocation
-        # on the untouched staged tree before planting individual faults (L5).
+        # on the untouched staged tree before planting individual faults.
         baseline_tests = list(dict.fromkeys(test for _, _, _, _, test in CONTROLS))
         filter_expr = " | ".join(f"test(={t})" for t in baseline_tests)
         env = os.environ.copy()

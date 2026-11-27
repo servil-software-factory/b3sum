@@ -113,7 +113,7 @@ pub(crate) struct IoUringCqe {
     pub flags: u32,
 }
 
-// Compile-time verification of the hand-written Linux io_uring UAPI layouts (M7).
+// Compile-time verification of the hand-written Linux io_uring UAPI layouts.
 const _: () = {
     assert!(size_of::<IoSqrOffsets>() == 40);
     assert!(size_of::<IoCqrOffsets>() == 40);
@@ -128,7 +128,7 @@ const _: () = {
 };
 
 /// Owning guard for one `io_uring` `mmap` region: guarantees a non-null,
-/// non-`MAP_FAILED` base address and unmaps once on drop (M7).
+/// non-`MAP_FAILED` base address and unmaps once on drop.
 struct RingMap {
     ptr: NonNull<libc::c_void>,
     len: usize,
@@ -204,6 +204,10 @@ thread_local! {
 impl Uring {
     /// Acquire this thread's cached `Uring` with at least `entries` SQEs, or create one.
     pub(crate) fn acquire(entries: u32) -> io::Result<Self> {
+        #[cfg(test)]
+        if REFUSED.load(Ordering::Relaxed) {
+            return Err(io::Error::from_raw_os_error(libc::ENOSYS));
+        }
         if let Some(ring) = LOCAL_URING.with(|c| c.take()) {
             if ring.sq_entries >= entries {
                 return Ok(ring);
@@ -280,7 +284,7 @@ impl Uring {
         // inside the mapping of the length it also gave; the heads and tails
         // are u32s the kernel reads and writes atomically, as AtomicU32 does,
         // and the SQ indirection array has `params.sq_entries` u32 slots
-        // initialized once to the identity permutation `0..sq_entries` (L4).
+        // initialized once to the identity permutation `0..sq_entries`.
         let (sq_head, sq_tail, sq_mask, cq_head, cq_tail, cq_mask, cqes, local_sq_tail) = unsafe {
             let sq_head = sq_base.add(params.sq_off.head as usize).cast::<AtomicU32>();
             let sq_tail = sq_base.add(params.sq_off.tail as usize).cast::<AtomicU32>();
@@ -425,7 +429,7 @@ impl Uring {
 
 /// Drive the `io_uring_enter` submission loop until all queued SQEs are
 /// submitted (or a wait-only enter completes), enforcing forward progress on
-/// every iteration (M31).
+/// every iteration.
 pub(crate) fn run_submit_loop(
     mut to_submit: u32,
     min_complete: u32,
@@ -461,7 +465,7 @@ pub(crate) fn run_submit_loop(
 
 /// Reconcile remaining SQEs after a non-negative `io_uring_enter` return,
 /// rejecting contradictory over-counts and unexplained zero-progress loops
-/// (M31).
+///.
 pub(crate) fn reconcile_submit_progress(
     to_submit: u32,
     submitted: u32,
@@ -622,7 +626,7 @@ mod test {
     /// On a host where raw `io_uring_setup` succeeds and an independent raw
     /// `IORING_REGISTER_PROBE` reports `IORING_OP_READ` supported, `Uring::new`
     /// must succeed (so an always-false `probe_op_read` fails this test!), while
-    /// `REFUSE_OP_READ` causes `Uring::new` to fail with `EOPNOTSUPP` (L10).
+    /// `REFUSE_OP_READ` causes `Uring::new` to fail with `EOPNOTSUPP`.
     #[test]
     fn uring_probe_accepts_op_read_and_refuse_seam_rejects_it() {
         let mut params = super::IoUringParams::default();

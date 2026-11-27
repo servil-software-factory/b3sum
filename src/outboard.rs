@@ -142,7 +142,7 @@ fn build<E>(
 }
 
 /// Stream `reader` in 16 KiB chunk groups to compute its root hash and Bao
-/// outboard without holding the full input in memory (M12). Retains only a
+/// outboard without holding the full input in memory. Retains only a
 /// single-group (16 KiB) lookahead buffer to distinguish the final group plus
 /// the group chaining values and parent nodes, reading in chunks of at least
 /// `min_packet_read_len()` so Linux `pipe2(O_DIRECT)` packet-mode pipes never
@@ -529,7 +529,7 @@ pub(crate) mod test {
         ),
     ];
 
-    /// Non-uniform key `[0x00, 0x01, ..., 0x1f]` golden from `bao-tree 0.17.0`
+    /// Non-uniform key `[0x00, 0x01,..., 0x1f]` golden from `bao-tree 0.17.0`
     /// at `5 * GROUP + 1` (81,921 bytes, ragged multi-group tree) so both byte
     /// and word ordering in keyed mode are pinned independently.
     const BAO_TREE_0_17_0_NONUNIFORM_KEY: (usize, &str, usize, &str) = (

@@ -24,8 +24,8 @@ check holds the version commit to that commit: the same files, but for
 the release's version written where a version stood. So a tag that was
 moved, or a version commit with anything else in it, is no release here,
 and every check below is then of the source the name commits to. With
---published the version commit must also be in the history of the
-remote's main branch, which only a release moves.
+--published the version commit must also be in the history of
+origin/main.
 
 Take this checker from a commit you trust, not from the tag's own: the
 code commit the name gives (git checkout <those 40 digits>) or main. A
@@ -105,7 +105,7 @@ CRATE_DIRS = ("",)
 B3SUM_TARGETS = ("x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu")
 # A release version or development-line version stamp.
 STAMP = re.compile(rb"\d+\.\d+\.\d+\+(?:[0-9a-f]{40}|dev)")
-# Cargo's own files in a .crate: not the commit's.
+# Cargo's own files in a.crate: not the commit's.
 CARGOS = (".cargo_vcs_info.json", "Cargo.toml", "Cargo.lock")
 
 
@@ -184,7 +184,7 @@ class Release:
             problems.append("changes no version from its parent")
         # Require exact stamped values in every declared crate's Cargo.toml and
         # (when present) in Cargo.lock for local crates ONLY — refusing edits to
-        # unrelated dependency versions (such as Git-pinned blake3-servil; M20).
+        # unrelated dependency versions (such as Git-pinned blake3-servil).
         if not problems:
             crate_names = set()
             for folder in CRATE_DIRS:
@@ -361,7 +361,7 @@ def _read_bounded(stream, limit, label):
 def crate_problems(data, release, max_uncompressed_bytes=MAX_CRATE_UNCOMPRESSED_BYTES, max_members=MAX_CRATE_MEMBERS):
     """Why the .crate `data` is not the version commit's files."""
     # Cap the decompressed gzip stream BEFORE handing it to tarfile so a
-    # gzip/header bomb cannot exhaust memory or CPU during archive traversal (R3 M5).
+    # gzip/header bomb cannot exhaust memory or CPU during archive traversal.
     try:
         with gzip.GzipFile(fileobj=io.BytesIO(data), mode="rb") as gz:
             raw_tar = _read_bounded(gz, max_uncompressed_bytes, "decompressed crate")
@@ -553,7 +553,7 @@ def published(release):
     for asset in sorted(listing["assets"], key=lambda asset: (is_digest(asset["name"]), asset["name"])):
         yield f"the GitHub release: {asset['name']}", asset["name"], fetch(asset["browser_download_url"])
     # Each program, and both digest files the release has beside it
-    # (CONTRIBUTING, tools/b3sum-release.sh): a missing digest file fails,
+    # (README.md, tools/b3sum-release.sh): a missing digest file fails,
     # as a wrong one does (BLAKE3 #446).
     programs = [n for n in expected(release) if not n.endswith(".crate")]
     for missing in [n for n in programs + expected_program_digests(release) if n not in names]:
@@ -724,7 +724,7 @@ def main(argv):
         bad = 0
         if paths == ["--published"]:
             items = published(release)
-            # Published from main: the branch only a release moves.
+            # Published release commit must be reachable from origin/main.
             on_main = release.on_main()
             if on_main is not True:
                 bad = 1
