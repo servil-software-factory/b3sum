@@ -22,7 +22,7 @@ impl Mmap {
     /// # Safety
     ///
     /// The underlying file must not be modified or truncated concurrently
-    /// while the mapping is live (see `b3sum/README.md`, `--no-mmap`).
+    /// while the mapping is live (see `README.md`, `--no-mmap`).
     pub(crate) unsafe fn map(file: &impl AsRawFd) -> io::Result<Self> {
         let fd = file.as_raw_fd();
         // Sound: `libc::stat` is a plain C struct of integers initialized by `fstat`.

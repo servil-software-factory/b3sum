@@ -100,7 +100,7 @@ Options:
   -h, --help                  Print help
   -V, --version               Print version
 
-More information: b3sum/README.md at
+More information: README.md at
 https://github.com/servil-software-factory/b3sum/blob/main/README.md
 ```
 

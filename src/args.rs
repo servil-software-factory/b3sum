@@ -33,8 +33,8 @@ Options:
   -h, --help                  Print help
   -V, --version               Print version
 
-More information: b3sum/README.md at
-https://github.com/servil-software-factory/BLAKE3/blob/main/b3sum/README.md
+More information: README.md at
+https://github.com/servil-software-factory/b3sum/blob/main/README.md
 ";
 
 #[derive(Debug, PartialEq, Eq)]
@@ -337,4 +337,16 @@ where
         quiet,
         outboard,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::HELP_TEXT;
+
+    #[test]
+    fn help_text_matches_readme() {
+        let readme = include_str!("../README.md");
+        let fenced = format!("```\n{HELP_TEXT}```");
+        assert!(readme.contains(&fenced), "HELP_TEXT in src/args.rs drifted from the Usage block in README.md");
+    }
 }
