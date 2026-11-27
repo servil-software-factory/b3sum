@@ -135,11 +135,6 @@ def _attr_requires_test(attr_text):
     return any(cfg_requires_test(expr) for expr in _extract_cfg_exprs(attr_text))
 
 
-def line_has_test_cfg(code_line):
-    """True iff `code_line` begins with an outer `#[cfg(...)]` requiring `test`."""
-    return _attr_requires_test(code_line.strip())
-
-
 def split_code_and_comments(text):
     """Return `(code_text, comment_text)` preserving line numbers:
     - `code_text` blanks out comments and string/raw-string/char literals;
@@ -246,10 +241,6 @@ def split_code_and_comments(text):
         comm_out.append("\n" if ch == "\n" else " ")
         i += 1
     return "".join(code_out), "".join(comm_out)
-
-
-def strip_code_preserving_lines(text):
-    return split_code_and_comments(text)[0]
 
 
 def _iter_comment_tokens(comm_text):
@@ -608,14 +599,6 @@ def _blank_spans(text, spans):
     return "".join(out)
 
 
-def mask_test_items(code):
-    """Mask every outer `#[cfg(...)]` requiring `test` together with its exact
-    attached item, block, statement, field, or parameter in comment/string-
-    stripped `code`, replacing masked characters with spaces while preserving
-    every `\\n`."""
-    return _blank_spans(code, _test_item_spans(code))
-
-
 def _extend_trailing_comment_spans(code_text, comm_text, spans):
     """Extend each masked `#[cfg(test)]` span across any immediately following
     trailing comment tokens on its ending line (including nested or multi-line
@@ -672,16 +655,6 @@ def masked_code(text):
     return masked, comm_text
 
 
-def non_test_lines(text):
-    """Yield `(line_number_1based, raw_line, code_line)` for every line of
-    `text`, with test-only `#[cfg(...)]` modules, items, and statements masked
-    out of `code_line` at exact token boundaries."""
-    raw_lines = text.split("\n")
-    masked_lines = masked_code(text)[0].split("\n")
-    for idx, (raw, code) in enumerate(zip(raw_lines, masked_lines), 1):
-        yield idx, raw, code
-
-
 def _macro_call_end(code, bang_end):
     """Given index right after `!` of a macro call, return index right after
     its balanced delimiter group (and optional trailing `;`)."""
@@ -736,7 +709,7 @@ def debug_assert_without_reason(text):
     """The lines (numbers from 1, and the line) of `text`'s `debug_assert*!`
     invocations that have no non-empty `// Debug-only:` comment directly
     attached above (or inline/trailing on that invocation alone), skipping
-    test-only modules/items (QUALITY.md). Consecutive standalone
+    test-only modules/items (README.md). Consecutive standalone
     `debug_assert*!` statements share one directly attached comment above;
     any other code or branch boundary breaks attachment."""
     raw_lines = text.split("\n")

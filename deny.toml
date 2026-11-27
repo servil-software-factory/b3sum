@@ -29,9 +29,6 @@ include-dev = true
 allow = [
     "MIT",
     "Apache-2.0",
-    "Apache-2.0 WITH LLVM-exception",
-    "ISC",
-    "CC0-1.0",
     "TGPPL-1.0",
 ]
 # BOSL-1.0 is welcome too (Zooko, November 23, 2026). SPDX has no identifier

@@ -1,6 +1,10 @@
-# cargo-nextest profile for b3sum (BLAKE3 #465).
-# Matches the repository root's 60 s per-test hang timeout so a wedged CLI or
-# I/O test is stopped and named rather than hanging indefinitely.
+# cargo-nextest profile for standalone b3sum.
+# Enforces one 60 s per-test hang timeout so a wedged CLI or I/O test is
+# stopped and named rather than hanging indefinitely. Two planted-fault
+# subprocess tests (`unit_tests::sigbus_exits_promptly_...` and
+# `uring::test::failed_enter_aborts_even_with_full_undrained_stderr_pipe`)
+# keep an 8 s parent `try_wait` deadline so a removed nonblocking-write guard
+# fails cleanly under `tools/b3sum_controls.py` instead of timing out at 60 s.
 
 [profile.default]
 slow-timeout = { period = "60s", terminate-after = 1 }

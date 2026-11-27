@@ -26,13 +26,15 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// Cargo's marker in its checkout of a git dependency: no change of ours.
-const CARGO_MARKER: &str = ".cargo-ok";
-
 fn git_bytes_with_stdin(dir: &Path, args: &[&str], index: Option<&Path>, objects: Option<(&Path, &OsStr)>, stdin_bytes: Option<&[u8]>) -> Option<Vec<u8>> {
     use std::io::Write;
     use std::process::Stdio;
     let mut command = Command::new("git");
+    // Strip ambient GIT_* overrides so an outer repository's environment
+    // cannot redirect `git -C <crate>` to a foreign HEAD or index.
+    for var in ["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY", "GIT_COMMON_DIR", "GIT_NAMESPACE"] {
+        command.env_remove(var);
+    }
     command.arg("-C").arg(dir).args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
     if let Some(index) = index {
         command.env("GIT_INDEX_FILE", index);
@@ -152,9 +154,6 @@ pub fn build_version(krate: &Path, version: &str, scratch: &Path) -> (String, Ve
     let mut cached_existing = Vec::new();
     let mut tracked_top_dirs: BTreeSet<Vec<u8>> = BTreeSet::new();
     for raw in cached_raw.split(|&b| b == 0).filter(|s| !s.is_empty()) {
-        if raw == CARGO_MARKER.as_bytes() {
-            continue;
-        }
         if let Some(slash) = raw.iter().position(|&b| b == b'/') {
             tracked_top_dirs.insert(raw[..slash].to_vec());
         }
@@ -480,9 +479,6 @@ fn watched(dir: &Path, git_dir: &Path, common: &Path, cached_raw: &[u8], top_dir
         }
     }
     for raw in cached_raw.split(|&b| b == 0).filter(|s| !s.is_empty()) {
-        if raw == CARGO_MARKER.as_bytes() {
-            continue;
-        }
         let full = dir.join(OsStr::from_bytes(raw));
         if full.symlink_metadata().is_ok() {
             set.insert(full);

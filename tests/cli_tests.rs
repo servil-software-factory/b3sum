@@ -152,7 +152,9 @@ fn test_output_error_is_failure() {
     fs::write(dir.path().join("empty"), b"").unwrap();
     // Published BLAKE3 test vector for the empty input, not this binary's output.
     fs::write(dir.path().join("sums"), b"af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262  empty\n").unwrap();
-    for args in [&[][..], &["--raw"][..], &["--length", "64"][..], &["--check", "sums"][..], &["--help"][..], &["--version"][..]] {
+    for args in
+        [&[][..], &["--raw"][..], &["--raw", "--length", "64"][..], &["--length", "64"][..], &["--check", "sums"][..], &["--help"][..], &["--version"][..]]
+    {
         let output = std::process::Command::new(b3sum_exe())
             .args(args)
             .current_dir(dir.path())

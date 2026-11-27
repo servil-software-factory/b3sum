@@ -10,7 +10,12 @@ standard input, like `sha256sum` or `md5sum`. This is `blake3-servil`'s
 
 ## Prebuilt Linux binaries
 
-Download `b3sum-VERSION-x86_64-unknown-linux-gnu` or
+> **Standalone repo status:** `servil-software-factory/b3sum` was recently split
+> out of `servil-software-factory/BLAKE3` and does not yet have a standalone tag
+> or GitHub release here; existing `b3sums` releases on crates.io and earlier
+> release binaries (`0.9.0`–`0.11.0`) were published from the monorepo.
+
+Once tagged here, download `b3sum-VERSION-x86_64-unknown-linux-gnu` or
 `b3sum-VERSION-aarch64-unknown-linux-gnu` and its `.sha256` and `.b3` digest
 files from the
 [releases page](https://github.com/servil-software-factory/b3sum/releases).
@@ -235,23 +240,32 @@ $ ls outboards
 ## Quality, testing, and security
 
 This standalone CLI crate (`b3sums`) is pre-1.0 software maintained under the
-[Servil Software Factory Manual](https://github.com/servil-software-factory/.github/blob/main/manual/01-philosophy.md).
+[Servil Software Factory standards](https://github.com/servil-software-factory/.github/blob/main/profile/README.md)
+and [Chapter 1](https://github.com/servil-software-factory/.github/blob/main/manual/01-philosophy.md).
 Supported build targets are `x86_64-unknown-linux-gnu`,
 `aarch64-unknown-linux-gnu`, and `aarch64-apple-darwin` (enforced in `build.rs`;
 for other platforms, see official upstream [BLAKE3 `b3sum`](https://github.com/BLAKE3-team/BLAKE3)).
+Static prebuilt release binaries and Linux `io_uring`/fault-control CI jobs
+target the two Linux triples; `aarch64-apple-darwin` is a source-build target
+tested in GitHub CI (no macOS prebuilt binary or controls job yet). `--num-threads`
+is capped internally at `max(64, 4 × CPUs)` up to `1024`. Incremental dev
+`--version` stamps hash tracked files, staged index entries, and non-ignored
+untracked files under tracked subdirectories (not unstaged root scratch files);
+release scripts build from fresh `HEAD` clones.
 
 ### Verification scope and limits
 
 | Check | What it verifies | Known limits |
 |---|---|---|
-| `cargo nextest run --locked --release` | Unit, CLI, `--check`, `--outboard`, PTY, FD-budget, and `io_uring` tests across all three native CI targets | Covers CLI I/O paths; BLAKE3 kernel proofs live in `blake3-servil-core`, not this crate |
+| `cargo nextest run --locked --release` | Unit, CLI, `--check`, `--outboard`, PTY, FD-budget, and `io_uring` tests on all three GitHub-hosted CI targets | Runs on GitHub-hosted VMs (not dedicated native fleet hardware); BLAKE3 kernel proofs live in `blake3-servil-core`, not this crate |
 | `python3 tools/b3sum_controls.py` | 18 staged planted-fault controls on Linux (fd/ring/mmap/cancel/bounds regressions) | Targeted regression controls, not full repository-wide mutation coverage |
-| `python3 tools/unsafe_reasons.py` | Proximity check that shipped `unsafe` sites carry a `Sound:` comment and `debug_assert*!` carries `Debug-only:` | Syntactic check; does not prove soundness of `unsafe` blocks |
-| `python3 tools/test_dependency_policy.py` & `cargo-deny` / `cargo-vet` | Dependency graph policy (`libc` admitted via `supply-chain/config.toml` exemption; remaining deps audited) | Release packaging (`cargo package`) requires replacing the dev Git pin with a published `blake3-servil` version |
+| `python3 tools/unsafe_reasons.py` | Proximity check that shipped `unsafe` sites carry a `Sound:` comment and shipped `debug_assert*!` carries `Debug-only:` | Syntactic check; does not prove soundness of `unsafe` blocks |
+| `python3 tools/dependency_policy.py` & `controls` (`cargo-deny` / `cargo-vet`) | Dependency graph policy: the only third-party crate (`libc`) is exempted (not audited) in `supply-chain/config.toml`; `blake3-servil*` are first-party by policy and commit-pinned | Release packaging (`cargo package`) requires replacing the dev Git pin with a published `blake3-servil` version; Rust toolchains are version-selected via `rustup` rather than manifest-hash-pinned |
 
-AI-assisted development is reviewed per change and audited across rounds, with
-human approval required for releases; no independent third-party human audit of
-this standalone CLI I/O layer has been performed yet.
+This repository's code is written primarily by AI agents under human direction,
+reviewed across rounds, with explicit human approval required for tags and
+releases; no independent third-party human audit of this standalone CLI I/O
+layer has been performed yet.
 
 Run the local verification checks from a checkout:
 
@@ -261,7 +275,10 @@ cargo clippy --locked --bins -- -D warnings
 cargo nextest run --locked --release
 python3 tools/unsafe_reasons.py
 python3 tools/b3sum_controls.py         # Linux: 18 staged planted-fault controls
+sh tools/ci-tools.sh cargo-deny cargo-vet
 python3 tools/test_dependency_policy.py
+python3 tools/dependency_policy.py
+python3 tools/dependency_policy.py controls
 python3 tools/test_release_artifacts.py
 ```
 

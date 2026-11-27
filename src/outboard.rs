@@ -205,7 +205,6 @@ pub(crate) fn outboard_from_reader(mode: blake3::Mode, reader: &mut impl std::io
 /// discard stale mappings and stream to EOF), and `Err(Failure::Err)` on a real
 /// I/O error; on any `Err`, `out` is rolled back to its prior length.
 #[cfg(target_os = "linux")]
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn outboard_direct(
     mode: blake3::Mode,
     file: &std::fs::File,
@@ -222,8 +221,8 @@ pub(crate) fn outboard_direct(
     direct(mode, file, len, threads, mine.get_or_insert_with(Piece::new), cvs, out)
 }
 
-/// [`outboard_direct`]'s reading and hashing, for a file of `len` bytes,
-/// PIECE or more: each piece's groups' chaining values are a run of the
+/// [`outboard_direct`]'s reading and hashing, for a file of `len` bytes
+/// (`len >= PIECE`): each piece's groups' chaining values are a run of the
 /// file's (a piece is 128 groups).
 #[cfg(target_os = "linux")]
 fn direct(
@@ -641,9 +640,9 @@ pub(crate) mod test {
     /// A file read directly gives the hash and outboard its bytes in
     /// memory give: at lengths around a piece and ragged ones, on one
     /// thread and several, plain and keyed. A file whose pieces are not
-    /// the ones its length when opened promised gives None and leaves
-    /// `out` as it was. (Where the test's directory has no direct reads, as a
-    /// tmpfs before Linux 6.6, there is nothing to compare.)
+    /// the ones its length when opened promised returns `Err(Failure::Changed)`
+    /// and leaves `out` as it was. (Where the test's directory has no direct
+    /// reads, as a tmpfs before Linux 6.6, there is nothing to compare.)
     #[test]
     #[cfg(target_os = "linux")]
     fn a_file_read_directly_gives_the_same_outboard() {

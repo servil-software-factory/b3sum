@@ -252,4 +252,23 @@ fn incremental_cargo_build_agrees_with_fresh_build_across_root_and_subdir_change
     fs::write(repo.join("Cargo.toml"), format!("{orig_toml}# tracked root edit\n")).unwrap();
     let v5 = assert_inc_matches_fresh("edited tracked root file");
     assert!(v5.starts_with(&format!("0.11.0+dev.{head}.dirty.")), "got {v5}");
+    fs::write(repo.join("Cargo.toml"), &orig_toml).unwrap();
+
+    // 6. Exported foreign `GIT_DIR` must NOT spoof `build_version`'s commit.
+    let foreign = root.path().join("foreign");
+    fs::create_dir_all(&foreign).unwrap();
+    let foreign_head = init_repo(&foreign);
+    assert_ne!(foreign_head, head);
+    let foreign_target = tempfile::tempdir().unwrap();
+    let out = Command::new(&cargo)
+        .args(["build", "--quiet", "--offline"])
+        .current_dir(&repo)
+        .env("CARGO_TARGET_DIR", foreign_target.path())
+        .env("GIT_DIR", foreign.join(".git"))
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "cargo build with foreign GIT_DIR failed: {}", String::from_utf8_lossy(&out.stderr));
+    let run = Command::new(foreign_target.path().join("debug/stamp_fixture")).output().unwrap();
+    assert!(run.status.success());
+    assert_eq!(String::from_utf8(run.stdout).unwrap(), format!("0.11.0+dev.{head}"), "foreign GIT_DIR must not spoof build_version");
 }

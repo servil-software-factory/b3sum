@@ -29,7 +29,7 @@ permissions:
 jobs:
   verify-tag:
     name: verify release tag ancestry and version-only delta
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     outputs:
       commit: ${{ steps.verify.outputs.commit }}
@@ -81,7 +81,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, ubuntu-24.04-arm]
+        os: [ubuntu-24.04, ubuntu-24.04-arm]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     steps:
@@ -112,7 +112,7 @@ jobs:
   clean:
     name: every published artifact is a clean build of the version commit
     needs: [verify-tag, build]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       # Check out the verified code commit (proven in verify-tag to be in

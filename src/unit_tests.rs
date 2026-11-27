@@ -694,7 +694,9 @@ fn sigbus_exits_promptly_with_full_undrained_stderr_pipe_and_writes_when_writabl
         .stderr(std::process::Stdio::from(stderr_file))
         .spawn()
         .unwrap();
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    // 8 s parent deadline (documented in `.config/nextest.toml`) so the H5
+    // planted-fault control fails cleanly instead of hitting nextest's 60 s cap.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
     let status = loop {
         if let Some(status) = child.try_wait().unwrap() {
             break status;

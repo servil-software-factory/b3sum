@@ -1014,18 +1014,25 @@ pub(crate) fn update(hasher: &mut blake3::convenience::Hasher, input: &[u8]) {
     }
 }
 
-const PIECE: usize = 4 << 20;
+const STREAM_PIECE: usize = 4 << 20;
+
+const _: () = {
+    assert!(STREAM_PIECE == file_end::SMALL_MEM_CAP);
+    assert!(POOL_START_LEN == STREAM_PIECE);
+    #[cfg(target_os = "linux")]
+    assert!(direct::DIRECT_MIN >= STREAM_PIECE as u64);
+};
 
 struct StreamBuffers {
     first: Vec<u8>,
-    /// Allocated lazily only on the multi-threaded overlap branch (M11), so
+    /// Allocated lazily only on the multi-threaded overlap branch, so
     /// single-threaded runs and streams that finish within the first 4 MiB
     /// piece never allocate a second 4 MiB buffer.
     second: Option<Vec<u8>>,
 }
 
 thread_local! {
-    static BUFFERS: std::cell::RefCell<StreamBuffers> = std::cell::RefCell::new(StreamBuffers { first: vec![0; PIECE], second: None });
+    static BUFFERS: std::cell::RefCell<StreamBuffers> = std::cell::RefCell::new(StreamBuffers { first: vec![0; STREAM_PIECE], second: None });
 }
 
 /// Minimum read request length so Linux `pipe2(O_DIRECT)` packet-mode pipes
@@ -1092,7 +1099,7 @@ pub(crate) fn update_from_counted(hasher: &mut blake3::convenience::Hasher, mut 
                 total += len as u64;
             }
         }
-        let second = bufs.second.get_or_insert_with(|| vec![0; PIECE]);
+        let second = bufs.second.get_or_insert_with(|| vec![0; STREAM_PIECE]);
         std::thread::scope(|scope| {
             let (free_tx, free_rx) = std::sync::mpsc::sync_channel::<&mut [u8]>(1);
             let (full_tx, full_rx) = std::sync::mpsc::sync_channel::<(&mut [u8], io::Result<(usize, bool)>)>(1);
@@ -1194,12 +1201,15 @@ fn write_hex_output(mut output: blake3::OutputReader, args: &Args, out: &mut Out
     Ok(())
 }
 
-fn write_raw_output(output: blake3::OutputReader, args: &Args, out: &mut OutBuf) -> err::Result<()> {
-    out.flush()?;
-    let mut output = output.take(args.len());
-    let stdout = std::io::stdout();
-    let mut handler = stdout.lock();
-    std::io::copy(&mut output, &mut handler)?;
+fn write_raw_output(mut output: blake3::OutputReader, args: &Args, out: &mut OutBuf) -> err::Result<()> {
+    let mut len = args.len();
+    let mut block = [0u8; 4096];
+    while len > 0 {
+        let take_bytes = usize::try_from(cmp::min(len, block.len() as u64)).expect("bounded by block.len()");
+        output.fill(&mut block[..take_bytes]);
+        out.write_bytes(&block[..take_bytes])?;
+        len -= take_bytes as u64;
+    }
     Ok(())
 }
 
@@ -1988,7 +1998,6 @@ impl PendingCheckRecord {
 /// while a single record when `entries.is_empty()` is always accepted for
 /// forward progress). Returns `Ok(true)` when EOF was reached AND `pending` is
 /// empty.
-#[allow(clippy::too_many_arguments)]
 fn collect_check_batch(
     reader: &mut impl BufRead,
     raw_line: &mut Vec<u8>,
@@ -2281,7 +2290,6 @@ fn main() -> err::Result<()> {
         files_failed = hash_inputs(&args, &stdin_ctx, &mut out);
     }
     out.flush()?;
-    std::io::stdout().flush()?;
     if args.check() && files_failed > 0 {
         eprintln_safe!("{}: WARNING: {} computed checksum{} did NOT match", NAME, files_failed, if files_failed == 1 { "" } else { "s" },);
     }
