@@ -947,22 +947,11 @@ fn hash_paths_inner(
 
     if io_threads == 1 {
         let next = AtomicUsize::new(0);
-        let mut results: Vec<Option<crate::err::Result<blake3::Hash>>> = (0..nfiles).map(|_| None).collect();
-        let mut emitted = 0usize;
-        let mut stop = false;
+        let mut collector = crate::OrderedCollector::new(nfiles);
         run_hybrid_worker(args, paths, forbidden, slots_per_ring, total_threads, 1, force_no_uring, &next, &mut |idx, res| {
-            results[idx] = Some(res);
-            while emitted < nfiles {
-                let Some(item) = results[emitted].take() else { break };
-                if !on_ordered(emitted, item) {
-                    stop = true;
-                    return false;
-                }
-                emitted += 1;
-            }
-            !stop
+            collector.insert_and_drain(idx, res, &mut *on_ordered, || {})
         });
-        assert!(stop || emitted == nfiles, "single-reader collector returned after {emitted}/{nfiles} files without cancellation");
+        collector.finish("single-reader collector");
         return;
     }
 
@@ -983,28 +972,18 @@ fn hash_paths_inner(
         }
         drop(done_tx);
 
-        let mut results: Vec<Option<crate::err::Result<blake3::Hash>>> = (0..nfiles).map(|_| None).collect();
-        let mut emitted = 0usize;
-        let mut stop = false;
+        let mut collector = crate::OrderedCollector::new(nfiles);
         let mut take = |idx: usize, res: crate::err::Result<blake3::Hash>| -> bool {
-            results[idx] = Some(res);
-            while emitted < nfiles {
-                let Some(item) = results[emitted].take() else { break };
-                if !on_ordered(emitted, item) {
-                    stop = true;
-                    next.fetch_max(nfiles, Ordering::SeqCst);
-                    #[cfg(test)]
-                    {
-                        let hook = AFTER_CANCEL.lock().unwrap().as_ref().map(std::sync::Arc::clone);
-                        if let Some(hook) = hook {
-                            hook();
-                        }
+            collector.insert_and_drain(idx, res, &mut *on_ordered, || {
+                next.fetch_max(nfiles, Ordering::SeqCst);
+                #[cfg(test)]
+                {
+                    let hook = AFTER_CANCEL.lock().unwrap().as_ref().map(std::sync::Arc::clone);
+                    if let Some(hook) = hook {
+                        hook();
                     }
-                    return false;
                 }
-                emitted += 1;
-            }
-            !stop
+            })
         };
 
         let mut keep_going = true;
@@ -1029,7 +1008,7 @@ fn hash_paths_inner(
             }
         }
         drop(done_rx);
-        assert!(stop || emitted == nfiles, "multi-reader collector returned after {emitted}/{nfiles} files without cancellation");
+        collector.finish("multi-reader collector");
     });
 }
 

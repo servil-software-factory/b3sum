@@ -3,8 +3,10 @@
 //! version, in Cargo.toml, is a release's `X.Y.Z+<its code commit>` on the
 //! release commit alone, and `X.Y.Z+dev` on the commits after it. A build of
 //! the release commit is named by that version alone. Any other build appends
-//! its commit, and a dirty tree the Git tree id of its working tree, every
-//! file Git does not ignore as it is now:
+//! its commit, and a dirty tree the Git tree id of its tracked files, staged
+//! index entries, and non-ignored untracked files under tracked subdirectories
+//! (the exact input set Cargo watches incrementally without recursively
+//! watching `target/`; release scripts build from clean `HEAD` clones):
 //!
 //!     0.8.0+b3c5efc7…              the release commit, clean
 //!     0.8.0+dev.<commit>           a later commit, clean
@@ -139,19 +141,57 @@ pub fn build_version(krate: &Path, version: &str, scratch: &Path) -> (String, Ve
     let objs = Some((private_objects.as_path(), alternates.as_os_str()));
     // Always populate the scratch index from `HEAD` via `read-tree` instead of
     // copying `.git/index` so `assume-unchanged` / `skip-worktree` flags cannot
-    // hide modified source bytes as clean (M1). Also re-add any force-added
-    // ignored paths currently tracked in the real index (`ls-files --cached
-    // --ignored --exclude-standard`) without copying index stat/skip flags.
-    let exclude = format!(":(exclude){CARGO_MARKER}");
-    let force_tracked_ignored = git_bytes(dir, &["ls-files", "-z", "--cached", "--ignored", "--exclude-standard"], None, None);
+    // hide modified source bytes as clean (M1). Hash the exact input set that
+    // `watched()` invalidates in Cargo (R3 M3): every tracked file (via
+    // `add -u`), every existing path currently staged in the real index (incl.
+    // staged root files and force-added ignored files), and every non-ignored
+    // untracked file under tracked top-level subdirectories (e.g. `src/`,
+    // `tests/`, `tools/`), excluding untracked scratch files at the repo root
+    // that Cargo cannot watch without recursively watching `target/`.
+    let cached_raw = git_bytes(dir, &["ls-files", "-z", "--cached"], None, None).unwrap_or_default();
+    let mut cached_existing = Vec::new();
+    let mut tracked_top_dirs: BTreeSet<Vec<u8>> = BTreeSet::new();
+    for raw in cached_raw.split(|&b| b == 0).filter(|s| !s.is_empty()) {
+        if raw == CARGO_MARKER.as_bytes() {
+            continue;
+        }
+        if let Some(slash) = raw.iter().position(|&b| b == b'/') {
+            tracked_top_dirs.insert(raw[..slash].to_vec());
+        }
+        if dir.join(OsStr::from_bytes(raw)).symlink_metadata().is_ok() {
+            cached_existing.extend_from_slice(raw);
+            cached_existing.push(0);
+        }
+    }
+    let existing_top_dirs: Vec<OsString> = tracked_top_dirs
+        .iter()
+        .filter_map(|d| {
+            let os = OsStr::from_bytes(d);
+            dir.join(os).is_dir().then(|| os.to_os_string())
+        })
+        .collect();
     let tree = git_ascii(dir, &["read-tree", "HEAD"], Some(&index), objs)
-        .and_then(|_| git_ascii(dir, &["add", "-A", "--", ".", &exclude], Some(&index), objs))
-        .and_then(|_| match force_tracked_ignored.as_deref() {
-            Some(paths) if !paths.is_empty() => {
-                git_bytes_with_stdin(dir, &["add", "-f", "--pathspec-from-file=-", "--pathspec-file-nul"], Some(&index), objs, Some(paths))
+        .and_then(|_| git_ascii(dir, &["add", "-u", "--", "."], Some(&index), objs))
+        .and_then(|_| {
+            if cached_existing.is_empty() {
+                Some(String::new())
+            } else {
+                git_bytes_with_stdin(dir, &["add", "-f", "--pathspec-from-file=-", "--pathspec-file-nul"], Some(&index), objs, Some(&cached_existing))
                     .map(|_| String::new())
             }
-            _ => Some(String::new()),
+        })
+        .and_then(|_| {
+            if existing_top_dirs.is_empty() {
+                Some(String::new())
+            } else {
+                let mut pathspec_in = Vec::new();
+                for d in &existing_top_dirs {
+                    pathspec_in.extend_from_slice(d.as_bytes());
+                    pathspec_in.push(0);
+                }
+                git_bytes_with_stdin(dir, &["add", "-A", "--pathspec-from-file=-", "--pathspec-file-nul"], Some(&index), objs, Some(&pathspec_in))
+                    .map(|_| String::new())
+            }
         })
         .and_then(|_| git_ascii(dir, &["write-tree"], Some(&index), objs));
     let _ = std::fs::remove_file(&index);
@@ -165,7 +205,7 @@ pub fn build_version(krate: &Path, version: &str, scratch: &Path) -> (String, Ve
         (true, false) => format!("{version}.{commit}"),
         (false, _) => format!("{version}.{commit}.dirty{}", tree.map_or(String::new(), |t| format!(".{t}"))),
     };
-    (name, watched(dir, &git_dir, &common))
+    (name, watched(dir, &git_dir, &common, &cached_raw, &existing_top_dirs))
 }
 
 /// Minimal strict RFC 8259 JSON parser for `.cargo_vcs_info.json` (M16):
@@ -425,35 +465,48 @@ fn from_package_info(dir: &Path, version: &str) -> String {
     if version.ends_with("+dev") || dirty { format!("{version}.{commit}{}", if dirty { ".dirty" } else { "" }) } else { version.to_owned() }
 }
 
-/// What a commit, a checkout, or an edit to tracked/untracked source files
-/// changes: HEAD, the index, the reflog, the refs, NUL-delimited tracked and
-/// untracked non-ignored files, plus non-target source subdirectories (never
-/// the repo root itself, which would make Cargo recursively scan `target/` and
-/// `.git/` and re-run `build.rs` on every no-op build; M2).
-fn watched(dir: &Path, git_dir: &Path, common: &Path) -> Vec<PathBuf> {
+/// What a commit, a checkout, or an edit to the stamped input set changes:
+/// HEAD, the index, the reflog, the refs, every tracked/staged file, every
+/// tracked top-level subdirectory (watched recursively by Cargo so new
+/// untracked files or nested subdirs trigger a rerun), and existing untracked
+/// files inside those tracked subdirectories — never the repo root itself
+/// (which would make Cargo recursively scan `target/` and `.git/` on every
+/// no-op build; M2, R3 M3).
+fn watched(dir: &Path, git_dir: &Path, common: &Path, cached_raw: &[u8], top_dirs: &[OsString]) -> Vec<PathBuf> {
     let mut set = BTreeSet::new();
     for p in [git_dir.join("HEAD"), git_dir.join("index"), git_dir.join("logs/HEAD"), common.join("refs"), common.join("packed-refs")] {
         if p.exists() {
             set.insert(p);
         }
     }
-    if let Some(files) = git_bytes(dir, &["ls-files", "-z", "--cached", "--others", "--exclude-standard"], None, None) {
-        for raw in files.split(|&b| b == 0).filter(|s| !s.is_empty()) {
-            if raw == CARGO_MARKER.as_bytes() {
+    for raw in cached_raw.split(|&b| b == 0).filter(|s| !s.is_empty()) {
+        if raw == CARGO_MARKER.as_bytes() {
+            continue;
+        }
+        let full = dir.join(OsStr::from_bytes(raw));
+        if full.symlink_metadata().is_ok() {
+            set.insert(full);
+        }
+    }
+    for top in top_dirs {
+        let top_path = dir.join(top);
+        if top_path.is_dir() {
+            set.insert(top_path);
+        }
+    }
+    if !top_dirs.is_empty()
+        && let Some(untracked) = git_bytes(dir, &["ls-files", "-z", "--others", "--exclude-standard"], None, None)
+    {
+        for raw in untracked.split(|&b| b == 0).filter(|s| !s.is_empty()) {
+            let Some(slash) = raw.iter().position(|&b| b == b'/') else {
                 continue;
-            }
-            let full = dir.join(OsStr::from_bytes(raw));
-            if full.exists() {
-                // Watch immediate parent subdirectories strictly below `dir`
-                // (never `dir` itself, which contains `target/` and `.git/`).
-                if let Some(parent) = full.parent()
-                    && parent != dir
-                    && parent.starts_with(dir)
-                    && parent.exists()
-                {
-                    set.insert(parent.to_path_buf());
+            };
+            let prefix = OsStr::from_bytes(&raw[..slash]);
+            if top_dirs.iter().any(|d| d.as_os_str() == prefix) {
+                let full = dir.join(OsStr::from_bytes(raw));
+                if full.symlink_metadata().is_ok() {
+                    set.insert(full);
                 }
-                set.insert(full);
             }
         }
     }
