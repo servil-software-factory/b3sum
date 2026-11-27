@@ -792,3 +792,60 @@ fn direct_read_workers_stop_claiming_pieces_after_error() {
     let claimed = crate::direct::CLAIMED_PIECES.load(Ordering::SeqCst);
     assert!(claimed <= 2, "at most piece 0 (failing) and one in-flight peer piece may be claimed, got {claimed} of {pieces}");
 }
+
+#[test]
+fn checked_fd_offset_helpers_propagate_espipe_and_overflow() {
+    use std::io::Read;
+    use std::os::fd::{AsFd, FromRawFd};
+
+    // Regular file: roundtrip offset query, set, and lifetime-bound PreadReader.
+    let dir = crate::tempfile::tempdir().unwrap();
+    let path = dir.path().join("seekable.bin");
+    std::fs::write(&path, b"0123456789abcdef").unwrap();
+    let f = std::fs::File::open(&path).unwrap();
+    assert_eq!(crate::file_end::current_fd_offset(f.as_fd()).unwrap(), 0);
+    crate::file_end::set_fd_offset(f.as_fd(), 6).unwrap();
+    assert_eq!(crate::file_end::current_fd_offset(f.as_fd()).unwrap(), 6);
+    let mut pr = crate::file_end::PreadReader::new(f.as_fd(), 4);
+    let mut chunk = [0u8; 4];
+    pr.read_exact(&mut chunk).unwrap();
+    assert_eq!(&chunk, b"4567");
+    // Positioned pread must not move the file description's cursor.
+    assert_eq!(crate::file_end::current_fd_offset(f.as_fd()).unwrap(), 6);
+    // Overflowing `off_t` (u64::MAX) must fail cleanly as InvalidInput.
+    let err = crate::file_end::set_fd_offset(f.as_fd(), u64::MAX).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    let mut pr_over = crate::file_end::PreadReader::new(f.as_fd(), u64::MAX);
+    let err2 = pr_over.read(&mut chunk).unwrap_err();
+    assert_eq!(err2.kind(), std::io::ErrorKind::InvalidInput);
+
+    // Non-seekable pipe: current_fd_offset and set_fd_offset must propagate ESPIPE
+    // rather than substituting 0 (M2).
+    let mut ends = [0i32; 2];
+    assert_eq!(unsafe { libc::pipe(ends.as_mut_ptr()) }, 0);
+    let r = unsafe { std::fs::File::from_raw_fd(ends[0]) };
+    let w = unsafe { std::fs::File::from_raw_fd(ends[1]) };
+    assert_eq!(crate::file_end::current_fd_offset(r.as_fd()).unwrap_err().raw_os_error(), Some(libc::ESPIPE));
+    assert_eq!(crate::file_end::set_fd_offset(r.as_fd(), 0).unwrap_err().raw_os_error(), Some(libc::ESPIPE));
+    drop((r, w));
+}
+
+#[test]
+fn post_open_forbidden_stream_guard_rejects_swapped_descriptor() {
+    // M13: `ordinary` passes the pre-open `path_matches_stream` check, then
+    // the injected open returns an open descriptor for the forbidden FIFO.
+    // Removing only the post-open `fstat` guard in `open_checked_with` makes
+    // this test fail.
+    use std::os::fd::AsRawFd;
+    let dir = crate::tempfile::tempdir().unwrap();
+    let ordinary = dir.path().join("ordinary.txt");
+    std::fs::write(&ordinary, b"harmless").unwrap();
+    let fifo = dir.path().join("manifest.fifo");
+    assert!(std::process::Command::new("mkfifo").arg(&fifo).status().unwrap().success());
+    let _rw = std::fs::OpenOptions::new().read(true).write(true).open(&fifo).unwrap();
+    let forbid = crate::file_end::fstat_fd(_rw.as_raw_fd()).unwrap().id;
+    assert!(!crate::file_end::path_matches_stream(&ordinary, forbid), "pre-open path check must NOT match ordinary file");
+
+    let err = crate::file_end::open_checked_with(&ordinary, Some(forbid), |_| std::fs::File::open(&fifo)).unwrap_err();
+    assert!(err.to_string().contains("checkfile is a stream"), "post-open fstat guard must reject swapped stream, got {err}");
+}

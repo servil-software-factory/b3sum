@@ -410,14 +410,13 @@ pub(crate) fn stdin_named_twice(paths: &[PathBuf], stdin_ctx: &StdinContext) -> 
 /// open-file description's shared offset (#515).
 #[cfg(target_os = "macos")]
 fn hash_darwin_regular_dev_fd_hash(args: &Args, path: &Path) -> err::Result<blake3::Hash> {
-    use std::os::fd::AsRawFd;
+    use std::os::fd::{AsFd, AsRawFd};
     let file = File::open(path)?;
-    let fd = file.as_raw_fd();
-    let meta = file_end::fstat_fd(fd)?;
-    file_end::ensure_byte_stream_fd(fd, meta.mode_type)?;
+    let meta = file_end::fstat_fd(file.as_raw_fd())?;
+    file_end::ensure_byte_stream_fd(file.as_raw_fd(), meta.mode_type)?;
     if meta.len < MAP_LEN as u64 {
         let mut buf = Vec::with_capacity((usize::try_from(meta.len).expect("len < MAP_LEN") + 1).max(4096).min(SMALL_MEM_CAP + 1));
-        let mut reader = file_end::PreadReader::new(fd, 0);
+        let mut reader = file_end::PreadReader::new(file.as_fd(), 0);
         let mut chunk = [0u8; 64 * 1024];
         loop {
             let n = reader.read(&mut chunk)?;
@@ -446,7 +445,7 @@ fn hash_darwin_regular_dev_fd_hash(args: &Args, path: &Path) -> err::Result<blak
         drop(map);
     }
     let mut hasher = args.base_hasher.clone();
-    update_from(&mut hasher, file_end::PreadReader::new(fd, 0))?;
+    update_from(&mut hasher, file_end::PreadReader::new(file.as_fd(), 0))?;
     Ok(hasher.finalize())
 }
 
@@ -674,10 +673,9 @@ fn hash_path(args: &Args, path: &Path, stdin_ctx: &StdinContext) -> err::Result<
         }
         #[cfg(target_os = "macos")]
         InputRole::DarwinRegularDevFd => {
-            use std::os::fd::AsRawFd;
+            use std::os::fd::{AsFd, AsRawFd};
             let file = File::open(path)?;
-            let fd = file.as_raw_fd();
-            let meta = file_end::validate_byte_stream_fd(fd)?;
+            let meta = file_end::validate_byte_stream_fd(file.as_raw_fd())?;
             if meta.len >= MAP_LEN as u64
                 && let Some(map) = args.map(&file)
                 && resident(&map)
@@ -685,7 +683,7 @@ fn hash_path(args: &Args, path: &Path, stdin_ctx: &StdinContext) -> err::Result<
                 update(&mut hasher, &map);
                 hold(map);
             } else {
-                update_from(&mut hasher, file_end::PreadReader::new(fd, 0))?;
+                update_from(&mut hasher, file_end::PreadReader::new(file.as_fd(), 0))?;
             }
         }
         InputRole::Path => {
@@ -1393,23 +1391,33 @@ fn hash_paths_32(
                 let Some(item) = results[emitted].take() else { break };
                 if !on_ordered(emitted, item) {
                     stop = true;
+                    next.fetch_max(paths.len(), std::sync::atomic::Ordering::Relaxed);
                     return false;
                 }
                 emitted += 1;
             }
             !stop
         };
+        let mut keep_going = true;
         loop {
             let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if i >= paths.len() || !take(i, hash_path_hash(args, &paths[i], stdin_ctx, forbidden)) {
+            if i >= paths.len() {
+                break;
+            }
+            if !take(i, hash_path_hash(args, &paths[i], stdin_ctx, forbidden)) {
+                keep_going = false;
                 break;
             }
         }
-        for (i, output) in done_rx {
-            if !take(i, output) {
-                break;
+        if keep_going {
+            while let Ok((i, output)) = done_rx.recv() {
+                if !take(i, output) {
+                    break;
+                }
             }
         }
+        drop(done_rx);
+        assert!(stop || emitted == paths.len(), "ordered collector returned after {emitted}/{} operands without cancellation", paths.len());
     });
 }
 
@@ -1589,7 +1597,7 @@ fn outboard_of(
         }
         #[cfg(target_os = "macos")]
         InputRole::DarwinRegularDevFd => {
-            use std::os::fd::AsRawFd;
+            use std::os::fd::{AsFd, AsRawFd};
             let file = File::open(path)?;
             let fd = file.as_raw_fd();
             let meta = file_end::validate_byte_stream_fd(fd)?;
@@ -1600,7 +1608,7 @@ fn outboard_of(
                 hold(map);
                 return Ok(hash);
             }
-            file_end::pread_all_into(fd, bytes)?;
+            file_end::pread_all_into(file.as_fd(), bytes)?;
             return Ok(outboard::outboard(mode, bytes, threads, &mut rooms.cvs, nodes));
         }
         InputRole::Path => {}
@@ -1716,6 +1724,7 @@ fn hash_inputs_with<O: Send>(
         drop(done_tx);
         let mut failed = 0u64;
         let mut printed = 0usize;
+        let mut stop = false;
         let mut results: Vec<Option<err::Result<O>>> = (0..paths.len()).map(|_| None).collect();
         let mut take = |i: usize, output: err::Result<O>| {
             results[i] = Some(output);
@@ -1726,6 +1735,8 @@ fn hash_inputs_with<O: Send>(
                     let _ = out.flush();
                     eprintln_safe!("{}: {}: {}", NAME, paths[printed].to_string_lossy(), e);
                     if out.is_poisoned() {
+                        stop = true;
+                        next.fetch_max(paths.len(), std::sync::atomic::Ordering::Relaxed);
                         return false;
                     }
                 }
@@ -1733,12 +1744,23 @@ fn hash_inputs_with<O: Send>(
             }
             true
         };
-        work(args, &next, &mut take);
-        for (i, output) in done_rx {
+        let mut keep_going = true;
+        work(args, &next, &mut |i, output| {
             if !take(i, output) {
-                break;
+                keep_going = false;
+                return false;
+            }
+            true
+        });
+        if keep_going {
+            while let Ok((i, output)) = done_rx.recv() {
+                if !take(i, output) {
+                    break;
+                }
             }
         }
+        drop(done_rx);
+        assert!(stop || printed == paths.len(), "ordered input collector returned after {printed}/{} operands without cancellation", paths.len());
         failed
     })
 }
@@ -1937,103 +1959,107 @@ fn collect_check_batch(
     Ok(false)
 }
 
+/// Owning reader for a checkfile source, binding every positioned `pread`
+/// reader to the lifetime of its open descriptor instead of a raw fd (M6).
+enum CheckfileReader<'a> {
+    File(File),
+    Stdin(io::StdinLock<'a>),
+    #[cfg(target_os = "macos")]
+    PreadFile {
+        file: File,
+        offset: u64,
+    },
+    #[cfg(target_os = "macos")]
+    PreadStdin {
+        stdin: io::StdinLock<'a>,
+        offset: u64,
+    },
+}
+
+impl Read for CheckfileReader<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        #[cfg(target_os = "macos")]
+        use std::os::fd::AsFd;
+        match self {
+            CheckfileReader::File(f) => f.read(buf),
+            CheckfileReader::Stdin(s) => s.read(buf),
+            #[cfg(target_os = "macos")]
+            CheckfileReader::PreadFile { file, offset } => file_end::pread_at(file.as_fd(), offset, buf),
+            #[cfg(target_os = "macos")]
+            CheckfileReader::PreadStdin { stdin, offset } => file_end::pread_at(stdin.as_fd(), offset, buf),
+        }
+    }
+}
+
 fn check_one_checkfile(path: &Path, args: &Args, stdin_ctx: &StdinContext, files_failed: &mut u64, out: &mut OutBuf) -> err::Result<()> {
+    #[cfg(target_os = "macos")]
+    use std::os::fd::AsFd;
     const CHECK_CHUNK: usize = 4096;
 
-    let mut file;
-    let stdin;
-    let mut stdin_lock;
-    #[cfg(target_os = "macos")]
-    let mut darwin_pread = file_end::PreadReader::new(0, 0);
-    let mut bufreader: io::BufReader<&mut dyn Read>;
+    let stdin = io::stdin();
     let own: Option<StreamId>;
     let checkfile_is_stdin;
-    #[cfg(target_os = "macos")]
-    let mut darwin_stdin_dash_pread = false;
-    let check_buf_cap = min_packet_read_len().max(64 * 1024);
-    match stdin_ctx.classify(path) {
+    let reader: CheckfileReader<'_> = match stdin_ctx.classify(path) {
         InputRole::StdinDash => {
             checkfile_is_stdin = true;
-            let _stdin_meta = {
-                let meta = file_end::fstat_fd(0)?;
-                file_end::ensure_byte_stream_fd(0, meta.mode_type)?;
-                own = (meta.kind == file_end::FileKind::Stream).then_some(meta.id);
-                meta
-            };
+            let stdin_lock = stdin.lock();
+            let meta = file_end::validate_byte_stream_fd(0)?;
+            own = (meta.kind == file_end::FileKind::Stream).then_some(meta.id);
             #[cfg(target_os = "macos")]
-            {
-                if _stdin_meta.kind == file_end::FileKind::Regular {
-                    // Sound: `lseek(SEEK_CUR)` queries fd 0's current offset without touching memory.
-                    let start = unsafe { libc::lseek(0, 0, libc::SEEK_CUR) }.max(0) as u64;
-                    darwin_pread = file_end::PreadReader::new(0, start);
-                    darwin_stdin_dash_pread = true;
-                    bufreader = io::BufReader::with_capacity(check_buf_cap, &mut darwin_pread);
-                } else {
-                    stdin = io::stdin();
-                    stdin_lock = stdin.lock();
-                    bufreader = io::BufReader::with_capacity(check_buf_cap, &mut stdin_lock);
-                }
+            if meta.kind == file_end::FileKind::Regular {
+                let start = file_end::current_fd_offset(stdin_lock.as_fd())?;
+                CheckfileReader::PreadStdin { stdin: stdin_lock, offset: start }
+            } else {
+                CheckfileReader::Stdin(stdin_lock)
             }
             #[cfg(not(target_os = "macos"))]
             {
-                stdin = io::stdin();
-                stdin_lock = stdin.lock();
-                bufreader = io::BufReader::with_capacity(check_buf_cap, &mut stdin_lock);
+                let _ = &meta;
+                CheckfileReader::Stdin(stdin_lock)
             }
         }
         InputRole::StdinStreamAlias => {
             checkfile_is_stdin = true;
-            let meta = file_end::fstat_fd(0)?;
-            file_end::ensure_byte_stream_fd(0, meta.mode_type)?;
+            let stdin_lock = stdin.lock();
+            let meta = file_end::validate_byte_stream_fd(0)?;
             own = (meta.kind == file_end::FileKind::Stream).then_some(meta.id);
-            stdin = io::stdin();
-            stdin_lock = stdin.lock();
-            bufreader = io::BufReader::with_capacity(check_buf_cap, &mut stdin_lock);
+            CheckfileReader::Stdin(stdin_lock)
         }
         #[cfg(target_os = "macos")]
         InputRole::DarwinRegularDevFd => {
             use std::os::fd::AsRawFd;
             checkfile_is_stdin = false;
             own = None;
-            file = File::open(path)?;
-            let meta = file_end::fstat_fd(file.as_raw_fd())?;
-            file_end::ensure_byte_stream_fd(file.as_raw_fd(), meta.mode_type)?;
-            darwin_pread = file_end::PreadReader::new(file.as_raw_fd(), 0);
-            bufreader = io::BufReader::with_capacity(check_buf_cap, &mut darwin_pread);
+            let file = File::open(path)?;
+            let _ = file_end::validate_byte_stream_fd(file.as_raw_fd())?;
+            CheckfileReader::PreadFile { file, offset: 0 }
         }
         InputRole::Path => {
-            file = File::open(path)?;
-            let _meta = {
-                use std::os::fd::AsRawFd;
-                let meta = file_end::fstat_fd(file.as_raw_fd())?;
-                file_end::ensure_byte_stream_fd(file.as_raw_fd(), meta.mode_type)?;
-                own = (meta.kind == file_end::FileKind::Stream).then_some(meta.id);
-                checkfile_is_stdin = own.is_some() && own == stdin_ctx.stdin_stream_id();
-                meta
-            };
+            use std::os::fd::AsRawFd;
+            let file = File::open(path)?;
+            let meta = file_end::validate_byte_stream_fd(file.as_raw_fd())?;
+            own = (meta.kind == file_end::FileKind::Stream).then_some(meta.id);
+            checkfile_is_stdin = own.is_some() && own == stdin_ctx.stdin_stream_id();
             #[cfg(target_os = "macos")]
-            {
-                use std::os::fd::AsRawFd;
-                if _meta.kind == file_end::FileKind::Regular {
-                    // On macOS, opening `/dev/fd/N` shares the underlying open
-                    // file description offset (`fd(4)`). Reading a regular
-                    // checkfile via positioned `pread` prevents any `-` or
-                    // `/dev/fd/M` entry from advancing the parser cursor behind
-                    // its back (#515).
-                    // Sound: `lseek(SEEK_CUR)` queries the current offset without touching memory.
-                    let start = unsafe { libc::lseek(file.as_raw_fd(), 0, libc::SEEK_CUR) }.max(0) as u64;
-                    darwin_pread = file_end::PreadReader::new(file.as_raw_fd(), start);
-                    bufreader = io::BufReader::with_capacity(check_buf_cap, &mut darwin_pread);
-                } else {
-                    bufreader = io::BufReader::with_capacity(check_buf_cap, &mut file);
-                }
+            if meta.kind == file_end::FileKind::Regular {
+                // On macOS, opening `/dev/fd/N` shares the underlying open
+                // file description offset (`fd(4)`). Reading a regular
+                // checkfile via positioned `pread` prevents any `-` or
+                // `/dev/fd/M` entry from advancing the parser cursor behind
+                // its back (#515).
+                let start = file_end::current_fd_offset(file.as_fd())?;
+                CheckfileReader::PreadFile { file, offset: start }
+            } else {
+                CheckfileReader::File(file)
             }
             #[cfg(not(target_os = "macos"))]
             {
-                bufreader = io::BufReader::with_capacity(check_buf_cap, &mut file);
+                CheckfileReader::File(file)
             }
         }
-    }
+    };
+    let check_buf_cap = min_packet_read_len().max(64 * 1024);
+    let mut bufreader = io::BufReader::with_capacity(check_buf_cap, reader);
 
     // The checkfile's own stream, by any name (few checkfiles are
     // streams: for those every entry is looked at, AND the actual opened
@@ -2057,62 +2083,73 @@ fn check_one_checkfile(path: &Path, args: &Args, stdin_ctx: &StdinContext, files
     let mut eof = false;
     let mut saw_line = false;
 
-    while !eof {
-        eof = collect_check_batch(
-            &mut bufreader,
-            &mut raw_line,
-            &mut pending,
-            &mut entries,
-            &mut batch_paths,
-            CHECK_CHUNK,
-            MAX_CHECK_BATCH_BYTES,
-            MAX_CHECK_LINE_BYTES,
-            stdin_ctx,
-            &is_the_checkfile,
-        )?;
-        if entries.is_empty() {
-            break;
-        }
-        saw_line = true;
+    let loop_res: err::Result<()> = (|| {
+        while !eof {
+            eof = collect_check_batch(
+                &mut bufreader,
+                &mut raw_line,
+                &mut pending,
+                &mut entries,
+                &mut batch_paths,
+                CHECK_CHUNK,
+                MAX_CHECK_BATCH_BYTES,
+                MAX_CHECK_LINE_BYTES,
+                stdin_ctx,
+                &is_the_checkfile,
+            )?;
+            if entries.is_empty() {
+                break;
+            }
+            saw_line = true;
 
-        let mut batch_results: Vec<Option<err::Result<blake3::Hash>>> = (0..batch_paths.len()).map(|_| None).collect();
-        hash_paths_32(args, &batch_paths, stdin_ctx, own, &mut |idx, res| {
-            batch_results[idx] = Some(res);
-            true
-        });
+            let mut batch_results: Vec<Option<err::Result<blake3::Hash>>> = (0..batch_paths.len()).map(|_| None).collect();
+            hash_paths_32(args, &batch_paths, stdin_ctx, own, &mut |idx, res| {
+                batch_results[idx] = Some(res);
+                true
+            });
 
-        for entry in entries.drain(..) {
-            let ok = match entry {
-                CheckBatchEntry::ParseErr(e) => {
-                    let _ = out.flush();
-                    eprintln_safe!("{}: {}", NAME, e);
-                    false
+            for entry in entries.drain(..) {
+                let ok = match entry {
+                    CheckBatchEntry::ParseErr(e) => {
+                        let _ = out.flush();
+                        eprintln_safe!("{}: {}", NAME, e);
+                        false
+                    }
+                    CheckBatchEntry::Own(parsed) => {
+                        let what = if checkfile_is_stdin { "standard input is the checkfile; it" } else { "this checkfile is a stream, and" };
+                        emit_checked_entry(parsed, Err(format_err!("{what} cannot also be a file to check")), args, out)?
+                    }
+                    CheckBatchEntry::Stdin(parsed) => {
+                        let res = hash_path_hash(args, &parsed.file_path, stdin_ctx, own);
+                        emit_checked_entry(parsed, res, args, out)?
+                    }
+                    CheckBatchEntry::File { escaped_display, expected_hash, batch_idx } => {
+                        let res = batch_results[batch_idx].take().expect("every batch path hashed");
+                        let display = escaped_display.as_deref().unwrap_or_else(|| batch_paths[batch_idx].to_str().expect("checkfile paths are valid UTF-8"));
+                        emit_checked_result(display, expected_hash, res, args, out)?
+                    }
+                };
+                if !ok {
+                    *files_failed = files_failed.saturating_add(1);
                 }
-                CheckBatchEntry::Own(parsed) => {
-                    let what = if checkfile_is_stdin { "standard input is the checkfile; it" } else { "this checkfile is a stream, and" };
-                    emit_checked_entry(parsed, Err(format_err!("{what} cannot also be a file to check")), args, out)?
-                }
-                CheckBatchEntry::Stdin(parsed) => {
-                    let res = hash_path_hash(args, &parsed.file_path, stdin_ctx, own);
-                    emit_checked_entry(parsed, res, args, out)?
-                }
-                CheckBatchEntry::File { escaped_display, expected_hash, batch_idx } => {
-                    let res = batch_results[batch_idx].take().expect("every batch path hashed");
-                    let display = escaped_display.as_deref().unwrap_or_else(|| batch_paths[batch_idx].to_str().expect("checkfile paths are valid UTF-8"));
-                    emit_checked_result(display, expected_hash, res, args, out)?
-                }
-            };
-            if !ok {
-                *files_failed = files_failed.saturating_add(1);
             }
         }
-    }
+        Ok(())
+    })();
+    // Advance fd 0's shared offset to match all bytes consumed from the
+    // checkfile even when the loop terminated early on an I/O or write error (M2).
     #[cfg(target_os = "macos")]
-    if darwin_stdin_dash_pread {
-        drop(bufreader);
-        // Sound: `lseek` updates fd 0's offset to match the consumed checkfile bytes.
-        unsafe { libc::lseek(0, darwin_pread.offset() as libc::off_t, libc::SEEK_SET) };
-    }
+    let seek_res = {
+        let buffered = bufreader.buffer().len() as u64;
+        if let CheckfileReader::PreadStdin { stdin, offset } = bufreader.into_inner() {
+            file_end::set_fd_offset(stdin.as_fd(), offset.saturating_sub(buffered))
+        } else {
+            Ok(())
+        }
+    };
+    loop_res?;
+    #[cfg(target_os = "macos")]
+    seek_res?;
     ensure!(saw_line, "{}: no checksum entries", path.display());
     Ok(())
 }

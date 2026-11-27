@@ -269,22 +269,23 @@ impl Uring {
 
         // Sound: each offset is one the kernel gave for this ring (`params`),
         // inside the mapping of the length it also gave; the heads and tails
-        // are u32s the kernel reads and writes atomically, as AtomicU32 does.
-        let sq_head = unsafe { sq_base.add(params.sq_off.head as usize).cast::<AtomicU32>() };
-        let sq_tail = unsafe { sq_base.add(params.sq_off.tail as usize).cast::<AtomicU32>() };
-        let sq_mask = unsafe { *sq_base.add(params.sq_off.ring_mask as usize).cast::<u32>() };
-        let sq_array = unsafe { sq_base.add(params.sq_off.array as usize).cast::<u32>() };
-        for i in 0..params.sq_entries {
-            // Sound: the array has `sq_entries` slots.
-            unsafe { *sq_array.add(i as usize) = i };
-        }
-
-        // Sound: as the submission ring's, above.
-        let cq_head = unsafe { cq_base.add(params.cq_off.head as usize).cast::<AtomicU32>() };
-        let cq_tail = unsafe { cq_base.add(params.cq_off.tail as usize).cast::<AtomicU32>() };
-        let cq_mask = unsafe { *cq_base.add(params.cq_off.ring_mask as usize).cast::<u32>() };
-        let cqes = unsafe { cq_base.add(params.cq_off.cqes as usize).cast::<IoUringCqe>() };
-        let local_sq_tail = unsafe { (*sq_tail).load(Ordering::Relaxed) };
+        // are u32s the kernel reads and writes atomically, as AtomicU32 does,
+        // and the SQ indirection array has `params.sq_entries` u32 slots.
+        let (sq_head, sq_tail, sq_mask, sq_array, cq_head, cq_tail, cq_mask, cqes, local_sq_tail) = unsafe {
+            let sq_head = sq_base.add(params.sq_off.head as usize).cast::<AtomicU32>();
+            let sq_tail = sq_base.add(params.sq_off.tail as usize).cast::<AtomicU32>();
+            let sq_mask = *sq_base.add(params.sq_off.ring_mask as usize).cast::<u32>();
+            let sq_array = sq_base.add(params.sq_off.array as usize).cast::<u32>();
+            for i in 0..params.sq_entries {
+                *sq_array.add(i as usize) = i;
+            }
+            let cq_head = cq_base.add(params.cq_off.head as usize).cast::<AtomicU32>();
+            let cq_tail = cq_base.add(params.cq_off.tail as usize).cast::<AtomicU32>();
+            let cq_mask = *cq_base.add(params.cq_off.ring_mask as usize).cast::<u32>();
+            let cqes = cq_base.add(params.cq_off.cqes as usize).cast::<IoUringCqe>();
+            let local_sq_tail = (*sq_tail).load(Ordering::Relaxed);
+            (sq_head, sq_tail, sq_mask, sq_array, cq_head, cq_tail, cq_mask, cqes, local_sq_tail)
+        };
 
         Ok(Self {
             fd: ring_fd,
@@ -372,7 +373,7 @@ impl Uring {
             // Sound: into the ring's mapping, as sq_space_left's.
             unsafe { (*self.sq_tail).store(self.local_sq_tail, Ordering::Release) };
         }
-        let mut to_submit = self.unsubmitted;
+        let to_submit = self.unsubmitted;
         self.unsubmitted = 0;
 
         let need_getevents = min_complete > 0 || (self.ring_flags & IORING_SETUP_DEFER_TASKRUN) != 0;
@@ -380,22 +381,15 @@ impl Uring {
             return;
         }
         let enter_flags = if need_getevents { IORING_ENTER_GETEVENTS } else { 0 };
-
-        loop {
-            if let Some(submitted) = enter(self.fd, to_submit, min_complete, enter_flags) {
-                to_submit = to_submit.saturating_sub(submitted);
-                if to_submit == 0 {
-                    return;
-                }
-            } else {
-                // Interrupted: the kernel may have consumed some SQEs.
-                // Sound: as above.
-                let head = unsafe { (*self.sq_head).load(Ordering::Acquire) };
-                to_submit = self.local_sq_tail.wrapping_sub(head);
-                if min_complete == 0 && to_submit == 0 {
-                    return;
-                }
-            }
+        // Sound: `self.sq_head` points into this ring's live SQ mapping.
+        if let Err(reason) = run_submit_loop(
+            to_submit,
+            min_complete,
+            self.local_sq_tail,
+            || unsafe { (*self.sq_head).load(Ordering::Acquire) },
+            |rem| enter(self.fd, rem, min_complete, enter_flags),
+        ) {
+            abort_submit_progress(reason);
         }
     }
 
@@ -408,15 +402,91 @@ impl Uring {
             return None;
         }
         let idx = (head & self.cq_mask) as usize;
-        // Sound: `idx` is masked to the CQEs' count, and the kernel has
-        // finished writing the entry before it moved the tail past it.
-        let cqe = unsafe { *self.cqes.add(idx) };
-        unsafe { (*self.cq_head).store(head.wrapping_add(1), Ordering::Release) };
+        // Sound: `idx` is masked to the CQEs' count, the kernel finished
+        // writing the CQE before advancing `cq_tail`, and only this thread
+        // advances `cq_head` inside the live CQ mapping.
+        let cqe = unsafe {
+            let cqe = *self.cqes.add(idx);
+            (*self.cq_head).store(head.wrapping_add(1), Ordering::Release);
+            cqe
+        };
         self.in_flight -= 1;
         #[cfg(test)]
         let cqe = spoiled(cqe);
         Some(cqe)
     }
+}
+
+/// Drive the `io_uring_enter` submission loop until all queued SQEs are
+/// submitted (or a wait-only enter completes), enforcing forward progress on
+/// every iteration (M31).
+pub(crate) fn run_submit_loop(
+    mut to_submit: u32,
+    min_complete: u32,
+    local_sq_tail: u32,
+    mut read_sq_head: impl FnMut() -> u32,
+    mut do_enter: impl FnMut(u32) -> Option<u32>,
+) -> Result<(), &'static str> {
+    loop {
+        let sq_head_before = read_sq_head();
+        if let Some(submitted) = do_enter(to_submit) {
+            if to_submit == 0 {
+                if submitted != 0 {
+                    return Err("io_uring_enter reported submissions with none queued");
+                }
+                return Ok(());
+            }
+            let sq_head_after = read_sq_head();
+            match reconcile_submit_progress(to_submit, submitted, sq_head_before, sq_head_after, local_sq_tail) {
+                Ok(0) => return Ok(()),
+                Ok(remaining) => to_submit = remaining,
+                Err(reason) => return Err(reason),
+            }
+        } else {
+            // Interrupted: the kernel may have consumed some SQEs.
+            let head = read_sq_head();
+            to_submit = local_sq_tail.wrapping_sub(head);
+            if min_complete == 0 && to_submit == 0 {
+                return Ok(());
+            }
+        }
+    }
+}
+
+/// Reconcile remaining SQEs after a non-negative `io_uring_enter` return,
+/// rejecting contradictory over-counts and unexplained zero-progress loops
+/// (M31).
+pub(crate) fn reconcile_submit_progress(
+    to_submit: u32,
+    submitted: u32,
+    sq_head_before: u32,
+    sq_head_after: u32,
+    local_sq_tail: u32,
+) -> Result<u32, &'static str> {
+    if submitted > to_submit {
+        return Err("io_uring_enter reported more submissions than queued");
+    }
+    if to_submit == 0 {
+        return Ok(0);
+    }
+    if submitted > 0 {
+        return Ok(to_submit - submitted);
+    }
+    // `submitted == 0` with `to_submit > 0`: allow progress only if the kernel
+    // visibly advanced `sq_head` toward `local_sq_tail` so remaining shrank.
+    if sq_head_after != sq_head_before {
+        let remaining = local_sq_tail.wrapping_sub(sq_head_after);
+        if remaining < to_submit {
+            return Ok(remaining);
+        }
+    }
+    Err("io_uring_enter made zero submission progress with pending SQEs")
+}
+
+#[cold]
+fn abort_submit_progress(reason: &str) -> ! {
+    crate::file_end::write_fatal_fmt(format_args!("b3sum: {reason}; stopping before pending reads' buffers can be released\n"));
+    std::process::abort()
 }
 
 /// The most one read is asked for: less than the 4 GiB that a request's
@@ -761,5 +831,90 @@ mod test {
         ring.release();
         let reused = Uring::acquire(8).unwrap();
         assert_eq!(reused.fd, saved_fd);
+    }
+
+    #[test]
+    fn reconcile_submit_progress_rejects_overcount_and_zero_progress() {
+        // Normal full & partial progress through the actual production submit loop.
+        assert_eq!(
+            super::run_submit_loop(
+                0,
+                1,
+                10,
+                || 10,
+                |rem| {
+                    assert_eq!(rem, 0);
+                    Some(0)
+                }
+            ),
+            Ok(())
+        );
+        let calls = core::cell::Cell::new(0u32);
+        assert_eq!(
+            super::run_submit_loop(
+                4,
+                0,
+                14,
+                || 10 + calls.get(),
+                |rem| {
+                    let c = calls.get() + 1;
+                    calls.set(c);
+                    if c == 1 {
+                        assert_eq!(rem, 4);
+                        Some(1)
+                    } else {
+                        assert_eq!(rem, 3);
+                        Some(3)
+                    }
+                },
+            ),
+            Ok(())
+        );
+        // Zero return allowed ONLY when kernel visibly advanced sq_head.
+        let head = core::cell::Cell::new(10u32);
+        let mut step = 0u32;
+        assert_eq!(
+            super::run_submit_loop(
+                4,
+                0,
+                14,
+                || head.get(),
+                |_| {
+                    step += 1;
+                    if step == 1 {
+                        head.set(12);
+                        Some(0)
+                    } else {
+                        head.set(14);
+                        Some(2)
+                    }
+                },
+            ),
+            Ok(())
+        );
+        // Wrap-around sq_head advancement works cleanly.
+        assert_eq!(super::reconcile_submit_progress(4, 0, u32::MAX - 1, 1, 2), Ok(1));
+        // Over-count rejected by the loop rather than silently saturating to 0.
+        assert!(super::run_submit_loop(2, 0, 12, || 10, |_| Some(3)).is_err());
+        assert!(super::run_submit_loop(0, 1, 10, || 10, |_| Some(1)).is_err());
+        // Zero progress with pending SQEs and unmoved sq_head rejected immediately
+        // instead of looping forever.
+        let mut stall_calls = 0u32;
+        assert!(
+            super::run_submit_loop(
+                2,
+                0,
+                12,
+                || 10,
+                |_| {
+                    stall_calls += 1;
+                    assert!(stall_calls <= 2, "submit loop must fail stop instead of spinning");
+                    Some(0)
+                },
+            )
+            .is_err()
+        );
+        // Even if sq_head changed to something not shrinking remaining, reject.
+        assert!(super::reconcile_submit_progress(2, 0, 10, 9, 12).is_err());
     }
 }

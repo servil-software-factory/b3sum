@@ -275,6 +275,7 @@ fn stream_fd_into_rooms(
             }
 
             let n = cqe.res as usize;
+            assert!(n <= ROOM_LEN, "io_uring read returned {n} bytes, exceeding requested {ROOM_LEN}");
             if n == 0 {
                 drop(room);
                 eof_seq = Some(eof_seq.map_or(seq, |e| e.min(seq)));
@@ -329,7 +330,7 @@ fn stream_fd_into_rooms(
                     break;
                 }
                 Some(WindowSlot::Ready(mut room, len)) => {
-                    debug_assert_eq!(len, ROOM_LEN);
+                    assert_eq!(len, ROOM_LEN, "full ready window slot must carry ROOM_LEN bytes");
                     pipe.commit(msg, &mut room, ROOM_LEN);
                     committed_bytes += ROOM_LEN as u64;
                     committed_any = true;
@@ -471,8 +472,10 @@ impl WarmBatch {
                 // Sound: slot k is inside the arena, and `padded` is at most
                 // the slot's length (`byte_len` is, and the slot is whole
                 // blocks).
-                let start_ptr = unsafe { arena.as_mut_ptr().add(k * WARM_SLOT_BLOCKS).cast::<u8>() };
-                unsafe { start_ptr.add(byte_len).write_bytes(0, padded - byte_len) };
+                unsafe {
+                    let start_ptr = arena.as_mut_ptr().add(k * WARM_SLOT_BLOCKS).cast::<u8>();
+                    start_ptr.add(byte_len).write_bytes(0, padded - byte_len);
+                }
             }
         }
         let arena_ref: &[MaybeUninit<Block>] = &*arena;
@@ -618,13 +621,16 @@ impl WarmLargePipe {
     fn drain(&mut self, sink: &mut Sink<'_>) {
         while let Some(ev) = self.pipe.next_event() {
             self.in_flight -= 1;
-            if let Event::Hashed { tag: idx, hash, owner } = ev {
-                if let Some(map) = owner {
-                    crate::hold(map);
+            match ev {
+                Event::Hashed { tag: idx, hash, owner } => {
+                    if let Some(map) = owner {
+                        crate::hold(map);
+                    }
+                    #[cfg(test)]
+                    WARM_PIPE_COMPLETED.fetch_add(1, Ordering::Relaxed);
+                    sink.put(idx, Ok(hash));
                 }
-                #[cfg(test)]
-                WARM_PIPE_COMPLETED.fetch_add(1, Ordering::Relaxed);
-                sink.put(idx, Ok(hash));
+                _ => unreachable!("WarmLargePipe submits only owned messages, got unexpected event"),
             }
         }
     }
@@ -908,6 +914,7 @@ fn hash_paths_inner(
             }
             !stop
         });
+        assert!(stop || emitted == nfiles, "single-reader collector returned after {emitted}/{nfiles} files without cancellation");
         return;
     }
 
@@ -967,6 +974,7 @@ fn hash_paths_inner(
             }
         }
         drop(done_rx);
+        assert!(stop || emitted == nfiles, "multi-reader collector returned after {emitted}/{nfiles} files without cancellation");
     });
 }
 
