@@ -1204,7 +1204,8 @@ class StandaloneB3sum(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "exceeds maximum allowed size"):
             ra._read_bounded(io.BytesIO(b"abcde"), 4, "too-big")
 
-        # Oversized .crate archive expansion is rejected without allocating the whole payload.
+        # Oversized .crate archive expansion is rejected at the gzip stream layer
+        # before tarfile traversal, and member-count caps stop archive iteration early.
         buf = io.BytesIO()
         with tarfile.open(fileobj=buf, mode="w:gz") as tf:
             payload = b"A" * 1024
@@ -1212,7 +1213,16 @@ class StandaloneB3sum(unittest.TestCase):
             info.size = len(payload)
             tf.addfile(info, io.BytesIO(payload))
         probs = ra.crate_problems(buf.getvalue(), None, max_uncompressed_bytes=512)
-        self.assertTrue(any("exceeding maximum (512 bytes)" in p for p in probs), probs)
+        self.assertTrue(any("expands past maximum allowed size (512 bytes)" in p for p in probs), probs)
+
+        many_buf = io.BytesIO()
+        with tarfile.open(fileobj=many_buf, mode="w:gz") as tf:
+            for idx in range(5):
+                info = tarfile.TarInfo(f"b3sums-0.11.0/f{idx}.txt")
+                info.size = 1
+                tf.addfile(info, io.BytesIO(b"x"))
+        many_probs = ra.crate_problems(many_buf.getvalue(), None, max_members=3)
+        self.assertTrue(any("more than 3 entries" in p for p in many_probs), many_probs)
 
         # check() stores only digest pairs in `seen` (verified via digest_problems tuple path).
         data = b"artifact-bytes"

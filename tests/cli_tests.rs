@@ -1914,3 +1914,46 @@ fn test_terminal_stdout_flushes_multi_file_large_before_blocked_fifo() {
     let status = guard.0.take().unwrap().wait().unwrap();
     assert!(status.success(), "b3sum exited {status:?}");
 }
+
+#[cfg(unix)]
+#[test]
+fn check_stdin_and_dup_socket_fd_preserves_manifest_order() {
+    use std::os::fd::OwnedFd;
+    use std::os::unix::net::UnixStream;
+    use std::os::unix::process::CommandExt;
+
+    blake3::initialize();
+    let dir = tempfile::tempdir().unwrap();
+    let payload = b"finite-unix-stream-socket-payload\n";
+    let h_msg = blake3::convenience::hash(payload).to_hex();
+    let h_empty = blake3::convenience::hash(b"").to_hex();
+    let manifest = dir.path().join("manifest.b3");
+    // `-` comes first, `/dev/fd/3` (a duplicate of stdin's socket) comes second:
+    // both MUST be treated as stdin stream aliases so `-` gets the payload and
+    // `/dev/fd/3` gets EOF (never hashed out of order ahead of `-`, R3 M1).
+    fs::write(&manifest, format!("{h_msg}  -\n{h_empty}  /dev/fd/3\n")).unwrap();
+
+    let (mut writer, reader) = UnixStream::pair().unwrap();
+    writer.write_all(payload).unwrap();
+    drop(writer);
+    let reader_fd = OwnedFd::from(reader);
+
+    let mut cmd = std::process::Command::new(b3sum_exe());
+    cmd.args(["--check", manifest.to_str().unwrap()]).stdin(std::process::Stdio::from(reader_fd));
+    // Sound: `pre_exec` only calls async-signal-safe `dup2(0, 3)` after `stdin`
+    // has been placed on fd 0, duplicating stdin's open socket onto fd 3 with
+    // FD_CLOEXEC clear.
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::dup2(0, 3) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let out = cmd.output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "expected --check pass on stdin + /dev/fd/3:\nstdout:\n{stdout}\nstderr:\n{stderr}");
+    assert_eq!(stdout, "-: OK\n/dev/fd/3: OK\n");
+}

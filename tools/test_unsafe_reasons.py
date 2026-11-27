@@ -423,6 +423,20 @@ class Reasons(unittest.TestCase):
             "}\n"
         )
         self.assertEqual([n for n, _ in ur.without_reason(const_block_nl_semi)], [4])
+        const_block_try = (
+            "fn f(p: *const u8) -> Result<u8, ()> {\n"
+            "    #[cfg(test)] const { Ok::<(), ()>(()) }?; // Sound: test fixture.\n"
+            "    Ok(unsafe { *p })\n"
+            "}\n"
+        )
+        self.assertEqual([n for n, _ in ur.without_reason(const_block_try)], [3])
+        const_block_bare_range = (
+            "fn f(p: *const u8) {\n"
+            "    #[cfg(test)] const { () }\n"
+            "    ..unsafe { *p };\n"
+            "}\n"
+        )
+        self.assertEqual([n for n, _ in ur.without_reason(const_block_bare_range)], [3])
         # Nested generics ending with `>>>` on a test-only generic parameter
         # (`fn bounded<#[cfg(test)] T: Into<Vec<u8>>>() { ... }`) must stop
         # before the enclosing `>` and still check the shipped function body.

@@ -162,7 +162,10 @@ next section, this gives us an important set of properties:
    checked.
 3. Checking ambiguous or unrepresentable filepaths always fails.
 4. Checkfiles are always valid UTF-8.
-5. Checkfiles are portable between Unix and Windows.
+5. Checkfiles use a common UTF-8 record encoding across Unix and Windows; a
+   manifest can be checked on another OS whenever the target filesystem accepts
+   those pathnames (for example, upstream Windows rejects literal backslashes
+   inside filenames, even though Unix filenames allow them).
 
 ## Formal Rules
 

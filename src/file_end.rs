@@ -1,8 +1,9 @@
 //! Unified file-end, descriptor-identity, and bounded-read state machines for `b3sum` (#468).
 //!
 //! Ordinary reading paths in `b3sum` share three invariants enforced here
-//! (memory-mapped paths hash the mapped extent, and `--outboard`'s non-mapped
-//! fallback still buffers the whole input):
+//! (memory-mapped paths hash the mapped extent, and `--outboard` streams
+//! non-mapped inputs in bounded groups while retaining only the tree nodes —
+//! see `crate::outboard`):
 //! 1. **Only a waiting read returning 0 ends a file.** A non-blocking cache
 //!    probe (`RWF_NOWAIT`) returning `0` or an error (such as `EAGAIN` or
 //!    sandbox `EPERM`) never ends a file; a real blocking read error (`EIO`,
@@ -344,7 +345,11 @@ impl StdinContext {
                 && (path_matches_fd_meta(path, stdin) || {
                     #[cfg(target_os = "macos")]
                     {
-                        darwin_dev_fd_number(path) == Some(0)
+                        // Darwin `stat("/dev/fd/N")` can describe the fdescfs
+                        // node instead of the underlying descriptor (e.g. a
+                        // Unix stream socket); check `fstat(N)` identity for
+                        // any verified `/dev/fd/N` alias, not just `N == 0`.
+                        darwin_dev_fd_number(path).is_some_and(|fd| fd == 0 || fstat_fd(fd).is_ok_and(|meta| meta.kind == stdin.kind && meta.id == stdin.id))
                     }
                     #[cfg(not(target_os = "macos"))]
                     {

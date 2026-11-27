@@ -71,11 +71,15 @@ cp "$stage/checkout/Cargo.lock" "$stage/Cargo.lock.orig"
 	RUSTC="$rustc_bin" "$cargo_bin" package --frozen $verify --target-dir "$stage/target"
 )
 cmp -s "$stage/Cargo.lock.orig" "$stage/checkout/Cargo.lock" || { echo "crates-release: packaging changed Cargo.lock" >&2; exit 1; }
-mkdir -p dist
-cp "$stage"/target/package/*.crate dist/
+# Stage archive and digest sidecars privately inside `$stage/out`, verify
+# before exposing anything in `$root/dist`, and publish atomically by rename
+# on the destination filesystem so a failed check never exposes partial files
+# or removes an existing good `dist/` artifact (R3 M8).
+mkdir -p "$stage/out"
+cp "$stage"/target/package/*.crate "$stage/out/"
 (
-	cd dist
-	for crate in "$stage"/target/package/*.crate; do
+	cd "$stage/out"
+	for crate in "$stage"/out/*.crate; do
 		base=$(basename "$crate")
 		{ sha256sum "$base" 2>/dev/null || shasum -a 256 "$base"; } > "$base.sha256"
 		python3 "$stage/checkout/tools/blake3_ref.py" "$base" > "$base.b3"
@@ -83,12 +87,18 @@ cp "$stage"/target/package/*.crate dist/
 	done
 )
 if [ -n "$is_release_commit" ]; then
-	for crate in "$stage"/target/package/*.crate; do
+	for crate in "$stage"/out/*.crate; do
 		base=$(basename "$crate")
-		python3 "$stage/checkout/tools/release_artifacts.py" "v$version" "dist/$base" --commit "$commit" || {
-			rm -f "dist/$base" "dist/$base.sha256" "dist/$base.b3"
-			exit 1
-		}
+		python3 "$stage/checkout/tools/release_artifacts.py" "v$version" "$stage/out/$base" --commit "$commit"
 	done
 fi
+mkdir -p "$root/dist"
+for crate in "$stage"/out/*.crate; do
+	base=$(basename "$crate")
+	for f in "$base" "$base.sha256" "$base.b3"; do
+		tmp_dst="$root/dist/.$f.tmp.$$"
+		cp "$stage/out/$f" "$tmp_dst"
+		mv -f "$tmp_dst" "$root/dist/$f"
+	done
+done
 echo "crates-release: the b3sums archive (with .sha256 and .b3) is in $root/dist"

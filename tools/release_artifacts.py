@@ -71,6 +71,7 @@ versions name showed, but only on our machines.
 """
 
 import collections
+import gzip
 import hashlib
 import importlib.util
 import io
@@ -357,16 +358,39 @@ def _read_bounded(stream, limit, label):
         chunks.append(chunk)
 
 
-def crate_problems(data, release, max_uncompressed_bytes=MAX_CRATE_UNCOMPRESSED_BYTES):
+def crate_problems(data, release, max_uncompressed_bytes=MAX_CRATE_UNCOMPRESSED_BYTES, max_members=MAX_CRATE_MEMBERS):
     """Why the .crate `data` is not the version commit's files."""
-    with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as archive:
-        members = archive.getmembers()
-        if len(members) > MAX_CRATE_MEMBERS:
-            return [f"holds {len(members)} entries, exceeding maximum ({MAX_CRATE_MEMBERS})"]
-        odd = [m.name for m in members if not (m.isfile() or m.isdir())]
+    # Cap the decompressed gzip stream BEFORE handing it to tarfile so a
+    # gzip/header bomb cannot exhaust memory or CPU during archive traversal (R3 M5).
+    try:
+        with gzip.GzipFile(fileobj=io.BytesIO(data), mode="rb") as gz:
+            raw_tar = _read_bounded(gz, max_uncompressed_bytes, "decompressed crate")
+    except ValueError:
+        return [f"expands past maximum allowed size ({max_uncompressed_bytes} bytes)"]
+    with tarfile.open(fileobj=io.BytesIO(raw_tar), mode="r:") as archive:
+        members = []
+        odd = []
+        names = []
+        files = {}
+        remaining = max_uncompressed_bytes
+        for m in archive:
+            members.append(m)
+            if len(members) > max_members:
+                return [f"holds more than {max_members} entries"]
+            if not (m.isfile() or m.isdir()):
+                odd.append(m.name)
+                continue
+            if m.isfile():
+                names.append(m.name)
+                if "/" in m.name:
+                    try:
+                        content = _read_bounded(archive.extractfile(m), remaining, m.name)
+                    except ValueError:
+                        return [f"expands past maximum allowed size ({max_uncompressed_bytes} bytes)"]
+                    remaining -= len(content)
+                    files[m.name.split("/", 1)[1]] = content
         if odd:
             return [f"holds what is no plain file ({odd[0]})"]
-        names = [m.name for m in members if m.isfile()]
         # Every file once, and in the one folder Cargo packs a crate into: a
         # second entry of a name, or one outside the folder, is a file some
         # reader of the archive sees and this check would not.
@@ -379,19 +403,6 @@ def crate_problems(data, release, max_uncompressed_bytes=MAX_CRATE_UNCOMPRESSED_
             return [f"holds files outside one folder ({', '.join(f or 'the top' for f in folders)})"]
         if any(os.path.normpath(n) != n or n.startswith("/") for n in names):
             return ["holds a file whose path is not plain"]
-        declared_total = sum(m.size for m in members if m.isfile())
-        if declared_total > max_uncompressed_bytes:
-            return [f"expands to {declared_total} bytes, exceeding maximum ({max_uncompressed_bytes} bytes)"]
-        files = {}
-        remaining = max_uncompressed_bytes
-        for m in members:
-            if m.isfile() and "/" in m.name:
-                try:
-                    content = _read_bounded(archive.extractfile(m), remaining, m.name)
-                except ValueError:
-                    return [f"expands past maximum allowed size ({max_uncompressed_bytes} bytes)"]
-                remaining -= len(content)
-                files[m.name.split("/", 1)[1]] = content
     for cargos in (".cargo_vcs_info.json", "Cargo.toml.orig"):
         if cargos not in files:
             return [f"has no {cargos}: not as Cargo packages a crate from a Git checkout"]

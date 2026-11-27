@@ -977,3 +977,34 @@ fn use_pool_for_respects_actual_pool_width_vs_prospective_budget() {
         assert!(!crate::use_pool_for(crate::POOL_START_LEN * 2), "a 1-thread pool must never be used as multithreaded");
     }
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn cold_ring_temporary_width_one_does_not_freeze_global_pool_at_one() {
+    // Two >= 4 MiB cold files under `--num-threads 2` allocate 2 file readers
+    // (`cold_pool_workers = 1`); the cold ring must fall back to local
+    // streaming instead of freezing `ACTUAL_POOL_THREADS` at 1, leaving a
+    // subsequent lone large file free to initialize the pool at width 2 (R3 M2).
+    blake3::initialize();
+    let dir = crate::tempfile::tempdir().unwrap();
+    let a = dir.path().join("a.bin");
+    let b = dir.path().join("b.bin");
+    let bytes = vec![0x42u8; 4 * 1024 * 1024 + 17];
+    std::fs::write(&a, &bytes).unwrap();
+    std::fs::write(&b, &bytes).unwrap();
+
+    let files = vec![a, b];
+    let args = crate::Args::for_test_plain_threads(files.clone(), 2);
+    crate::linux_pipe::set_force_miss(true);
+    let mut got = Vec::new();
+    crate::linux_pipe::hash_paths(&args, &files, None, &mut |i, res| {
+        got.push((i, res.unwrap()));
+        true
+    });
+    crate::linux_pipe::set_force_miss(false);
+    assert_eq!(got.len(), 2);
+    let want = blake3::convenience::hash(&bytes);
+    assert_eq!(got[0].1, want);
+    assert_eq!(got[1].1, want);
+    assert_ne!(crate::actual_pool_threads(), 1, "temporary width-1 cold-ring batch must not freeze global pool singleton at 1");
+}
