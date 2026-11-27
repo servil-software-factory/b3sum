@@ -3,8 +3,9 @@
 //! `SYS_io_uring_enter`, and the ring mappings). Zero external dependencies.
 
 use core::cell::Cell;
+use core::ptr::NonNull;
 use std::io;
-use std::os::fd::RawFd;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::ptr;
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -112,22 +113,72 @@ pub(crate) struct IoUringCqe {
     pub flags: u32,
 }
 
-pub(crate) struct Uring {
-    fd: RawFd,
-    ring_flags: u32,
-    sq_ring_ptr: *mut libc::c_void,
-    sq_ring_len: usize,
-    cq_ring_ptr: *mut libc::c_void,
-    cq_ring_len: usize,
-    single_mmap: bool,
-    sqes_ptr: *mut IoUringSqe,
-    sqes_len: usize,
+// Compile-time verification of the hand-written Linux io_uring UAPI layouts (M7).
+const _: () = {
+    assert!(size_of::<IoSqrOffsets>() == 40);
+    assert!(size_of::<IoCqrOffsets>() == 40);
+    assert!(size_of::<IoUringParams>() == 120);
+    assert!(size_of::<IoUringSqe>() == 64);
+    assert!(size_of::<IoUringCqe>() == 16);
+    assert!(core::mem::offset_of!(IoUringSqe, off) == 8);
+    assert!(core::mem::offset_of!(IoUringSqe, addr) == 16);
+    assert!(core::mem::offset_of!(IoUringSqe, len) == 24);
+    assert!(core::mem::offset_of!(IoUringSqe, user_data) == 32);
+    assert!(core::mem::offset_of!(IoUringCqe, res) == 8);
+};
 
+/// Owning guard for one `io_uring` `mmap` region: guarantees a non-null,
+/// non-`MAP_FAILED` base address and unmaps once on drop (M7).
+struct RingMap {
+    ptr: NonNull<libc::c_void>,
+    len: usize,
+}
+
+impl RingMap {
+    fn map(fd: &OwnedFd, len: usize, offset: libc::off_t) -> io::Result<Self> {
+        assert!(len > 0, "io_uring mapping length must be positive");
+        // Sound: mapping `len` bytes of the owned `io_uring` descriptor at the
+        // kernel-defined ring offset; kernel chooses the address.
+        let raw = unsafe { libc::mmap(ptr::null_mut(), len, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_SHARED, fd.as_raw_fd(), offset) };
+        if raw == libc::MAP_FAILED {
+            return Err(io::Error::last_os_error());
+        }
+        let Some(ptr) = NonNull::new(raw) else {
+            // Sound: `raw` was just returned as a valid mapping of `len` bytes.
+            unsafe { libc::munmap(raw, len) };
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "mmap returned null address"));
+        };
+        Ok(Self { ptr, len })
+    }
+
+    #[inline]
+    fn as_ptr(&self) -> *mut libc::c_void {
+        self.ptr.as_ptr()
+    }
+}
+
+impl Drop for RingMap {
+    fn drop(&mut self) {
+        // Sound: `self.ptr` and `self.len` came from a successful `mmap` in
+        // `RingMap::map`, unmapped once here.
+        unsafe { libc::munmap(self.ptr.as_ptr(), self.len) };
+    }
+}
+
+pub(crate) struct Uring {
+    // Field drop order (after `Drop::drop` verifies `in_flight == 0`):
+    // unmap SQEs, optional separate CQ ring, SQ ring, then close `fd`.
+    _sqes_map: RingMap,
+    _cq_map: Option<RingMap>,
+    _sq_map: RingMap,
+    fd: OwnedFd,
+    ring_flags: u32,
+
+    sqes_ptr: *mut IoUringSqe,
     sq_head: *const AtomicU32,
     sq_tail: *const AtomicU32,
     sq_mask: u32,
     sq_entries: u32,
-    sq_array: *mut u32,
     local_sq_tail: u32,
     unsubmitted: u32,
 
@@ -182,7 +233,7 @@ impl Uring {
             0,
         ];
         let mut params = IoUringParams::default();
-        let mut ring_fd: RawFd = -1;
+        let mut ring_fd: Option<OwnedFd> = None;
         let mut chosen_flags = 0u32;
         let mut last_err = io::Error::from_raw_os_error(libc::ENOSYS);
 
@@ -191,22 +242,23 @@ impl Uring {
             // Sound: kernel initializes `params` and returns a new cloexec fd or -1.
             let rc = unsafe { libc::syscall(libc::SYS_io_uring_setup, entries, &mut params as *mut IoUringParams) };
             if rc >= 0 {
-                ring_fd = rc as RawFd;
+                let raw_fd = RawFd::try_from(rc).map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "io_uring_setup fd out of range"))?;
+                // Sound: `raw_fd` is a freshly created `io_uring` fd owned solely here.
+                ring_fd = Some(unsafe { OwnedFd::from_raw_fd(raw_fd) });
                 chosen_flags = flags;
                 break;
             }
             last_err = io::Error::last_os_error();
         }
-        if ring_fd < 0 {
-            return Err(last_err);
-        }
+        let fd = match ring_fd {
+            Some(fd) => fd,
+            None => return Err(last_err),
+        };
 
         // Verify the kernel actually supports `IORING_OP_READ` (introduced in
         // Linux 5.6 alongside `IORING_REGISTER_PROBE`, whereas `io_uring_setup`
         // dates to 5.1) before selecting the ring backend.
-        if !probe_op_read(ring_fd) {
-            // Sound: `ring_fd` is owned here and closed once on failure.
-            unsafe { libc::close(ring_fd) };
+        if !probe_op_read(fd.as_raw_fd()) {
             return Err(io::Error::from_raw_os_error(libc::EOPNOTSUPP));
         }
 
@@ -215,63 +267,21 @@ impl Uring {
         let single_mmap = (params.features & IORING_FEAT_SINGLE_MMAP) != 0;
         let sq_ring_len = if single_mmap { sq_size.max(cq_size) } else { sq_size };
 
-        // Sound: mapping the ring descriptor at kernel-defined offsets.
-        let sq_ring_ptr =
-            // Sound: a new mapping of the ring's descriptor at the kernel's
-            // offset for it; the kernel chooses the address.
-            unsafe { libc::mmap(ptr::null_mut(), sq_ring_len, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_SHARED, ring_fd, IORING_OFF_SQ_RING) };
-        if sq_ring_ptr == libc::MAP_FAILED {
-            let err = io::Error::last_os_error();
-            // Sound: the descriptor is this function's, closed once on each
-            // way out.
-            unsafe { libc::close(ring_fd) };
-            return Err(err);
-        }
-
-        let (cq_ring_ptr, cq_ring_len) = if single_mmap {
-            (sq_ring_ptr, 0)
-        } else {
-            // Sound: as the first mapping.
-            let p = unsafe { libc::mmap(ptr::null_mut(), cq_size, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_SHARED, ring_fd, IORING_OFF_CQ_RING) };
-            if p == libc::MAP_FAILED {
-                let err = io::Error::last_os_error();
-                // Sound: this function's own mapping and descriptor, released
-                // once.
-                unsafe {
-                    libc::munmap(sq_ring_ptr, sq_ring_len);
-                    libc::close(ring_fd);
-                }
-                return Err(err);
-            }
-            (p, cq_size)
-        };
-
+        let sq_map = RingMap::map(&fd, sq_ring_len, IORING_OFF_SQ_RING)?;
+        let cq_map = if single_mmap { None } else { Some(RingMap::map(&fd, cq_size, IORING_OFF_CQ_RING)?) };
         let sqes_len = (params.sq_entries as usize) * size_of::<IoUringSqe>();
-        // Sound: as the first mapping.
-        let sqes_raw = unsafe { libc::mmap(ptr::null_mut(), sqes_len, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_SHARED, ring_fd, IORING_OFF_SQES) };
-        if sqes_raw == libc::MAP_FAILED {
-            let err = io::Error::last_os_error();
-            // Sound: this function's own mappings and descriptor, released
-            // once.
-            unsafe {
-                if !single_mmap {
-                    libc::munmap(cq_ring_ptr, cq_ring_len);
-                }
-                libc::munmap(sq_ring_ptr, sq_ring_len);
-                libc::close(ring_fd);
-            }
-            return Err(err);
-        }
+        let sqes_map = RingMap::map(&fd, sqes_len, IORING_OFF_SQES)?;
 
-        let sq_base = sq_ring_ptr.cast::<u8>();
-        let cq_base = cq_ring_ptr.cast::<u8>();
-        let sqes_ptr = sqes_raw.cast::<IoUringSqe>();
+        let sq_base = sq_map.as_ptr().cast::<u8>();
+        let cq_base = cq_map.as_ref().unwrap_or(&sq_map).as_ptr().cast::<u8>();
+        let sqes_ptr = sqes_map.as_ptr().cast::<IoUringSqe>();
 
         // Sound: each offset is one the kernel gave for this ring (`params`),
         // inside the mapping of the length it also gave; the heads and tails
         // are u32s the kernel reads and writes atomically, as AtomicU32 does,
-        // and the SQ indirection array has `params.sq_entries` u32 slots.
-        let (sq_head, sq_tail, sq_mask, sq_array, cq_head, cq_tail, cq_mask, cqes, local_sq_tail) = unsafe {
+        // and the SQ indirection array has `params.sq_entries` u32 slots
+        // initialized once to the identity permutation `0..sq_entries` (L4).
+        let (sq_head, sq_tail, sq_mask, cq_head, cq_tail, cq_mask, cqes, local_sq_tail) = unsafe {
             let sq_head = sq_base.add(params.sq_off.head as usize).cast::<AtomicU32>();
             let sq_tail = sq_base.add(params.sq_off.tail as usize).cast::<AtomicU32>();
             let sq_mask = *sq_base.add(params.sq_off.ring_mask as usize).cast::<u32>();
@@ -284,24 +294,20 @@ impl Uring {
             let cq_mask = *cq_base.add(params.cq_off.ring_mask as usize).cast::<u32>();
             let cqes = cq_base.add(params.cq_off.cqes as usize).cast::<IoUringCqe>();
             let local_sq_tail = (*sq_tail).load(Ordering::Relaxed);
-            (sq_head, sq_tail, sq_mask, sq_array, cq_head, cq_tail, cq_mask, cqes, local_sq_tail)
+            (sq_head, sq_tail, sq_mask, cq_head, cq_tail, cq_mask, cqes, local_sq_tail)
         };
 
         Ok(Self {
-            fd: ring_fd,
+            _sqes_map: sqes_map,
+            _cq_map: cq_map,
+            _sq_map: sq_map,
+            fd,
             ring_flags: chosen_flags,
-            sq_ring_ptr,
-            sq_ring_len,
-            cq_ring_ptr,
-            cq_ring_len,
-            single_mmap,
             sqes_ptr,
-            sqes_len,
             sq_head,
             sq_tail,
             sq_mask,
             sq_entries: params.sq_entries,
-            sq_array,
             local_sq_tail,
             unsubmitted: 0,
             cq_head,
@@ -330,17 +336,17 @@ impl Uring {
     /// must ensure `buf[..room]` stays valid and exclusively writable by
     /// the kernel until the matching CQE is reaped.
     #[inline]
-    pub(crate) unsafe fn push_read(&mut self, fd: RawFd, buf: *mut u8, room: usize, offset: u64, rw_flags: u32, user_data: u64) -> bool {
+    pub(crate) unsafe fn push_read(&mut self, fd: RawFd, buf: *mut u8, room: usize, offset: u64, user_data: u64) -> bool {
         if self.sq_space_left() == 0 {
             return false;
         }
         let len = read_len(room);
         let idx = (self.local_sq_tail & self.sq_mask) as usize;
-        // Sound: `idx` is below `sq_entries` (masked), so both writes are
-        // inside the ring's array and its SQEs; the kernel reads an SQE only
-        // after the tail moves past it (submit_and_wait).
+        // Sound: `idx` is below `sq_entries` (masked), so the write is inside
+        // the ring's SQE array (the SQ indirection array was initialized once
+        // to the identity permutation in `Uring::new`), and the kernel reads
+        // an SQE only after `sq_tail` advances in `submit_and_wait`.
         unsafe {
-            *self.sq_array.add(idx) = u32::try_from(idx).expect("sq index fits u32");
             *self.sqes_ptr.add(idx) = IoUringSqe {
                 opcode: IORING_OP_READ,
                 flags: 0,
@@ -349,7 +355,7 @@ impl Uring {
                 off: offset,
                 addr: buf as usize as u64,
                 len,
-                rw_flags,
+                rw_flags: 0,
                 user_data,
                 buf_group: 0,
                 personality: 0,
@@ -387,7 +393,7 @@ impl Uring {
             min_complete,
             self.local_sq_tail,
             || unsafe { (*self.sq_head).load(Ordering::Acquire) },
-            |rem| enter(self.fd, rem, min_complete, enter_flags),
+            |rem| enter(self.fd.as_raw_fd(), rem, min_complete, enter_flags),
         ) {
             abort_submit_progress(reason);
         }
@@ -603,16 +609,8 @@ impl Drop for Uring {
             ));
             std::process::abort()
         }
-        // Sound: the three mappings and the descriptor are this ring's own
-        // (new), each released once, here.
-        unsafe {
-            libc::munmap(self.sqes_ptr.cast(), self.sqes_len);
-            if !self.single_mmap {
-                libc::munmap(self.cq_ring_ptr, self.cq_ring_len);
-            }
-            libc::munmap(self.sq_ring_ptr, self.sq_ring_len);
-            libc::close(self.fd);
-        }
+        // Owned mappings (`_sqes_map`, `_cq_map`, `_sq_map`) and `fd` drop
+        // automatically in field order right after this guard returns.
     }
 }
 
@@ -671,7 +669,7 @@ mod test {
         let file = std::fs::File::open(&path).unwrap();
         // Sound: the buffer has the 4 GiB of room said, and is not touched
         // until the read's completion is taken, below.
-        assert!(unsafe { ring.push_read(file.as_raw_fd(), buffer.as_mut_ptr(), 1 << 32, 0, 0, 5) });
+        assert!(unsafe { ring.push_read(file.as_raw_fd(), buffer.as_mut_ptr(), 1 << 32, 0, 5) });
         ring.submit_and_wait(1);
         let cqe = ring.pop_cqe().unwrap();
         assert_eq!((cqe.user_data, cqe.res), (5, 100));
@@ -688,7 +686,7 @@ mod test {
             let mut ends = [0i32; 2];
             assert_eq!(unsafe { libc::pipe(ends.as_mut_ptr()) }, 0);
             let mut buffer = [0u8; 64];
-            assert!(unsafe { ring.push_read(ends[0], buffer.as_mut_ptr(), 64, 0, 0, 1) });
+            assert!(unsafe { ring.push_read(ends[0], buffer.as_mut_ptr(), 64, 0, 1) });
             ring.submit_and_wait(0);
             drop(ring);
             std::process::exit(0);
@@ -796,12 +794,12 @@ mod test {
         let mut bufs: Vec<Vec<u8>> = (0..cap as usize).map(|_| vec![0u8; 256]).collect();
         for (i, b) in bufs.iter_mut().enumerate() {
             let off = (i * 111) as u64;
-            assert!(unsafe { ring.push_read(f.as_raw_fd(), b.as_mut_ptr(), 256, off, 0, i as u64) });
+            assert!(unsafe { ring.push_read(f.as_raw_fd(), b.as_mut_ptr(), 256, off, i as u64) });
             assert_eq!(ring.unsubmitted(), (i + 1) as u32);
         }
         assert_eq!(ring.sq_space_left(), 0);
         let mut extra = [0u8; 16];
-        assert!(!unsafe { ring.push_read(f.as_raw_fd(), extra.as_mut_ptr(), 16, 0, 0, 999) }, "ring must report full");
+        assert!(!unsafe { ring.push_read(f.as_raw_fd(), extra.as_mut_ptr(), 16, 0, 999) }, "ring must report full");
 
         ring.submit_and_wait(cap);
         assert_eq!(ring.unsubmitted(), 0);
@@ -820,17 +818,17 @@ mod test {
 
         // 2. Fault injection: invalid fd `-1` produces `-EBADF` CQE without corrupting ring state,
         // and `acquire` / `release` recycles the idle ring cleanly.
-        assert!(unsafe { ring.push_read(-1, extra.as_mut_ptr(), 16, 0, 0, 0xDEAD_BEEF) });
+        assert!(unsafe { ring.push_read(-1, extra.as_mut_ptr(), 16, 0, 0xDEAD_BEEF) });
         ring.submit_and_wait(1);
         let err_cqe = ring.pop_cqe().expect("error CQE");
         assert_eq!(err_cqe.user_data, 0xDEAD_BEEF);
         assert_eq!(err_cqe.res, -libc::EBADF);
         ring.submit_and_wait(0);
 
-        let saved_fd = ring.fd;
+        let saved_fd = ring.fd.as_raw_fd();
         ring.release();
         let reused = Uring::acquire(8).unwrap();
-        assert_eq!(reused.fd, saved_fd);
+        assert_eq!(reused.fd.as_raw_fd(), saved_fd);
     }
 
     #[test]
