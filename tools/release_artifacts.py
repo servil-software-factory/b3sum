@@ -146,6 +146,9 @@ class Release:
         commit's is."""
         problems = []
         changed = False
+        allowed_manifests = {os.path.join(folder, "Cargo.toml") if folder else "Cargo.toml" for folder in CRATE_DIRS}
+        allowed_stamp_files = allowed_manifests | {"Cargo.lock"}
+        changed_blobs = {}
         raw = subprocess.run(["git", "-C", self.repo, "diff-tree", "-r", "--raw", "--no-renames", "-z", code, self.commit], capture_output=True, check=True).stdout
         fields = raw.split(b"\0")
         for entry, path in zip(fields[0::2], fields[1::2]):
@@ -154,7 +157,9 @@ class Release:
             if status != "M" or old_mode != new_mode:
                 problems.append(f"{path} is added, removed, or of another kind")
                 continue
-            before, after = (subprocess.run(["git", "-C", self.repo, "cat-file", "blob", blob], capture_output=True, check=True).stdout.split(b"\n") for blob in (old, new))
+            before_raw, after_raw = (subprocess.run(["git", "-C", self.repo, "cat-file", "blob", blob], capture_output=True, check=True).stdout for blob in (old, new))
+            changed_blobs[path] = (before_raw, after_raw)
+            before, after = before_raw.split(b"\n"), after_raw.split(b"\n")
             if len(before) != len(after):
                 problems.append(f"{path} has lines added or removed")
                 continue
@@ -168,10 +173,86 @@ class Release:
                 if len(stamps_were) != len(stamps_are) or STAMP.split(was) != STAMP.split(now) or any(n != self.version.encode() for n in written):
                     problems.append(f"{path} line {number} changes more than a version to this release's")
                     break
+                if path not in allowed_stamp_files:
+                    problems.append(f"{path} is not a version stamp file (only declared Cargo.toml manifests and Cargo.lock may change)")
+                    break
                 if written:
                     changed = True
         if not problems and not changed:
             problems.append("changes no version from its parent")
+        # Require exact stamped values in every declared crate's Cargo.toml and
+        # (when present) in Cargo.lock for local crates ONLY — refusing edits to
+        # unrelated dependency versions (such as Git-pinned blake3-servil; M20).
+        if not problems:
+            crate_names = set()
+            for folder in CRATE_DIRS:
+                manifest_path = os.path.join(folder, "Cargo.toml") if folder else "Cargo.toml"
+                manifest_bytes = self.file(manifest_path)
+                if manifest_bytes is None:
+                    problems.append(f"{manifest_path} is missing in {self.commit}")
+                    continue
+                try:
+                    after_doc = tomllib.loads(manifest_bytes.decode())
+                    pkg = after_doc["package"]
+                    got_ver = pkg["version"]
+                    crate_names.add(pkg["name"])
+                except (UnicodeDecodeError, tomllib.TOMLDecodeError, KeyError, TypeError) as e:
+                    problems.append(f"{manifest_path} has no valid [package].version ({e})")
+                    continue
+                if got_ver != self.version:
+                    problems.append(f"{manifest_path} [package].version is {got_ver!r}, expected {self.version!r}")
+                if manifest_path in changed_blobs:
+                    try:
+                        before_doc = tomllib.loads(changed_blobs[manifest_path][0].decode())
+                    except (UnicodeDecodeError, tomllib.TOMLDecodeError) as e:
+                        problems.append(f"parent {manifest_path} could not be parsed ({e})")
+                        continue
+                    # Only [package].version may change in a declared manifest.
+                    expected_doc = dict(before_doc)
+                    expected_pkg = dict(before_doc.get("package", {}))
+                    expected_pkg["version"] = self.version
+                    expected_doc["package"] = expected_pkg
+                    if after_doc != expected_doc:
+                        problems.append(f"{manifest_path} changes fields other than [package].version")
+            lock_bytes = self.file("Cargo.lock")
+            if lock_bytes is not None and crate_names:
+                try:
+                    after_lock = tomllib.loads(lock_bytes.decode())
+                    lock_pkgs = after_lock.get("package", [])
+                except (UnicodeDecodeError, tomllib.TOMLDecodeError) as e:
+                    problems.append(f"Cargo.lock could not be parsed ({e})")
+                    lock_pkgs = []
+                for cname in sorted(crate_names):
+                    local_entries = [p for p in lock_pkgs if isinstance(p, dict) and p.get("name") == cname and "source" not in p]
+                    if not local_entries:
+                        problems.append(f"Cargo.lock has no local [[package]] entry for {cname}")
+                    elif any(p.get("version") != self.version for p in local_entries):
+                        found_vers = [p.get("version") for p in local_entries]
+                        problems.append(f"Cargo.lock entry for {cname} has version {found_vers!r}, expected {self.version!r}")
+                if "Cargo.lock" in changed_blobs and not problems:
+                    try:
+                        before_lock = tomllib.loads(changed_blobs["Cargo.lock"][0].decode())
+                    except (UnicodeDecodeError, tomllib.TOMLDecodeError) as e:
+                        problems.append(f"parent Cargo.lock could not be parsed ({e})")
+                    else:
+                        before_pkgs = before_lock.get("package", [])
+                        if len(before_pkgs) != len(lock_pkgs):
+                            problems.append("Cargo.lock changed package count")
+                        else:
+                            for old_p, new_p in zip(before_pkgs, lock_pkgs):
+                                if old_p == new_p:
+                                    continue
+                                is_local_release_crate = (
+                                    isinstance(old_p, dict)
+                                    and isinstance(new_p, dict)
+                                    and old_p.get("name") in crate_names
+                                    and "source" not in old_p
+                                    and "source" not in new_p
+                                )
+                                expected_p = dict(old_p, version=self.version) if is_local_release_crate else old_p
+                                if new_p != expected_p:
+                                    problems.append(f"Cargo.lock changes non-release package {old_p.get('name')!r}")
+                                    break
         return problems
 
     def on_main(self):

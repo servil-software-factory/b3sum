@@ -13,6 +13,14 @@ fn main() {
     println!("cargo::rustc-env=B3SUM_BUILD_VERSION={name}");
     println!("cargo::rerun-if-changed=build_version.rs");
     for path in watched {
-        println!("cargo::rerun-if-changed={}", path.display());
+        // Cargo's build-script stdout protocol is UTF-8 and line-delimited:
+        // never emit a lossily-replaced or newline-containing path that could
+        // silently watch the wrong target or inject a build directive (F7).
+        if let Some(s) = path.to_str()
+            && !s.contains('\n')
+            && !s.contains('\r')
+        {
+            println!("cargo::rerun-if-changed={s}");
+        }
     }
 }
