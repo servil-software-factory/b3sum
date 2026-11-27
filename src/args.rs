@@ -45,12 +45,28 @@ pub(crate) enum KeyMode {
     DeriveKey(String),
 }
 
+/// Validated text line format for digest output (R3 L9).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TextFormat {
+    DigestOnly,
+    Gnu,
+    Bsd,
+}
+
+/// Validated output format for `Command::Hash`; makes contradictory `--raw --tag`
+/// unrepresentable (R3 L9).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OutputFormat {
+    Raw,
+    Text(TextFormat),
+}
+
 /// Validated mutually-exclusive CLI subcommand and its mode-specific options (L1).
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Command {
-    Hash { length: u64, seek: u64, raw: bool, tag: bool, no_names: bool },
+    Hash { length: u64, seek: u64, format: OutputFormat },
     Check { quiet: bool },
-    Outboard { dir: PathBuf, tag: bool, no_names: bool },
+    Outboard { dir: PathBuf, format: TextFormat },
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -334,12 +350,20 @@ where
     } else {
         KeyMode::Plain
     };
+    let text_format = if no_names {
+        TextFormat::DigestOnly
+    } else if tag {
+        TextFormat::Bsd
+    } else {
+        TextFormat::Gnu
+    };
     let command = if check {
         Command::Check { quiet }
     } else if let Some(dir) = outboard {
-        Command::Outboard { dir, tag, no_names }
+        Command::Outboard { dir, format: text_format }
     } else {
-        Command::Hash { length: length.unwrap_or(blake3::OUT_LEN as u64), seek: seek.unwrap_or(0), raw, tag, no_names }
+        let format = if raw { OutputFormat::Raw } else { OutputFormat::Text(text_format) };
+        Command::Hash { length: length.unwrap_or(blake3::OUT_LEN as u64), seek: seek.unwrap_or(0), format }
     };
 
     Ok(ParseOutcome::Parsed(ParsedArgs { files, key_mode, command, num_threads, no_mmap }))

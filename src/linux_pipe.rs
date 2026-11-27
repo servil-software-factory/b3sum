@@ -1359,10 +1359,15 @@ fn run_hybrid_worker(
 
         // Cold `>= 4 MiB`: stream into 64 KiB `Pipeline` rooms
         // at ~20 MiB RSS, overlapping NVMe DMA with multi-core hashing!
+        // Skip initializing a 1-thread global pool singleton when file readers
+        // temporarily occupy the thread budget (`pool_workers <= 1` and the
+        // pool is still uninitialized); fall through to the local streaming
+        // reader so later parallel batches keep full width (R3 M2).
         let mut retire_cold_ring = false;
-        if let Some(c) = cold.get_or_init(max_slots) {
-            let pool_workers = if args.num_threads().is_some() { (total_threads - io_threads + 1).max(1) } else { total_threads.min(16) };
-            crate::init_pool_once(pool_workers);
+        let cold_pool_workers = if args.num_threads().is_some() { (total_threads - io_threads + 1).max(1) } else { total_threads.min(16) };
+        let use_cold_ring = cold_pool_workers > 1 || crate::actual_pool_threads() != 0;
+        if use_cold_ring && let Some(c) = cold.get_or_init(max_slots) {
+            crate::init_pool_once(cold_pool_workers);
             let cpipe = c.cold_large_pipe.get_or_insert_with(|| Pipeline::<usize, ()>::new(args.mode, Limits { messages: 2, rooms: LARGE_WINDOW }));
             let mut m = block_on(cpipe.message(i, Some(size)));
             let (stream_res, committed_any) = stream_fd_into_rooms(&mut c.ring, &mut c.deferred_cqes, cpipe, &mut m, file.as_raw_fd(), size);

@@ -557,13 +557,17 @@ def _test_item_spans(code):
                         j = m_else.end()
                         continue
                     # For inline `const { ... }` block expressions, keep
-                    # scanning if followed by a postfix continuation (e.g.
-                    # `.unwrap();`) or consume a trailing `;` (even on the next
+                    # scanning if followed by a postfix continuation (`.foo`,
+                    # `?`, NOT a `..` range expression starting the next
+                    # statement) or consume a trailing `;` (even on the next
                     # line) so its trailing comment is masked too.
                     k = j
                     while k < n and code[k].isspace():
                         k += 1
-                    if is_const_block and k < n and code[k] == ".":
+                    if is_const_block and k < n and (
+                        code[k] == "?"
+                        or (code[k] == "." and not code.startswith("..", k))
+                    ):
                         must_end_semi = True
                         seen_top_brace = False
                         j = k + 1

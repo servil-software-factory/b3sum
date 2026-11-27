@@ -237,8 +237,21 @@ $ ls outboards
 This standalone CLI crate (`b3sums`) is pre-1.0 software maintained under the
 [Servil Software Factory Manual](https://github.com/servil-software-factory/.github/blob/main/manual/01-philosophy.md).
 Supported build targets are `x86_64-unknown-linux-gnu`,
-`aarch64-unknown-linux-gnu`, and `aarch64-apple-darwin` (for other platforms,
-see official upstream [BLAKE3 `b3sum`](https://github.com/BLAKE3-team/BLAKE3)).
+`aarch64-unknown-linux-gnu`, and `aarch64-apple-darwin` (enforced in `build.rs`;
+for other platforms, see official upstream [BLAKE3 `b3sum`](https://github.com/BLAKE3-team/BLAKE3)).
+
+### Verification scope and limits
+
+| Check | What it verifies | Known limits |
+|---|---|---|
+| `cargo nextest run --locked --release` | Unit, CLI, `--check`, `--outboard`, PTY, FD-budget, and `io_uring` tests across all three native CI targets | Covers CLI I/O paths; BLAKE3 kernel proofs live in `blake3-servil-core`, not this crate |
+| `python3 tools/b3sum_controls.py` | 18 staged planted-fault controls on Linux (fd/ring/mmap/cancel/bounds regressions) | Targeted regression controls, not full repository-wide mutation coverage |
+| `python3 tools/unsafe_reasons.py` | Proximity check that shipped `unsafe` sites carry a `Sound:` comment and `debug_assert*!` carries `Debug-only:` | Syntactic check; does not prove soundness of `unsafe` blocks |
+| `python3 tools/test_dependency_policy.py` & `cargo-deny` / `cargo-vet` | Dependency graph policy (`libc` admitted via `supply-chain/config.toml` exemption; remaining deps audited) | Release packaging (`cargo package`) requires replacing the dev Git pin with a published `blake3-servil` version |
+
+AI-assisted development is reviewed per change and audited across rounds, with
+human approval required for releases; no independent third-party human audit of
+this standalone CLI I/O layer has been performed yet.
 
 Run the local verification checks from a checkout:
 

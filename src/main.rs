@@ -112,8 +112,8 @@ impl Args {
             }
         };
         let file_args = parsed.files;
-        if let Command::Hash { raw, seek, length, .. } = parsed.command {
-            if raw && file_args.len() > 1 {
+        if let Command::Hash { format, seek, length } = parsed.command {
+            if format == args::OutputFormat::Raw && file_args.len() > 1 {
                 bail!("Only one filename can be provided when using --raw");
             }
             // BLAKE3's output is 2^64 - 1 bytes long. A request past its end
@@ -143,7 +143,7 @@ impl Args {
     pub(crate) fn for_test_plain(file_args: Vec<PathBuf>) -> Self {
         Self {
             file_args,
-            command: Command::Hash { length: blake3::OUT_LEN as u64, seek: 0, raw: false, tag: false, no_names: false },
+            command: Command::Hash { length: blake3::OUT_LEN as u64, seek: 0, format: args::OutputFormat::Text(args::TextFormat::Gnu) },
             num_threads: None,
             no_mmap: false,
             mode: blake3::Mode::Plain,
@@ -182,15 +182,14 @@ impl Args {
     }
 
     fn raw(&self) -> bool {
-        matches!(self.command, Command::Hash { raw: true, .. })
+        matches!(self.command, Command::Hash { format: args::OutputFormat::Raw, .. })
     }
 
-    fn tag(&self) -> bool {
-        matches!(self.command, Command::Hash { tag: true, .. } | Command::Outboard { tag: true, .. })
-    }
-
-    fn no_names(&self) -> bool {
-        matches!(self.command, Command::Hash { no_names: true, .. } | Command::Outboard { no_names: true, .. })
+    fn text_format(&self) -> args::TextFormat {
+        match self.command {
+            Command::Hash { format: args::OutputFormat::Text(tf), .. } | Command::Outboard { format: tf, .. } => tf,
+            Command::Hash { format: args::OutputFormat::Raw, .. } | Command::Check { .. } => args::TextFormat::Gnu,
+        }
     }
 
     fn len(&self) -> u64 {
@@ -1139,24 +1138,31 @@ fn write_hash_text(hash: &blake3::Hash, args: &Args, out: &mut OutBuf) -> err::R
 /// callback (`write_hash_text` or `write_hex_output`), preserving the zero-
 /// allocation path for plain UTF-8 names (L2).
 fn write_formatted_line(path: &Path, args: &Args, out: &mut OutBuf, write_digest: impl FnOnce(&mut OutBuf) -> err::Result<()>) -> err::Result<()> {
-    if args.no_names() {
-        write_digest(out)?;
-        out.write_bytes(b"\n")?;
-        return out.finish_line().map_err(Into::into);
-    }
-    let FilepathString { filepath_string, is_escaped } = filepath_to_string(path);
-    if is_escaped {
-        out.write_bytes(b"\\")?;
-    }
-    if args.tag() {
-        out.write_bytes(b"BLAKE3 (")?;
-        out.write_bytes(filepath_string.as_bytes())?;
-        out.write_bytes(b") = ")?;
-        write_digest(out)?;
-    } else {
-        write_digest(out)?;
-        out.write_bytes(b"  ")?;
-        out.write_bytes(filepath_string.as_bytes())?;
+    match args.text_format() {
+        args::TextFormat::DigestOnly => {
+            write_digest(out)?;
+            out.write_bytes(b"\n")?;
+            return out.finish_line().map_err(Into::into);
+        }
+        args::TextFormat::Bsd => {
+            let FilepathString { filepath_string, is_escaped } = filepath_to_string(path);
+            if is_escaped {
+                out.write_bytes(b"\\")?;
+            }
+            out.write_bytes(b"BLAKE3 (")?;
+            out.write_bytes(filepath_string.as_bytes())?;
+            out.write_bytes(b") = ")?;
+            write_digest(out)?;
+        }
+        args::TextFormat::Gnu => {
+            let FilepathString { filepath_string, is_escaped } = filepath_to_string(path);
+            if is_escaped {
+                out.write_bytes(b"\\")?;
+            }
+            write_digest(out)?;
+            out.write_bytes(b"  ")?;
+            out.write_bytes(filepath_string.as_bytes())?;
+        }
     }
     out.write_bytes(b"\n")?;
     out.finish_line()?;
@@ -2273,7 +2279,7 @@ mod test {
         let Ok(ParseOutcome::Parsed(p)) = parse_from(["b3sum", "-l64", "--seek=8", "--num-threads", "2", "--", "-weird"]) else {
             panic!("expected parsed");
         };
-        assert_eq!(p.command, Command::Hash { length: 64, seek: 8, raw: false, tag: false, no_names: false });
+        assert_eq!(p.command, Command::Hash { length: 64, seek: 8, format: crate::args::OutputFormat::Text(crate::args::TextFormat::Gnu) });
         assert_eq!(p.num_threads.unwrap().get(), 2);
         assert_eq!(p.files, vec![std::path::PathBuf::from("-weird")]);
 
