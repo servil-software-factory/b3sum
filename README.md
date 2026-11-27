@@ -200,14 +200,12 @@ in-place overwrites.
 
 On Linux, `b3sum` can read cold regular files with direct I/O (bypassing the
 page cache) as an eligible optimization for standard digests (`--seek 0` with
-length `<= 32`, when memory mapping is enabled on single files or on the
-no-ring multi-file fallback) or `--outboard`, subject to size, thread-budget,
-and filesystem support: a single cold file of 4 MiB or more with multiple
-threads, multiple cold files of 32 MiB or more when at least 4 direct-I/O
-threads per file worker are available (or 4 MiB or more with multiple threads
-and mapping enabled when `io_uring` is unavailable), or any eligible cold file
-of 4 MiB or more with `--outboard`. Bypassing the cache avoids extra memory
-copies and leaves the page cache undisturbed when hashing large sets of files
+length `<= 32`, including under `--no-mmap`) or `--outboard`, subject to size,
+thread-budget, and filesystem support: a single cold file of 4 MiB or more with
+multiple threads, multiple cold files of 32 MiB or more when at least 4
+direct-I/O threads per file worker are available (or 4 MiB or more with multiple
+threads when `io_uring` is unavailable), or any eligible cold file of 4 MiB or
+more with `--outboard`. Bypassing the cache avoids extra memory copies and leaves the page cache undisturbed when hashing large sets of files
 once. On a Ryzen 9700X with NVMe storage, hashing a cold 1 GiB file drops from
 0.22 s through the page cache to 0.10 s with direct I/O (measured with
 `bench-hashes`).

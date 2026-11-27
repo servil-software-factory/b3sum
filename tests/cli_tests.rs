@@ -226,7 +226,6 @@ fn test_empty_checkfile_is_failure() {
 /// it ends GNU's tools: more results than a pipe holds, the reader gone
 /// after one line.
 #[test]
-#[cfg(unix)]
 fn test_reader_gone() {
     use std::io::BufRead;
     use std::os::unix::process::ExitStatusExt;
@@ -474,7 +473,6 @@ fn test_raw_with_multi_files_is_an_error() {
 }
 
 #[test]
-#[cfg(unix)]
 fn test_newline_and_backslash_escaping_on_unix() {
     blake3::initialize();
     let empty_hash = blake3::convenience::hash(b"").to_hex();
@@ -499,7 +497,6 @@ fn test_newline_and_backslash_escaping_on_unix() {
 }
 
 #[test]
-#[cfg(unix)]
 fn test_invalid_unicode_on_unix() {
     blake3::initialize();
     use std::os::unix::ffi::OsStringExt;
@@ -1084,7 +1081,6 @@ fn test_outboard_files_are_bao_trees() {
 /// taken in (a map and a read by position move no position themselves,
 /// and gave the second name the same file again).
 #[test]
-#[cfg(unix)]
 fn test_stdin_from_a_file_is_hashed_as_the_file() {
     use std::io::{Seek, SeekFrom};
     blake3::initialize();
@@ -1216,7 +1212,6 @@ fn test_stdin_from_an_empty_file_that_reports_a_size_and_with_no_descriptor_to_s
 /// directory, and there is none: an error, as a named checkfile's entry
 /// too, where it was the hash of standard input, and "OK".
 #[test]
-#[cfg(unix)]
 fn test_only_a_lone_dash_is_stdin() {
     blake3::initialize();
     let dir = tempfile::tempdir().unwrap();
@@ -1364,7 +1359,6 @@ fn test_a_checkfile_on_stdin_cannot_check_stdin() {
 /// Relative spellings of `/dev/stdin` (e.g. `stdin` with cwd `/dev`) are
 /// recognized by the unified classifier in both operand hashing and `--check`.
 #[test]
-#[cfg(unix)]
 fn test_relative_dev_stdin_alias_and_checkfile_order() {
     blake3::initialize();
     let payload: Vec<u8> = (0..128 * 1024usize).map(|i| (i.wrapping_mul(13) ^ (i >> 5)) as u8).collect();
@@ -1397,7 +1391,6 @@ fn test_relative_dev_stdin_alias_and_checkfile_order() {
 /// file hash the full file independently from byte 0 without corrupting fd 0's
 /// shared offset (catching Darwin `fd(4)` F_DUPFD offset sharing).
 #[test]
-#[cfg(unix)]
 fn test_regular_file_stdin_aliases_work_independently_on_unix() {
     use std::io::{Seek, SeekFrom};
     blake3::initialize();
@@ -1459,7 +1452,6 @@ fn test_regular_file_stdin_aliases_work_independently_on_unix() {
 /// aliases because b3sum reuses fd 0 instead of reopening `/dev/stdin`
 /// (avoiding Linux `ENXIO` on sockets and blocking reopen on closed FIFOs).
 #[test]
-#[cfg(unix)]
 fn test_unix_socket_and_named_fifo_stdin_aliases() {
     use std::io::Write;
     use std::os::unix::net::UnixStream;
@@ -1594,7 +1586,6 @@ fn test_low_nofile_budget_makes_progress_through_ring() {
 /// resolution: `/dev/stdin/` fails as not-a-directory, and a symlink traversal
 /// whose lexical form reduces to `/dev/stdin` still hashes the OS target file.
 #[test]
-#[cfg(unix)]
 fn test_lexical_dev_stdin_does_not_override_os_stat() {
     blake3::initialize();
 
@@ -1664,7 +1655,6 @@ fn test_lexical_dev_stdin_does_not_override_os_stat() {
 /// offset 0 and leave the parent's fd 0 offset untouched (including on macOS
 /// where opening `/dev/stdin` otherwise shares fd 0's offset via `fd(4)`).
 #[test]
-#[cfg(unix)]
 fn test_check_dev_stdin_regular_manifest_from_nonzero_offset() {
     use std::io::{Seek, SeekFrom};
     blake3::initialize();
@@ -1725,7 +1715,6 @@ fn test_raw_conflicts_with_tag() {
     }
 }
 
-#[cfg(unix)]
 mod pty_helpers {
     use std::ffi::CString;
     use std::fs;
@@ -1796,7 +1785,6 @@ mod pty_helpers {
 /// hashes across single-thread, multi-thread, `--tag`, `--no-names`, and XOF
 /// (`--length`) modes (#465).
 #[test]
-#[cfg(unix)]
 fn test_terminal_stdout_flushes_before_opening_blocked_fifo() {
     use std::io::Write as _;
     blake3::initialize();
@@ -1871,7 +1859,6 @@ fn test_terminal_stdout_flushes_before_opening_blocked_fifo() {
 /// with multiple threads (preventing channel-consumer stalls on a blocking
 /// FIFO, #465).
 #[test]
-#[cfg(unix)]
 fn test_terminal_stdout_flushes_multi_file_large_before_blocked_fifo() {
     use std::io::Write as _;
     blake3::initialize();
@@ -1917,7 +1904,6 @@ fn test_terminal_stdout_flushes_multi_file_large_before_blocked_fifo() {
     assert!(status.success(), "b3sum exited {status:?}");
 }
 
-#[cfg(unix)]
 #[test]
 fn check_stdin_and_dup_socket_fd_preserves_manifest_order() {
     use std::os::fd::OwnedFd;
