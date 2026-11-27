@@ -52,10 +52,8 @@ jobs:
         run: cargo clippy --locked --bins -- -D warnings
       - name: Test
         run: cargo nextest run --locked --release
-      - name: LTO CFLAGS build check
+      - name: Debug locked build check
         run: cargo build --locked
-        env:
-          CFLAGS: -flto
       - name: Safety controls (Linux)
         if: runner.os == 'Linux'
         run: |

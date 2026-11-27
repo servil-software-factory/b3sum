@@ -544,7 +544,13 @@ pub(crate) fn force_miss() -> bool {
 /// The tests' seam: called with each file's path just after the file is
 /// opened, where a test replaces what the path names.
 #[cfg(test)]
-pub(crate) static AFTER_OPEN: std::sync::Mutex<Option<Box<dyn Fn(&std::path::Path) + Send>>> = std::sync::Mutex::new(None);
+pub(crate) static AFTER_OPEN: std::sync::Mutex<Option<std::sync::Arc<dyn Fn(&std::path::Path) + Send + Sync>>> = std::sync::Mutex::new(None);
+
+/// Test seam invoked immediately after the multi-reader collector closes the
+/// claim queue (`next.fetch_max(nfiles)`) on cancellation, so tests can sample
+/// `FILES_CLAIMED` and release held helpers strictly after cancellation (M26).
+#[cfg(test)]
+pub(crate) static AFTER_CANCEL: std::sync::Mutex<Option<std::sync::Arc<dyn Fn() + Send + Sync>>> = std::sync::Mutex::new(None);
 
 /// The tests' seam: with it set, every file is taken for one the page
 /// cache does not hold.
@@ -946,7 +952,14 @@ fn hash_paths_inner(
                 let Some(item) = results[emitted].take() else { break };
                 if !on_ordered(emitted, item) {
                     stop = true;
-                    next.fetch_max(nfiles, Ordering::Relaxed);
+                    next.fetch_max(nfiles, Ordering::SeqCst);
+                    #[cfg(test)]
+                    {
+                        let hook = AFTER_CANCEL.lock().unwrap().as_ref().map(std::sync::Arc::clone);
+                        if let Some(hook) = hook {
+                            hook();
+                        }
+                    }
                     return false;
                 }
                 emitted += 1;
@@ -1094,8 +1107,11 @@ fn run_hybrid_worker(
         };
 
         #[cfg(test)]
-        if let Some(hook) = AFTER_OPEN.lock().unwrap().as_ref() {
-            hook(&paths[i]);
+        {
+            let hook = AFTER_OPEN.lock().unwrap().as_ref().map(std::sync::Arc::clone);
+            if let Some(hook) = hook {
+                hook(&paths[i]);
+            }
         }
 
         // From here on the file is the one opened above, on every path:
@@ -1839,7 +1855,7 @@ mod test {
         for path in &paths {
             std::fs::write(path, &first).unwrap();
         }
-        *super::AFTER_OPEN.lock().unwrap() = Some(Box::new(|path| {
+        *super::AFTER_OPEN.lock().unwrap() = Some(std::sync::Arc::new(|path| {
             std::fs::rename(path, path.with_extension("moved")).unwrap();
             std::fs::write(path, b"another file").unwrap();
         }));
@@ -2192,37 +2208,70 @@ mod test {
         paths.push(head);
         paths.extend(std::iter::repeat_n(body.clone(), 254));
 
-        // Hold helper readers on their first `body` open until `on_ordered(0)`
-        // returns `false` so the test deterministically checks cancellation
-        // regardless of runner scheduling speed.
+        // Hold helper readers (never the main collector thread) on their first
+        // `body` open (outside `AFTER_OPEN`'s mutex), wait in `on_ordered(0)`
+        // until at least one helper has actually reached the gate, then sample
+        // `FILES_CLAIMED` and release the gate from `AFTER_CANCEL` strictly
+        // AFTER `next.fetch_max(nfiles)` closes the claim queue. After join,
+        // assert ZERO new operands were claimed after cancellation (M26).
+        let main_tid = std::thread::current().id();
+        let arrived = Arc::new((Mutex::new(0usize), Condvar::new()));
         let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let timed_out = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let arrived_hook = Arc::clone(&arrived);
         let gate_hook = Arc::clone(&gate);
+        let timed_out_hook = Arc::clone(&timed_out);
         let body_hook = body.clone();
-        *super::AFTER_OPEN.lock().unwrap() = Some(Box::new(move |p: &std::path::Path| {
-            if p == body_hook {
+        *super::AFTER_OPEN.lock().unwrap() = Some(Arc::new(move |p: &std::path::Path| {
+            if p == body_hook && std::thread::current().id() != main_tid {
+                {
+                    let (lock, cvar) = &*arrived_hook;
+                    *lock.lock().unwrap() += 1;
+                    cvar.notify_all();
+                }
                 let (lock, cvar) = &*gate_hook;
                 let guard = lock.lock().unwrap();
-                let _ = cvar.wait_timeout_while(guard, std::time::Duration::from_secs(2), |done| !*done);
+                let (_g, wait_res) = cvar.wait_timeout_while(guard, std::time::Duration::from_secs(5), |done| !*done).unwrap();
+                if wait_res.timed_out() {
+                    timed_out_hook.store(true, Ordering::SeqCst);
+                }
             }
         }));
 
+        let claimed_at_close = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let claimed_at_close_hook = Arc::clone(&claimed_at_close);
+        let gate_cancel = Arc::clone(&gate);
+        *super::AFTER_CANCEL.lock().unwrap() = Some(Arc::new(move || {
+            // Runs strictly AFTER `next.fetch_max(nfiles, SeqCst)`: any worker
+            // waking from `gate` after this point must observe `next >= nfiles`
+            // and never increment `FILES_CLAIMED`.
+            claimed_at_close_hook.store(super::FILES_CLAIMED.load(Ordering::SeqCst), Ordering::SeqCst);
+            let (lock, cvar) = &*gate_cancel;
+            *lock.lock().unwrap() = true;
+            cvar.notify_all();
+        }));
+
         let args = crate::Args::for_test_plain_threads(paths.clone(), 4);
-        super::FILES_CLAIMED.store(0, Ordering::Relaxed);
+        super::FILES_CLAIMED.store(0, Ordering::SeqCst);
         let mut emitted = Vec::new();
         super::hash_paths_inner(&args, &paths, None, true, &mut |idx, res| {
             emitted.push((idx, res.unwrap()));
-            let (lock, cvar) = &*gate;
-            *lock.lock().unwrap() = true;
-            cvar.notify_all();
+            let (lock, cvar) = &*arrived;
+            let guard = lock.lock().unwrap();
+            let (_g, wait_res) = cvar.wait_timeout_while(guard, std::time::Duration::from_secs(5), |n| *n == 0).unwrap();
+            assert!(!wait_res.timed_out(), "at least one helper must reach the gate before closing sink");
             false
         });
         *super::AFTER_OPEN.lock().unwrap() = None;
+        *super::AFTER_CANCEL.lock().unwrap() = None;
+        assert!(!timed_out.load(Ordering::SeqCst), "cancellation rendezvous must complete without timing out (M26)");
         assert_eq!(emitted, vec![(0, blake3::convenience::hash(&head_data))]);
-        let claimed = super::FILES_CLAIMED.load(Ordering::Relaxed);
-        assert!(
-            claimed < paths.len() / 2,
-            "multi-reader helpers must stop claiming operands after on_ordered closes (claimed {claimed} of {}; #568)",
-            paths.len()
+        let claimed = super::FILES_CLAIMED.load(Ordering::SeqCst);
+        let at_close = claimed_at_close.load(Ordering::SeqCst);
+        assert_eq!(
+            claimed, at_close,
+            "zero additional operands may be claimed after next.fetch_max(nfiles) closes the queue (claimed {claimed}, at_close {at_close}; M26)"
         );
+        assert!(claimed <= 8, "only initial in-flight worker opens should occur before close (claimed {claimed})");
     }
 }

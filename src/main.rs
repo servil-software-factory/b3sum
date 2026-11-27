@@ -287,10 +287,8 @@ impl OutBuf {
             return Err(io::Error::new(io::ErrorKind::BrokenPipe, "stdout previously failed"));
         }
         if !self.buf.is_empty() {
-            let (written, res) = write_all_stdout(&self.buf);
-            if written > 0 {
-                self.buf.drain(..written);
-            }
+            let (_, res) = write_all_stdout(&self.buf);
+            self.buf.clear();
             if let Err(e) = res {
                 self.poisoned = true;
                 return Err(e);
@@ -715,10 +713,19 @@ fn hash_path(args: &Args, path: &Path, stdin_ctx: &StdinContext) -> err::Result<
 const HOLD_PAGES: u64 = 1 << 18;
 static HELD_PAGES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Cached OS virtual memory page size, validated positive once (L5).
+pub(crate) fn page_size() -> usize {
+    static PAGE_SIZE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *PAGE_SIZE.get_or_init(|| {
+        // Sound: `sysconf(_SC_PAGESIZE)` queries an immutable OS constant.
+        let ps = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        usize::try_from(ps).ok().filter(|&n| n > 0).expect("OS page size must be positive")
+    })
+}
+
 pub(crate) fn hold(map: mmap::Mmap) {
     use std::sync::atomic::Ordering;
-    // Sound: a query with no memory argument.
-    let page = u64::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).expect("the page size is positive");
+    let page = page_size() as u64;
     let pages = (map.len() as u64).div_ceil(page);
     if HELD_PAGES.fetch_add(pages, Ordering::Relaxed) + pages <= HOLD_PAGES {
         std::mem::forget(map);
@@ -968,16 +975,11 @@ thread_local! {
 /// Minimum read request length so Linux `pipe2(O_DIRECT)` packet-mode pipes
 /// (which buffer up to one kernel `PAGE_SIZE` per packet in `fs/pipe.c` and
 /// discard any unread tail on a short `read`) never silently truncate a packet
-/// on 4 KiB, 16 KiB, or 64 KiB page kernels (#515).
+/// on 4 KiB, 16 KiB, or 64 KiB page kernels (#515, L5).
 pub(crate) fn min_packet_read_len() -> usize {
     #[cfg(target_os = "linux")]
     {
-        static PAGE_SIZE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-        *PAGE_SIZE.get_or_init(|| {
-            // Sound: `sysconf(_SC_PAGESIZE)` queries an immutable OS constant.
-            let ps = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-            usize::try_from(ps).ok().filter(|&n| n >= 4096).unwrap_or(4096)
-        })
+        page_size().max(4096)
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -1074,37 +1076,15 @@ fn write_hash_text(hash: &blake3::Hash, args: &Args, out: &mut OutBuf) -> err::R
     Ok(())
 }
 
-pub(crate) fn print_hash_output(hash: blake3::Hash, path: &Path, args: &Args, out: &mut OutBuf) -> err::Result<()> {
-    let take = usize::try_from(args.len()).expect("standard 32-byte mode len <= 32");
-    if args.raw() {
-        out.write_bytes(&hash.as_bytes()[..take])?;
-        return Ok(());
-    }
+/// Shared GNU/BSD checkfile line formatter accepting any digest-writing
+/// callback (`write_hash_text` or `write_hex_output`), preserving the zero-
+/// allocation path for plain UTF-8 names (L2).
+fn write_formatted_line(path: &Path, args: &Args, out: &mut OutBuf, write_digest: impl FnOnce(&mut OutBuf) -> err::Result<()>) -> err::Result<()> {
     if args.no_names() {
-        write_hash_text(&hash, args, out)?;
+        write_digest(out)?;
         out.write_bytes(b"\n")?;
         return out.finish_line().map_err(Into::into);
     }
-
-    // Fast zero-allocation path when valid UTF-8 (or ASCII) without `\`, `\n`, `\r`!
-    if let Some(s) = path.to_str()
-        && !s.as_bytes().iter().any(|&b| matches!(b, b'\\' | b'\n' | b'\r'))
-    {
-        if args.tag() {
-            out.write_bytes(b"BLAKE3 (")?;
-            out.write_bytes(s.as_bytes())?;
-            out.write_bytes(b") = ")?;
-            write_hash_text(&hash, args, out)?;
-            out.write_bytes(b"\n")?;
-        } else {
-            write_hash_text(&hash, args, out)?;
-            out.write_bytes(b"  ")?;
-            out.write_bytes(s.as_bytes())?;
-            out.write_bytes(b"\n")?;
-        }
-        return out.finish_line().map_err(Into::into);
-    }
-
     let FilepathString { filepath_string, is_escaped } = filepath_to_string(path);
     if is_escaped {
         out.write_bytes(b"\\")?;
@@ -1113,16 +1093,24 @@ pub(crate) fn print_hash_output(hash: blake3::Hash, path: &Path, args: &Args, ou
         out.write_bytes(b"BLAKE3 (")?;
         out.write_bytes(filepath_string.as_bytes())?;
         out.write_bytes(b") = ")?;
-        write_hash_text(&hash, args, out)?;
-        out.write_bytes(b"\n")?;
+        write_digest(out)?;
     } else {
-        write_hash_text(&hash, args, out)?;
+        write_digest(out)?;
         out.write_bytes(b"  ")?;
         out.write_bytes(filepath_string.as_bytes())?;
-        out.write_bytes(b"\n")?;
     }
+    out.write_bytes(b"\n")?;
     out.finish_line()?;
     Ok(())
+}
+
+pub(crate) fn print_hash_output(hash: blake3::Hash, path: &Path, args: &Args, out: &mut OutBuf) -> err::Result<()> {
+    let take = usize::try_from(args.len()).expect("standard 32-byte mode len <= 32");
+    if args.raw() {
+        out.write_bytes(&hash.as_bytes()[..take])?;
+        return Ok(());
+    }
+    write_formatted_line(path, args, out, |out| write_hash_text(&hash, args, out))
 }
 
 fn write_hex_output(mut output: blake3::OutputReader, args: &Args, out: &mut OutBuf) -> err::Result<()> {
@@ -1141,10 +1129,6 @@ fn write_hex_output(mut output: blake3::OutputReader, args: &Args, out: &mut Out
     Ok(())
 }
 
-fn write_text_output(output: blake3::OutputReader, args: &Args, out: &mut OutBuf) -> err::Result<()> {
-    write_hex_output(output, args, out)
-}
-
 fn write_raw_output(output: blake3::OutputReader, args: &Args, out: &mut OutBuf) -> err::Result<()> {
     out.flush()?;
     let mut output = output.take(args.len());
@@ -1159,29 +1143,7 @@ fn print_output(output: blake3::OutputReader, path: &Path, args: &Args, out: &mu
         write_raw_output(output, args, out)?;
         return Ok(());
     }
-    if args.no_names() {
-        write_text_output(output, args, out)?;
-        out.write_bytes(b"\n")?;
-        return out.finish_line().map_err(Into::into);
-    }
-    let FilepathString { filepath_string, is_escaped } = filepath_to_string(path);
-    if is_escaped {
-        out.write_bytes(b"\\")?;
-    }
-    if args.tag() {
-        out.write_bytes(b"BLAKE3 (")?;
-        out.write_bytes(filepath_string.as_bytes())?;
-        out.write_bytes(b") = ")?;
-        write_text_output(output, args, out)?;
-        out.write_bytes(b"\n")?;
-        return out.finish_line().map_err(Into::into);
-    }
-    write_text_output(output, args, out)?;
-    out.write_bytes(b"  ")?;
-    out.write_bytes(filepath_string.as_bytes())?;
-    out.write_bytes(b"\n")?;
-    out.finish_line()?;
-    Ok(())
+    write_formatted_line(path, args, out, |out| write_hex_output(output, args, out))
 }
 
 fn read_key_from_stdin() -> err::Result<[u8; blake3::KEY_LEN]> {
@@ -1197,20 +1159,26 @@ fn read_key_from_stdin() -> err::Result<[u8; blake3::KEY_LEN]> {
     }
 }
 
-struct FilepathString {
-    filepath_string: String,
+struct FilepathString<'a> {
+    filepath_string: std::borrow::Cow<'a, str>,
     is_escaped: bool,
 }
 
-fn filepath_to_string(filepath: &Path) -> FilepathString {
+fn filepath_to_string(filepath: &Path) -> FilepathString<'_> {
     let unicode_cow = filepath.to_string_lossy();
-    let mut filepath_string = unicode_cow.to_string();
-    let mut is_escaped = false;
-    if filepath_string.contains(['\\', '\n', '\r']) {
-        filepath_string = filepath_string.replace('\\', "\\\\").replace('\n', "\\n").replace('\r', "\\r");
-        is_escaped = true;
+    if !unicode_cow.as_bytes().iter().any(|&b| matches!(b, b'\\' | b'\n' | b'\r')) {
+        return FilepathString { filepath_string: unicode_cow, is_escaped: false };
     }
-    FilepathString { filepath_string, is_escaped }
+    let mut escaped = String::with_capacity(unicode_cow.len() + 8);
+    for ch in unicode_cow.chars() {
+        match ch {
+            '\\' => escaped.push_str("\\\\"),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            _ => escaped.push(ch),
+        }
+    }
+    FilepathString { filepath_string: std::borrow::Cow::Owned(escaped), is_escaped: true }
 }
 
 fn hex_half_byte(b: u8) -> err::Result<u8> {
@@ -1446,6 +1414,32 @@ fn outboard_inputs(args: &Args, dir: &Path, stdin_ctx: &StdinContext, out: &mut 
         return paths.len().max(1) as u64;
     }
     let total = threads().get();
+    // On an interactive terminal, finish writing and printing each operand
+    // before opening the next so progress appears immediately and a later FIFO
+    // cannot hold back earlier lines (M4).
+    if out.is_line_flushed() {
+        let mut rooms = outboard::Rooms::new();
+        let mut nodes = Vec::new();
+        let mut failed = 0u64;
+        for path in paths {
+            nodes.clear();
+            let res = outboard_of(args, path, stdin_ctx, total, &mut rooms, &mut nodes).and_then(|hash| {
+                if !nodes.is_empty() {
+                    outboard::write_in(dir, &hash, &nodes)?;
+                }
+                print_hash_output(hash, path, args, out)
+            });
+            if let Err(e) = res {
+                failed = failed.saturating_add(1);
+                let _ = out.flush();
+                eprintln_safe!("{}: {}: {}", NAME, path.to_string_lossy(), e);
+                if out.is_poisoned() {
+                    break;
+                }
+            }
+        }
+        return failed;
+    }
     let max_workers = if args.num_threads().is_some() { max_file_threads(total) } else { total };
     let workers = if stdin_named_twice(paths, stdin_ctx) { 1 } else { max_workers.min(paths.len()) };
     let in_a_file = (total / workers.max(1)).max(1);
@@ -2083,6 +2077,12 @@ fn check_one_checkfile(path: &Path, args: &Args, stdin_ctx: &StdinContext, files
     let mut eof = false;
     let mut saw_line = false;
 
+    // On an interactive terminal, check and emit one entry at a time so
+    // progress appears immediately and a later blocking FIFO or slow manifest
+    // cannot hold back earlier results (M4). Keep full batching for redirected
+    // output.
+    let batch_limit = if out.is_line_flushed() { 1 } else { CHECK_CHUNK };
+
     let loop_res: err::Result<()> = (|| {
         while !eof {
             eof = collect_check_batch(
@@ -2091,7 +2091,7 @@ fn check_one_checkfile(path: &Path, args: &Args, stdin_ctx: &StdinContext, files
                 &mut pending,
                 &mut entries,
                 &mut batch_paths,
-                CHECK_CHUNK,
+                batch_limit,
                 MAX_CHECK_BATCH_BYTES,
                 MAX_CHECK_LINE_BYTES,
                 stdin_ctx,

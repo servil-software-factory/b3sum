@@ -1,14 +1,14 @@
 #!/bin/sh
-# Install hash-verified CI binaries (cargo-nextest 0.9.152, cargo-c 0.10.26,
+# Install hash-verified CI binaries (cargo-nextest 0.9.152,
 # cargo-deny 0.22.0, cargo-vet 0.10.4) into ${DEST:-${CARGO_HOME:-$HOME/.cargo}/bin},
 # dropping third-party installer actions.
 #
-#     sh tools/ci-tools.sh nextest [cargo-c] [cargo-deny] [cargo-vet]
+#     sh tools/ci-tools.sh nextest [cargo-deny] [cargo-vet]
 set -eu
 DEST=${DEST:-"${CARGO_HOME:-$HOME/.cargo}/bin"}
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 if [ "$#" -eq 0 ]; then
-  echo "usage: sh tools/ci-tools.sh nextest|cargo-c|cargo-deny|cargo-vet ..." >&2
+  echo "usage: sh tools/ci-tools.sh nextest|cargo-deny|cargo-vet ..." >&2
   exit 2
 fi
 
@@ -63,41 +63,6 @@ install_nextest() {
   "$DEST/cargo-nextest" --version
 }
 
-install_cargo_c() {
-  ver=0.10.26
-  case "$(uname -sm)" in
-    "Linux x86_64")
-      asset=cargo-c-x86_64-unknown-linux-musl.tar.gz
-      sha=685fab5a2e1539c5075cea21c42469ee5a489d877dbdbf7adccf4bb631d77545
-      # BLAKE3: 73e8bc49237e44e8160d594b6e0e9cb2e659c41499cfed66c36db95719f2dbcb
-      ;;
-    "Linux aarch64")
-      asset=cargo-c-aarch64-unknown-linux-musl.tar.gz
-      sha=68a45c967438240b64f2806639098c89df676c0152e855f5122cf5173204ce6c
-      # BLAKE3: 6c80df600f3e4e5aa548d8f85d2a44b20add795b05522d431cbf86bffbd26c58
-      ;;
-    "Darwin arm64"|"Darwin x86_64")
-      asset=cargo-c-macos.zip
-      sha=891ec1f27eb48f24ed615fd52180528c71295a2c9049b306c204e15e53130354
-      # BLAKE3: 72ee5199219b8a47316f9fae23debb7c83c9bc647708798c8a3c4bd317b97488
-      ;;
-    *) echo "ci-tools: no cargo-c binary named for $(uname -sm)" >&2; exit 1 ;;
-  esac
-  archive="$tmp/$asset"
-  curl --proto '=https' --tlsv1.2 -sSfL -o "$archive" \
-    "https://github.com/lu-zero/cargo-c/releases/download/v${ver}/${asset}"
-  verify_sha256 "$sha" "$archive"
-  mkdir -p "$DEST"
-  case "$asset" in
-    *.tar.gz) tar -xzf "$archive" -C "$DEST" cargo-capi cargo-cbuild cargo-cinstall cargo-ctest ;;
-    *.zip)
-      unzip -oq "$archive" -d "$DEST" cargo-capi cargo-cbuild cargo-cinstall cargo-ctest
-      chmod +x "$DEST/cargo-capi" "$DEST/cargo-cbuild" "$DEST/cargo-cinstall" "$DEST/cargo-ctest"
-      ;;
-  esac
-  "$DEST/cargo-cinstall" --version
-}
-
 install_cargo_deny() {
   ver=0.22.0
   case "$(uname -sm)" in
@@ -146,9 +111,8 @@ trap 'rm -rf "$tmp"' EXIT
 for tool in "$@"; do
   case "$tool" in
     nextest) install_nextest ;;
-    cargo-c) install_cargo_c ;;
     cargo-deny) install_cargo_deny ;;
     cargo-vet) install_cargo_vet ;;
-    *) echo "ci-tools: unknown tool $tool (nextest, cargo-c, cargo-deny, cargo-vet)" >&2; exit 2 ;;
+    *) echo "ci-tools: unknown tool $tool (nextest, cargo-deny, cargo-vet)" >&2; exit 2 ;;
   esac
 done
