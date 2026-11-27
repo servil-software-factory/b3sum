@@ -1,5 +1,7 @@
 # How does `b3sum --check` behave exactly?<br>or: Are filepaths...text?
 
+*(Adapted from upstream [BLAKE3's `what_does_check_do.md`](https://github.com/BLAKE3-team/BLAKE3/blob/master/b3sum/what_does_check_do.md); note that this standalone `b3sums` CLI natively supports Linux and macOS only, while preserving checkfile format interoperability with upstream `b3sum`.)*
+
 Most of the time, `b3sum --check` is a drop-in replacement for `md5sum --check`
 and other Coreutils hashing tools. It consumes a checkfile (the output of a
 regular `b3sum` command), re-hashes all the files listed there, and returns
@@ -16,7 +18,7 @@ document describes all of these edge cases in detail.
 > _new files_ are added to `my_dir`. Adding new files without changing anything
 > else is often enough to execute arbitrary code, for example by shadowing an
 > `import` in Python, or by installing something in `.git/hooks`. This is
-> confusing enough that I don't recommend using `--check` as a security tool in
+> confusing enough that `--check` is not recommended as a security tool in
 > new code.
 
 An expected digest needs a trusted source: a checkfile an attacker can

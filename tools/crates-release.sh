@@ -6,9 +6,10 @@
 #
 #     sh tools/crates-release.sh [--no-verify]
 #
-# HEAD is the version commit, or with RELEASE_ANY_COMMIT=1 any commit:
-# CI packages every candidate so. --no-verify leaves out Cargo's build of
-# the packaged crate (the release's own run keeps it).
+# HEAD is the version commit, or with RELEASE_ANY_COMMIT=1 any commit
+# (packaging requires replacing the dev Git `blake3-servil` pin in Cargo.toml
+# with a published crates.io version before tagging). --no-verify leaves out
+# Cargo's build of the packaged crate (the release's own run keeps it).
 #
 # The same bytes whoever packages. An archive is a function of the commit,
 # of Cargo.lock, and of Cargo's version, so a release's crate can be

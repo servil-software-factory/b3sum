@@ -131,28 +131,29 @@ fn size_ring_workers(nofile_cap: usize, open_fds: Option<usize>, desired_io_thre
 /// ring slot depth within the process descriptor budget.
 fn grow_descriptor_table(descriptors: usize) -> usize {
     let want = descriptors.next_power_of_two().max(64) as libc::rlim_t;
-    // Sound: system calls on plain values and on descriptors this function
-    // opened itself, each closed once.
-    unsafe {
-        let mut rlim = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
-        let cap = if libc::getrlimit(libc::RLIMIT_NOFILE, &mut rlim) == 0 {
-            if rlim.rlim_cur < want && rlim.rlim_max > rlim.rlim_cur {
-                let raised = want.min(rlim.rlim_max);
-                let try_rlim = libc::rlimit { rlim_cur: raised, rlim_max: rlim.rlim_max };
-                if libc::setrlimit(libc::RLIMIT_NOFILE, &try_rlim) == 0 {
-                    rlim.rlim_cur = raised;
-                }
+    let mut rlim = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+    // Sound: `rlim` is a valid stack `libc::rlimit` pointer.
+    let cap = if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut rlim) } == 0 {
+        if rlim.rlim_cur < want && rlim.rlim_max > rlim.rlim_cur {
+            let raised = want.min(rlim.rlim_max);
+            let try_rlim = libc::rlimit { rlim_cur: raised, rlim_max: rlim.rlim_max };
+            // Sound: `try_rlim` is a valid stack `libc::rlimit` pointer.
+            if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &try_rlim) } == 0 {
+                rlim.rlim_cur = raised;
             }
-            rlim.rlim_cur
-        } else {
-            1024
-        };
-        let target = i32::try_from(want.min(cap).saturating_sub(1).min(i32::MAX as libc::rlim_t)).expect("clamped to i32::MAX");
-        if target >= 63 {
-            // F_DUPFD takes the lowest free number from `target` up, so it
-            // never lands on a descriptor the caller gave this process
-            // (`b3sum /dev/fd/255 ...`). dup2 did: it closed that file
-            // without a word, and a later open could take its number.
+        }
+        rlim.rlim_cur
+    } else {
+        1024
+    };
+    let target = i32::try_from(want.min(cap).saturating_sub(1).min(i32::MAX as libc::rlim_t)).expect("clamped to i32::MAX");
+    if target >= 63 {
+        // F_DUPFD takes the lowest free number from `target` up, so it
+        // never lands on a descriptor the caller gave this process
+        // (`b3sum /dev/fd/255 ...`). dup2 did: it closed that file
+        // without a word, and a later open could take its number.
+        // Sound: opens `/dev/null` and closes every descriptor opened here once.
+        unsafe {
             let fd = libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC);
             if fd >= 0 {
                 let high = libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, target);
@@ -162,8 +163,8 @@ fn grow_descriptor_table(descriptors: usize) -> usize {
                 libc::close(fd);
             }
         }
-        usize::try_from(cap).unwrap_or(usize::MAX)
     }
+    usize::try_from(cap).unwrap_or(usize::MAX)
 }
 
 #[inline]
@@ -1054,7 +1055,16 @@ impl ColdRing {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Cap on global pool workers started by the cold-file `io_uring` Pipeline
+/// fallback when `--num-threads` is unset (bounds thread contention on high-core
+/// hosts when NVMe bandwidth saturates below 16 hashing threads).
+const COLD_RING_MAX_POOL_WORKERS: usize = 16;
+
+const _: () = {
+    assert!(COLD_RING_MAX_FILE == crate::POOL_START_LEN as u64);
+    assert!(COLD_DIRECT_MIN >= COLD_RING_MAX_FILE);
+};
+
 fn run_hybrid_worker(
     args: &Args,
     paths: &[PathBuf],
@@ -1257,13 +1267,13 @@ fn run_hybrid_worker(
         let mut mapped_cold = false;
         if let Some(map) = args.map(&file) {
             if !force_miss() && crate::resident(&map) {
-                if size < (4 << 20) {
+                if size < COLD_RING_MAX_FILE {
                     let h = crate::hash_slice_32(args.mode, &map);
                     crate::hold(map);
                     sink.put(i, Ok(h));
                     continue;
                 }
-                let pool_workers = if args.num_threads().is_some() { (total_threads - io_threads + 1).max(1) } else { total_threads };
+                let pool_workers = if args.num_threads().is_some() { crate::pool_threads().get() } else { total_threads };
                 // Don't start a 1-thread global pool singleton when a local
                 // hash suffices; keeps the singleton available for later
                 // parallel batches (M27).
@@ -1343,7 +1353,7 @@ fn run_hybrid_worker(
         // pool is still uninitialized); fall through to the local streaming
         // reader so later parallel batches keep full width (R3 M2).
         let mut retire_cold_ring = false;
-        let cold_pool_workers = if args.num_threads().is_some() { (total_threads - io_threads + 1).max(1) } else { total_threads.min(16) };
+        let cold_pool_workers = if args.num_threads().is_some() { crate::pool_threads().get() } else { total_threads.min(COLD_RING_MAX_POOL_WORKERS) };
         let use_cold_ring = cold_pool_workers > 1 || crate::actual_pool_threads() != 0;
         if use_cold_ring && let Some(c) = cold.get_or_init(max_slots) {
             crate::init_pool_once(cold_pool_workers);
@@ -1433,7 +1443,7 @@ mod test {
     #[test]
     fn sync_fallback_pread_and_uring_disabled_mode_match_reference() {
         blake3::initialize();
-        let dir = crate::tempfile::tempdir_in(".").unwrap_or_else(|_| crate::tempfile::tempdir().unwrap());
+        let dir = crate::tempfile::tempdir_in(std::env::current_exe().unwrap().parent().unwrap()).unwrap_or_else(|_| crate::tempfile::tempdir().unwrap());
         let p = dir.path().join("grow");
         let content: Vec<u8> = (0..100_000u32).map(|i| (i * 7) as u8).collect();
         std::fs::write(&p, &content).unwrap();
@@ -1553,7 +1563,7 @@ mod test {
         let Ok(mut ring) = crate::uring::Uring::new(64) else { return };
         crate::init_pool_once(2);
 
-        let dir = crate::tempfile::tempdir_in(".").unwrap_or_else(|_| crate::tempfile::tempdir().unwrap());
+        let dir = crate::tempfile::tempdir_in(std::env::current_exe().unwrap().parent().unwrap()).unwrap_or_else(|_| crate::tempfile::tempdir().unwrap());
         for &len in &[0usize, 1, 65_535, 65_536, 65_537, 600_000, 4_500_000] {
             let p = dir.path().join(format!("large-{len}"));
             let data: Vec<u8> = (0..len).map(|i| (i.wrapping_mul(31) ^ (i >> 8)) as u8).collect();
@@ -1633,7 +1643,7 @@ mod test {
     #[test]
     fn forced_misses_take_the_cold_paths_for_every_size_class() {
         blake3::initialize();
-        let dir = crate::tempfile::tempdir_in(".").unwrap_or_else(|_| crate::tempfile::tempdir().unwrap());
+        let dir = crate::tempfile::tempdir_in(std::env::current_exe().unwrap().parent().unwrap()).unwrap_or_else(|_| crate::tempfile::tempdir().unwrap());
         // 34 files: the wide form (32 files and more). Then 5: the narrow one.
         let (paths, want) = files_of_every_size(dir.path(), 34);
         assert_eq!(hashes_in_order(&paths), want, "from the page cache");
@@ -1669,7 +1679,7 @@ mod test {
     fn forced_misses_with_one_thread_hash_every_size_class() {
         blake3::initialize();
         crate::THREADS.set(std::num::NonZeroUsize::MIN).expect("this test's process sets the thread count first");
-        let dir = crate::tempfile::tempdir_in(".").unwrap_or_else(|_| crate::tempfile::tempdir().unwrap());
+        let dir = crate::tempfile::tempdir_in(std::env::current_exe().unwrap().parent().unwrap()).unwrap_or_else(|_| crate::tempfile::tempdir().unwrap());
         let (paths, want) = files_of_every_size(dir.path(), 34);
         super::FORCE_MISS.store(true, std::sync::atomic::Ordering::Relaxed);
         assert_eq!(hashes_in_order(&paths), want);
@@ -1855,7 +1865,7 @@ mod test {
     /// ring can be made the reads are of another kind, and this says
     /// nothing.)
     fn spoiled_ring_reads_come_to_the_same_hashes() {
-        let dir = crate::tempfile::tempdir_in(".").unwrap_or_else(|_| crate::tempfile::tempdir().unwrap());
+        let dir = crate::tempfile::tempdir_in(std::env::current_exe().unwrap().parent().unwrap()).unwrap_or_else(|_| crate::tempfile::tempdir().unwrap());
         let (paths, want) = files_of_every_size(dir.path(), 34);
         super::FORCE_MISS.store(true, std::sync::atomic::Ordering::Relaxed);
         for spoil in [1, 2] {
@@ -1923,7 +1933,7 @@ mod test {
     #[test]
     fn unsupported_op_read_falls_back_cleanly() {
         blake3::initialize();
-        let dir = crate::tempfile::tempdir_in(".").unwrap_or_else(|_| crate::tempfile::tempdir().unwrap());
+        let dir = crate::tempfile::tempdir_in(std::env::current_exe().unwrap().parent().unwrap()).unwrap_or_else(|_| crate::tempfile::tempdir().unwrap());
         let (paths, want) = files_of_every_size(dir.path(), 6);
         crate::uring::REFUSE_OP_READ.store(true, std::sync::atomic::Ordering::Relaxed);
         super::FORCE_MISS.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -1996,7 +2006,7 @@ mod test {
         // Force a 16-thread budget so 3 files -> io_threads=3 -> want_direct=5 >= 4
         // deterministically even on 4-CPU CI runners.
         crate::THREADS.set(std::num::NonZeroUsize::new(16).unwrap()).expect("fresh test process");
-        let dir = crate::tempfile::tempdir_in(".").unwrap_or_else(|_| crate::tempfile::tempdir().unwrap());
+        let dir = crate::tempfile::tempdir_in(std::env::current_exe().unwrap().parent().unwrap()).unwrap_or_else(|_| crate::tempfile::tempdir().unwrap());
         // Pin literal 32 MiB threshold (and 32 MiB - 1 below it).
         let at_32m: usize = 32 * 1024 * 1024;
         let below_32m: usize = at_32m - 1;
@@ -2037,7 +2047,7 @@ mod test {
     fn cold_large_multi_file_skips_direct_with_few_threads() {
         blake3::initialize();
         crate::THREADS.set(std::num::NonZeroUsize::new(4).unwrap()).expect("fresh test process");
-        let dir = crate::tempfile::tempdir_in(".").unwrap_or_else(|_| crate::tempfile::tempdir().unwrap());
+        let dir = crate::tempfile::tempdir_in(std::env::current_exe().unwrap().parent().unwrap()).unwrap_or_else(|_| crate::tempfile::tempdir().unwrap());
         let at_32m: usize = 32 * 1024 * 1024;
         let mut a = vec![0u8; at_32m];
         let mut b = vec![0u8; at_32m + 17];
@@ -2068,7 +2078,7 @@ mod test {
         // With 8 total threads and 2 files, `max_file_threads(8) = 4`, `io_threads = 2`,
         // so `want_direct = 4`: each worker leases 3 extra permits -> 2 + 2*3 = 8 total.
         crate::THREADS.set(std::num::NonZeroUsize::new(8).unwrap()).expect("fresh test process");
-        let dir = crate::tempfile::tempdir_in(".").unwrap_or_else(|_| crate::tempfile::tempdir().unwrap());
+        let dir = crate::tempfile::tempdir_in(std::env::current_exe().unwrap().parent().unwrap()).unwrap_or_else(|_| crate::tempfile::tempdir().unwrap());
         let at_32m: usize = 32 * 1024 * 1024;
         let mut a = vec![0u8; at_32m];
         let mut b = vec![0u8; at_32m + 17];

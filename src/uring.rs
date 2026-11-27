@@ -757,8 +757,9 @@ mod test {
             .stderr(std::process::Stdio::from(stderr_file))
             .spawn()
             .unwrap();
-        // Hold the read end open without ever reading from it; child must abort promptly.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        // Hold the read end open without ever reading from it; child must abort
+        // promptly (8 s parent deadline documented in `.config/nextest.toml`).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
         let status = loop {
             if let Some(status) = child.try_wait().unwrap() {
                 break status;

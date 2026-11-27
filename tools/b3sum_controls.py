@@ -12,7 +12,7 @@ named test under `cargo nextest` with a bounded timeout, and requires
 that exact test to fail. A protection whose test still passes, fails to
 build, or hits a timeout/infrastructure error exits 1 naming it.
 
-b3sum is outside the mutation gate (tools/mutants), which is slow on it
+b3sum is outside the mutation gate (BLAKE3's tools/mutants), which is slow on it
 (BLAKE3 #386); this is its bounded stand-in, for the protections named.
 """
 

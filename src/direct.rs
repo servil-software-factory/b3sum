@@ -71,14 +71,6 @@ pub(crate) fn is_for(file: &std::fs::File, len: u64) -> bool {
     cold
 }
 
-/// The open `file`, of `len` bytes, read in pieces of PIECE bytes by
-/// `threads` threads, each piece handed, with its number, to `each` on the
-/// thread that read it, beside its share of `outs`: `per` of them a piece
-/// (the last piece's, what is left). None where the file cannot be opened
-/// for direct reads, or a read fails or comes back short, or the file
-/// does not end at `len` (a last piece with fewer bytes or more, or bytes
-/// after a last whole piece): the caller then reads the file another way.
-/// The reads say where the file ends, and `len` only where to look.
 /// Why an `O_DIRECT` read or hash attempt did not complete directly.
 ///
 /// Separating `Unavailable` (reopen failed or `EINVAL` alignment/filesystem
@@ -253,9 +245,9 @@ pub(crate) fn read<T: Send>(
     }
 }
 
-/// The hash of the open `file`, of `len` bytes (PIECE or more), read
-/// directly: each piece's subtree hashed by the thread that read it, on
-/// its own core's kernels, then the pieces' parents a layer at a time.
+/// The hash of the open `file`, of `len` bytes (`len > PIECE`, two pieces or
+/// more), read directly: each piece's subtree hashed by the thread that read
+/// it, on its own core's kernels, then the pieces' parents a layer at a time.
 /// Propagates [`Failure`] as [`read`] says.
 pub(crate) fn hash(mode: blake3::Mode, file: &std::fs::File, len: usize, threads: usize, mine: &mut Piece) -> Result<blake3::Hash, Failure> {
     assert!(len > PIECE, "two pieces or more");
@@ -304,9 +296,9 @@ mod test {
     /// A file read directly hashes as its bytes do: at two pieces, an odd
     /// count of pieces, a ragged last piece and a last piece of one byte;
     /// on one thread and on several; plain and keyed. A length that the
-    /// file's pieces do not bear gives None. (Where the test's directory
-    /// has no direct reads, as a tmpfs before Linux 6.6, there is nothing
-    /// to compare.)
+    /// file's pieces do not bear returns `Err(Failure::Changed)`. (Where the
+    /// test's directory has no direct reads, as a tmpfs before Linux 6.6, there
+    /// is nothing to compare.)
     #[test]
     fn a_file_read_directly_hashes_as_its_bytes_do() {
         blake3::initialize();

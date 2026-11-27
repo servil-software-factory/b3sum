@@ -14,8 +14,6 @@ edition = "2024"
 name = "b3sum"
 path = "src/main.rs"
 
-[features]
-
 [dependencies]
 blake3 = { git = "https://github.com/servil-software-factory/BLAKE3", rev = "d332acb52bd38ed2f758087efca2e5d520db7c2d", package = "blake3-servil" }
 

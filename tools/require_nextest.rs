@@ -1,8 +1,7 @@
-// Included (include!) by every crate's tests in this repository: under
-// `cargo test` this test fails with how to run them, and cargo stops at
-// the first binary that fails. The tests run under cargo-nextest, each in
-// its own process (AGENTS: "Tests run under nextest"), and some rely on
-// being alone in theirs.
+// Included (include!) by the binary's unit tests: under `cargo test` this test
+// fails with how to run them, and cargo stops at the first binary that fails.
+// Tests run under cargo-nextest, each in its own process, because several I/O
+// and pool tests assume process isolation.
 #[test]
 fn aaa_require_nextest() {
     if std::env::var_os("NEXTEST").is_none() {
