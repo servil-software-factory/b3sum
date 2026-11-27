@@ -42,13 +42,13 @@ With [Rust and Cargo](https://doc.rust-lang.org/cargo/getting-started/installati
   Arm):
 
   ```bash
-  RUSTFLAGS="-C target-feature=+crt-static" cargo install b3sums --target x86_64-unknown-linux-gnu
+  RUSTFLAGS="-C target-feature=+crt-static" cargo install --locked b3sums --target x86_64-unknown-linux-gnu
   ```
 
 - On macOS:
 
   ```bash
-  cargo install b3sums
+  cargo install --locked b3sums
   ```
 
 The package name on crates.io is **`b3sums`** (the `b3sum` package is official

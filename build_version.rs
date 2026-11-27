@@ -27,9 +27,11 @@ use std::process::Command;
 /// Cargo's marker in its checkout of a git dependency: no change of ours.
 const CARGO_MARKER: &str = ".cargo-ok";
 
-fn git_bytes(dir: &Path, args: &[&str], index: Option<&Path>, objects: Option<(&Path, &OsStr)>) -> Option<Vec<u8>> {
+fn git_bytes_with_stdin(dir: &Path, args: &[&str], index: Option<&Path>, objects: Option<(&Path, &OsStr)>, stdin_bytes: Option<&[u8]>) -> Option<Vec<u8>> {
+    use std::io::Write;
+    use std::process::Stdio;
     let mut command = Command::new("git");
-    command.arg("-C").arg(dir).args(args);
+    command.arg("-C").arg(dir).args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
     if let Some(index) = index {
         command.env("GIT_INDEX_FILE", index);
     }
@@ -40,8 +42,21 @@ fn git_bytes(dir: &Path, args: &[&str], index: Option<&Path>, objects: Option<(&
         command.env("GIT_OBJECT_DIRECTORY", private_obj);
         command.env("GIT_ALTERNATE_OBJECT_DIRECTORIES", alternates);
     }
+    if let Some(input) = stdin_bytes {
+        command.stdin(Stdio::piped());
+        let mut child = command.spawn().ok()?;
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin.write_all(input).ok()?;
+        }
+        let out = child.wait_with_output().ok()?;
+        return out.status.success().then_some(out.stdout);
+    }
     let out = command.output().ok()?;
     out.status.success().then_some(out.stdout)
+}
+
+fn git_bytes(dir: &Path, args: &[&str], index: Option<&Path>, objects: Option<(&Path, &OsStr)>) -> Option<Vec<u8>> {
+    git_bytes_with_stdin(dir, args, index, objects, None)
 }
 
 fn git_path(dir: &Path, args: &[&str]) -> Option<PathBuf> {
@@ -103,10 +118,9 @@ pub fn build_version(krate: &Path, version: &str, scratch: &Path) -> (String, Ve
     if top.canonicalize().ok() != dir.canonicalize().ok() {
         return package();
     }
-    let (Some(git_dir), Some(common), Some(real_index), Some(real_objects), Some(commit), Some(head_tree)) = (
+    let (Some(git_dir), Some(common), Some(real_objects), Some(commit), Some(head_tree)) = (
         git_path(dir, &["rev-parse", "--git-dir"]),
         git_path(dir, &["rev-parse", "--git-common-dir"]),
-        git_path(dir, &["rev-parse", "--git-path", "index"]),
         git_path(dir, &["rev-parse", "--git-path", "objects"]),
         git_ascii(dir, &["rev-parse", "HEAD"], None, None),
         git_ascii(dir, &["rev-parse", "HEAD^{tree}"], None, None),
@@ -122,16 +136,23 @@ pub fn build_version(krate: &Path, version: &str, scratch: &Path) -> (String, Ve
     let _ = std::fs::remove_file(&index);
     let _ = std::fs::remove_dir_all(&private_objects);
     let _ = std::fs::create_dir_all(&private_objects);
-    let copy = |real: &Path| -> std::io::Result<()> {
-        let written = std::fs::metadata(real)?.modified()?;
-        std::fs::copy(real, &index)?;
-        std::fs::File::options().write(true).open(&index)?.set_modified(written)
-    };
     let objs = Some((private_objects.as_path(), alternates.as_os_str()));
-    let prepared = if real_index.exists() { copy(&real_index).ok().map(|_| String::new()) } else { git_ascii(dir, &["read-tree", "HEAD"], Some(&index), objs) };
+    // Always populate the scratch index from `HEAD` via `read-tree` instead of
+    // copying `.git/index` so `assume-unchanged` / `skip-worktree` flags cannot
+    // hide modified source bytes as clean (M1). Also re-add any force-added
+    // ignored paths currently tracked in the real index (`ls-files --cached
+    // --ignored --exclude-standard`) without copying index stat/skip flags.
     let exclude = format!(":(exclude){CARGO_MARKER}");
-    let tree = prepared
+    let force_tracked_ignored = git_bytes(dir, &["ls-files", "-z", "--cached", "--ignored", "--exclude-standard"], None, None);
+    let tree = git_ascii(dir, &["read-tree", "HEAD"], Some(&index), objs)
         .and_then(|_| git_ascii(dir, &["add", "-A", "--", ".", &exclude], Some(&index), objs))
+        .and_then(|_| match force_tracked_ignored.as_deref() {
+            Some(paths) if !paths.is_empty() => {
+                git_bytes_with_stdin(dir, &["add", "-f", "--pathspec-from-file=-", "--pathspec-file-nul"], Some(&index), objs, Some(paths))
+                    .map(|_| String::new())
+            }
+            _ => Some(String::new()),
+        })
         .and_then(|_| git_ascii(dir, &["write-tree"], Some(&index), objs));
     let _ = std::fs::remove_file(&index);
     let _ = std::fs::remove_dir_all(&private_objects);
@@ -195,21 +216,54 @@ impl<'a> JsonParser<'a> {
                         b'r' => out.push('\r'),
                         b't' => out.push('\t'),
                         b'u' => {
-                            let hex = std::str::from_utf8(self.bytes.get(self.pos..self.pos + 4)?).ok()?;
-                            let code = u32::from_str_radix(hex, 16).ok()?;
+                            let hex_bytes = self.bytes.get(self.pos..self.pos + 4)?;
+                            if !hex_bytes.iter().all(u8::is_ascii_hexdigit) {
+                                return None;
+                            }
+                            let hex = std::str::from_utf8(hex_bytes).ok()?;
+                            let code = u16::from_str_radix(hex, 16).ok()?;
                             self.pos += 4;
-                            out.push(char::from_u32(code)?);
+                            if (0xD800..=0xDBFF).contains(&code) {
+                                // UTF-16 high surrogate: must be followed by `\uXXXX` low surrogate (M3).
+                                if self.bytes.get(self.pos..self.pos + 2) != Some(b"\\u") {
+                                    return None;
+                                }
+                                self.pos += 2;
+                                let low_bytes = self.bytes.get(self.pos..self.pos + 4)?;
+                                if !low_bytes.iter().all(u8::is_ascii_hexdigit) {
+                                    return None;
+                                }
+                                let low_hex = std::str::from_utf8(low_bytes).ok()?;
+                                let low = u16::from_str_radix(low_hex, 16).ok()?;
+                                if !(0xDC00..=0xDFFF).contains(&low) {
+                                    return None;
+                                }
+                                self.pos += 4;
+                                let scalar = 0x10000 + (((u32::from(code) - 0xD800) << 10) | (u32::from(low) - 0xDC00));
+                                out.push(char::from_u32(scalar)?);
+                            } else if (0xDC00..=0xDFFF).contains(&code) {
+                                return None;
+                            } else {
+                                out.push(char::from_u32(u32::from(code))?);
+                            }
                         }
                         _ => return None,
                     }
                 }
                 0x00..=0x1F => return None,
+                0x20..=0x7F => out.push(b as char),
                 _ => {
-                    // Advance over valid UTF-8 scalar value.
+                    // Decode only the 2..=4 bytes of this single UTF-8 scalar (O(1) per char; M3).
                     let start = self.pos - 1;
-                    let s = std::str::from_utf8(&self.bytes[start..]).ok()?;
-                    let ch = s.chars().next()?;
-                    self.pos = start + ch.len_utf8();
+                    let width = match b {
+                        0xC2..=0xDF => 2,
+                        0xE0..=0xEF => 3,
+                        0xF0..=0xF4 => 4,
+                        _ => return None,
+                    };
+                    let slice = std::str::from_utf8(self.bytes.get(start..start + width)?).ok()?;
+                    let ch = slice.chars().next()?;
+                    self.pos = start + width;
                     out.push(ch);
                 }
             }
@@ -337,40 +391,48 @@ fn obj_get<'a>(val: &'a JsonVal, key: &str) -> Option<&'a JsonVal> {
 }
 
 /// A package's build: its validated 40-hex `git.sha1` and optional `git.dirty`
-/// flag as `cargo package` wrote them (M16). Rejects truncated/malformed JSON
-/// and ignores unrelated top-level fields.
+/// flag as `cargo package` wrote them (M16, M3). Missing `.cargo_vcs_info.json`
+/// (`ErrorKind::NotFound`) returns the bare manifest version; a *present* file
+/// that is unreadable, non-UTF-8, malformed, or truncated returns
+/// `{version}.unverified` so corrupt provenance is never mistaken for clean.
 fn from_package_info(dir: &Path, version: &str) -> String {
-    let Ok(info) = std::fs::read_to_string(dir.join(".cargo_vcs_info.json")) else {
-        return version.to_owned();
+    let unverified = || format!("{version}.unverified");
+    let raw = match std::fs::read(dir.join(".cargo_vcs_info.json")) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return version.to_owned(),
+        Err(_) => return unverified(),
+    };
+    let Ok(info) = String::from_utf8(raw) else {
+        return unverified();
     };
     let Some(root) = parse_json(&info) else {
-        return version.to_owned();
+        return unverified();
     };
     let Some(git_obj) = obj_get(&root, "git") else {
-        return version.to_owned();
+        return unverified();
     };
     let Some(JsonVal::Str(commit)) = obj_get(git_obj, "sha1") else {
-        return version.to_owned();
+        return unverified();
     };
     if !is_full_hex_sha(commit) {
-        return version.to_owned();
+        return unverified();
     }
     let dirty = match obj_get(git_obj, "dirty") {
         None => false,
         Some(JsonVal::Bool(b)) => *b,
-        Some(_) => return version.to_owned(),
+        Some(_) => return unverified(),
     };
     if version.ends_with("+dev") || dirty { format!("{version}.{commit}{}", if dirty { ".dirty" } else { "" }) } else { version.to_owned() }
 }
 
-/// What a commit, a checkout, an edit, or a new untracked file anywhere in the
-/// repository changes: HEAD, the index, the reflog, the refs, the repository
-/// root directory itself plus every ancestor directory of tracked/untracked
-/// non-ignored files, and every NUL-delimited tracked/untracked non-ignored
-/// file (M17).
+/// What a commit, a checkout, or an edit to tracked/untracked source files
+/// changes: HEAD, the index, the reflog, the refs, NUL-delimited tracked and
+/// untracked non-ignored files, plus non-target source subdirectories (never
+/// the repo root itself, which would make Cargo recursively scan `target/` and
+/// `.git/` and re-run `build.rs` on every no-op build; M2).
 fn watched(dir: &Path, git_dir: &Path, common: &Path) -> Vec<PathBuf> {
     let mut set = BTreeSet::new();
-    for p in [git_dir.join("HEAD"), git_dir.join("index"), git_dir.join("logs/HEAD"), common.join("refs"), common.join("packed-refs"), dir.to_path_buf()] {
+    for p in [git_dir.join("HEAD"), git_dir.join("index"), git_dir.join("logs/HEAD"), common.join("refs"), common.join("packed-refs")] {
         if p.exists() {
             set.insert(p);
         }
@@ -382,7 +444,10 @@ fn watched(dir: &Path, git_dir: &Path, common: &Path) -> Vec<PathBuf> {
             }
             let full = dir.join(OsStr::from_bytes(raw));
             if full.exists() {
+                // Watch immediate parent subdirectories strictly below `dir`
+                // (never `dir` itself, which contains `target/` and `.git/`).
                 if let Some(parent) = full.parent()
+                    && parent != dir
                     && parent.starts_with(dir)
                     && parent.exists()
                 {

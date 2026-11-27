@@ -178,10 +178,12 @@ next section, this gives us an important set of properties:
 4. Finally, any output line containing an escape sequence is prefixed with a
    single backslash.
 5. When checking, each line is parsed as UTF-8, separated by a newline
-   (U+000A). Invalid UTF-8 is an error. Every newline and carriage return
-   (U+000D) at a line's end is taken off it, as official `b3sum` does: so a
-   line written by hand for a file whose name ends in a carriage return
-   checks the name without it, unless the line escapes it (rule 6).
+   (U+000A), with a maximum record length of 1 MiB (1,048,576 bytes, including
+   the terminating newline if present; longer lines are rejected). Invalid
+   UTF-8 is an error. Every newline and carriage return (U+000D) at a line's
+   end is taken off it, as official `b3sum` does: so a line written by hand for
+   a file whose name ends in a carriage return checks the name without it,
+   unless the line escapes it (rule 6).
 6. Then, if a line begins with a backslash, the filepath component is
    unescaped. Any escape sequence other than `\\`, `\n` or `\r` is an error. If a
    line does not begin with a backslash, unescaping is not performed, and any

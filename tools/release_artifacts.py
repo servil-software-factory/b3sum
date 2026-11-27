@@ -310,7 +310,7 @@ def said_beyond(data, version):
     """What the build versions in `data` say beyond `version`, each once:
     nothing for a clean build of the version commit. None where `data`
     holds no build version of this release at all."""
-    pattern = re.compile(re.escape(version.encode()) + rb"((?:\.[0-9a-f]{40})?(?:\.dirty(?:\.[0-9a-f]{40})?)?)")
+    pattern = re.compile(re.escape(version.encode()) + rb"(\.unverified|(?:\.[0-9a-f]{40})?(?:\.dirty(?:\.[0-9a-f]{40})?)?)")
     found = [m.group(1).decode() for m in pattern.finditer(data)]
     return sorted({more for more in found if more}) if found else None
 
@@ -322,6 +322,9 @@ def program_problems(data, release):
         return [f"holds no build version of {release.version}: not a build of this release"]
     problems = []
     for more in said:
+        if more == ".unverified":
+            problems.append(f"its build version is {release.version}{more}: built with unreadable or malformed VCS metadata")
+            continue
         commit, dirty, tree = more.partition(".dirty")
         commit, tree = commit.lstrip("."), tree.lstrip(".")
         where = "the version commit" if commit in ("", release.commit) else f"another commit ({commit[:12]})"

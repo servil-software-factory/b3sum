@@ -272,13 +272,43 @@ def main():
             if originals[path].count(find) != 1:
                 sys.exit(f"b3sum_controls: the place of '{name}' is not in {path} once: update this script")
 
+        # Verify every named control test passes in ONE clean nextest invocation
+        # on the untouched staged tree before planting individual faults (L5).
+        baseline_tests = list(dict.fromkeys(test for _, _, _, _, test in CONTROLS))
+        filter_expr = " | ".join(f"test(={t})" for t in baseline_tests)
+        env = os.environ.copy()
+        env["CARGO_TARGET_DIR"] = target_dir
+        try:
+            proc = subprocess.run(
+                [
+                    "cargo",
+                    "nextest",
+                    "run",
+                    "--locked",
+                    "--release",
+                    "--no-fail-fast",
+                    "--status-level",
+                    "pass",
+                    "--final-status-level",
+                    "fail",
+                    "-E",
+                    filter_expr,
+                ],
+                cwd=stage_root,
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=CONTROL_TIMEOUT_SECS,
+            )
+        except subprocess.TimeoutExpired:
+            sys.exit(f"b3sum_controls: baseline suite timed out after {CONTROL_TIMEOUT_SECS}s")
+        m = SUMMARY_RE.search(proc.stderr)
+        if not m or proc.returncode != 0 or int(m.group(1)) != len(baseline_tests) or int(m.group(2)) != len(baseline_tests) or int(m.group(3) or 0) != 0:
+            sys.exit(f"b3sum_controls: baseline verification failed (exit={proc.returncode}, expected {len(baseline_tests)} passes)\n{proc.stderr[-2000:]}")
+
         for name, path, find, replace, test in CONTROLS:
             full = os.path.join(stage_root, path)
             original = originals[path]
-
-            status, why = run_named_test(stage_root, target_dir, test)
-            if status != "pass":
-                sys.exit(f"b3sum_controls: baseline {test} did not pass ({status})\n{why}")
 
             try:
                 with open(full, "w") as f:

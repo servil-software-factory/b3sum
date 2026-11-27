@@ -460,9 +460,14 @@ impl WarmBatch {
         (slot, self.slot_bytes_mut(slot))
     }
 
-    /// Register `byte_len` bytes just written into `slot`, flushing when full (M9).
+    /// Register `byte_len` initialized bytes written into `slot`, flushing when
+    /// full (M9).
+    ///
+    /// # Safety
+    /// The caller must have initialized at least the first `byte_len` bytes of
+    /// `slot` (obtained from [`Self::next_slot_mut`]) before calling (M7).
     #[inline]
-    fn commit_slot(&mut self, slot: usize, file_idx: usize, byte_len: usize, mode: blake3::Mode<'_>, sink: &mut Sink<'_>) {
+    unsafe fn commit_slot(&mut self, slot: usize, file_idx: usize, byte_len: usize, mode: blake3::Mode<'_>, sink: &mut Sink<'_>) {
         assert_eq!(slot, self.len, "warm batch slot committed out of order");
         assert!(byte_len <= WARM_SLOT_BLOCKS * 64, "warm batch slot length fits slot");
         self.entries[slot] = (file_idx, byte_len);
@@ -497,7 +502,8 @@ impl WarmBatch {
             // is a disjoint `&mut [MaybeUninit<u8>]` of at least `byte_len`.
             unsafe { core::ptr::copy_nonoverlapping(src.as_ptr(), dst.as_mut_ptr().cast::<u8>(), byte_len) };
         }
-        self.commit_slot(slot, file_idx, byte_len, mode, sink);
+        // Sound: the copy above initialized the first `byte_len` bytes of `slot`.
+        unsafe { self.commit_slot(slot, file_idx, byte_len, mode, sink) };
     }
 
     fn flush(&mut self, mode: blake3::Mode<'_>, sink: &mut Sink<'_>) {
@@ -1193,7 +1199,9 @@ fn run_hybrid_worker(
                 Ok(CacheRead::Eof(n)) => {
                     drop(file);
                     if let Some(slot) = direct_slot {
-                        warm_batch.commit_slot(slot, i, n, args.mode, &mut sink);
+                        // Sound: `try_pread_cached` returned `Eof(n)`, initializing
+                        // the first `n` bytes of `slot`'s direct arena slice.
+                        unsafe { warm_batch.commit_slot(slot, i, n, args.mode, &mut sink) };
                     } else {
                         // Sound: `try_pread_cached` initialized `probe_stack[..n]`.
                         let bytes = unsafe { core::slice::from_raw_parts(probe_stack.as_ptr().cast::<u8>(), n) };
