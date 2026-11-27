@@ -12,11 +12,11 @@
                               symbolic links; DIR holds nothing else
     ... --commit COMMIT  the version commit, where its tag is not made yet
 
-TAG is a release's tag, vX.Y.Z+<code commit>: it names the version commit
-(tools/gen-ver.py), whose parent is the code commit. Run this from a clone
-that has the tag; anyone can. It prints one line an artifact. Exit status
-0: every artifact is a clean build of the version commit; 1: one is not,
-or one a release has is missing.
+TAG is a release's tag, vX.Y.Z+<code commit>: it names the version commit,
+whose parent is the code commit. Run this from a clone that has the tag;
+anyone can. It prints one line an artifact. Exit status 0: every artifact
+is a clean build of the version commit; 1: one is not, or one a release
+has is missing.
 
 The tag's name is the release's source. The 40 hex digits in it (which a
 program's --version prints too) are the code commit's hash, and this
@@ -33,8 +33,7 @@ forged version commit could carry a checker that passes it.
 
 What makes an artifact clean, by its kind:
 
-  A program or a library (b3sum-*, *.so, *.a, *.dylib, and the libraries
-  in a .tar.gz): it holds its build version (version/build_version.rs),
+  A b3sum program (b3sum-*): it holds its build version (build_version.rs),
   which is the release's version alone when it was built in a Git
   checkout at the version commit with no file changed or added (or from
   the release's own package, where there is no Git to ask). Every other
@@ -50,14 +49,13 @@ What makes an artifact clean, by its kind:
   the toolchain and lock the repository names, so two honest builders
   agree; an artifact that differs from yours was not made from the
   commit, whatever it says of itself. For a crate this covers the files
-  Cargo writes too. Before a release the two builders are our machine
-  and GitHub's (tools/release-check.py); after it, the `release
-  artifacts` workflow makes again what was published, and so can anyone.
-  DIR may hold a folder for each of several builders (the workflow's
-  jobs each put theirs in one): the artifact is then compared with every
-  builder's copy, and a builder that made crates made this one. Copied
-  into one folder instead, a later builder's file would replace an
-  earlier one's unread, and a builder that disagreed would go unseen.
+  Cargo writes too. After a release, the `release artifacts` workflow
+  makes again what was published, and so can anyone. DIR may hold a
+  folder for each of several builders (the workflow's jobs each put
+  theirs in one): the artifact is then compared with every builder's
+  copy, and a builder that made crates made this one. Copied into one
+  folder instead, a later builder's file would replace an earlier one's
+  unread, and a builder that disagreed would go unseen.
 
   A .crate: Cargo's record in it (.cargo_vcs_info.json) names the version
   commit and no dirty tree, and every file in it is that commit's file,
@@ -69,9 +67,7 @@ What makes an artifact clean, by its kind:
 Why (BLAKE3 #435): 0.9.0's two b3sum programs were built in checkouts that
 held untracked files. They say `dirty`, nothing checked, and nobody saw
 until a user's question. No source file differed, as the trees their
-versions name showed, but only on our machines. Those two programs are
-this check's control: `release_artifacts.py v0.9.0+73ee859e... --published`
-fails on them and passes the release's library and its four crates.
+versions name showed, but only on our machines.
 """
 
 import hashlib
@@ -83,6 +79,7 @@ import re
 import subprocess
 import sys
 import tarfile
+import tomllib
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -98,24 +95,20 @@ def _load_blake3_ref():
 
 blake3_ref = _load_blake3_ref()
 
-REPO = "servil-software-factory/BLAKE3"
+REPO = "servil-software-factory/b3sum"
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-# The crates a release publishes, by their folders here (CONTRIBUTING.md,
-# "Releases"; the C library's and the test vectors' are not published).
-CRATE_DIRS = ("version", "", "threads", "b3sum")
-# The machines a release has a b3sum program for (b3sum/README.md,
-# "Installation").
+# The crate a release publishes, by its folder here (the root `b3sums` crate).
+CRATE_DIRS = ("",)
+# The machines a release has a b3sum program for (README.md, "Installation").
 B3SUM_TARGETS = ("x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu")
-# A version as tools/gen-ver.py writes one: a release's, or the
-# development line's.
+# A release version or development-line version stamp.
 STAMP = re.compile(rb"\d+\.\d+\.\d+\+(?:[0-9a-f]{40}|dev)")
-LIBRARY = re.compile(r"\.(so|a|dylib)(\.[0-9.]+)?$")
 # Cargo's own files in a .crate: not the commit's.
 CARGOS = (".cargo_vcs_info.json", "Cargo.toml", "Cargo.lock")
 
 
 class NotARelease(Exception):
-    """The tag is not a release's, as tools/gen-ver.py makes them."""
+    """The tag is not a release's (vX.Y.Z+<code commit> on a version commit)."""
 
 
 class Release:
@@ -148,9 +141,9 @@ class Release:
         """Why the version commit is not the code commit `code` with the
         release's version written in: nothing where each file is the
         same but for lines in which a version (X.Y.Z+<commit>, or
-        X.Y.Z+dev) became this release's. tools/gen-ver.py makes it so,
-        and nothing else belongs in a version commit: its hash is not in
-        the tag's name, and the code commit's is."""
+        X.Y.Z+dev) became this release's. Nothing else belongs in a
+        version commit: its hash is not in the tag's name, and the code
+        commit's is."""
         problems = []
         changed = False
         raw = subprocess.run(["git", "-C", self.repo, "diff-tree", "-r", "--raw", "--no-renames", "-z", code, self.commit], capture_output=True, check=True).stdout
@@ -219,10 +212,17 @@ class Release:
 
     def crate(self, folder):
         """The name of the crate in `folder`, from the commit's manifest."""
-        manifest = self.file(os.path.join(folder, "Cargo.toml"))
+        manifest_path = os.path.join(folder, "Cargo.toml")
+        manifest = self.file(manifest_path)
         if manifest is None:
-            raise NotARelease(f"{self.tag}'s commit has no {os.path.join(folder, 'Cargo.toml')}: a release from before the four crates (0.9.0), which this check does not know")
-        return re.search(r'(?m)^name\s*=\s*"([^"]+)"', manifest.decode()).group(1)
+            raise NotARelease(f"{self.tag}'s commit has no {manifest_path}")
+        try:
+            name = tomllib.loads(manifest.decode())["package"]["name"]
+        except (UnicodeDecodeError, tomllib.TOMLDecodeError, KeyError, TypeError) as e:
+            raise NotARelease(f"{self.tag}'s {manifest_path} has no [package].name ({e})") from e
+        if not isinstance(name, str) or not name:
+            raise NotARelease(f"{self.tag}'s {manifest_path} has an invalid [package].name")
+        return name
 
 
 def said_beyond(data, version):
@@ -235,7 +235,7 @@ def said_beyond(data, version):
 
 
 def program_problems(data, release):
-    """Why the program or library `data` is no clean build of the release."""
+    """Why the b3sum program `data` is no clean build of the release."""
     said = said_beyond(data, release.version)
     if said is None:
         return [f"holds no build version of {release.version}: not a build of this release"]
@@ -247,17 +247,6 @@ def program_problems(data, release):
         what = f"built at {where}" + (" from a dirty tree, files changed or added" + (f" (its tree: {tree})" if tree else "") if dirty else "")
         problems.append(f"its build version is {release.version}{more}: {what}")
     return problems
-
-
-def archive_problems(data, release):
-    """Why the libraries in the .tar.gz `data` are no clean builds."""
-    problems, libraries = [], 0
-    with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as archive:
-        for member in archive.getmembers():
-            if member.isfile() and LIBRARY.search(member.name):
-                libraries += 1
-                problems += [f"{member.name}: {problem}" for problem in program_problems(archive.extractfile(member).read(), release)]
-    return problems if libraries else ["holds no library (*.so, *.a, *.dylib)"]
 
 
 def crate_problems(data, release):
@@ -314,19 +303,17 @@ def problems(name, data, release):
     does not know is a problem, never skipped."""
     if name.endswith(".crate"):
         return crate_problems(data, release)
-    if name.endswith((".tar.gz", ".tgz")):
-        return archive_problems(data, release)
     # b3sum as tools/b3sum-release.sh names it, for some machine: a file of
     # another name beside it (b3sum-...-x86_64-unknown-linux-gnu.b3) is
     # not taken for the program.
-    if re.fullmatch(re.escape(f"b3sum-{release.tag}-") + r"[A-Za-z0-9_-]+", name) or LIBRARY.search(name):
+    if re.fullmatch(re.escape(f"b3sum-{release.tag}-") + r"[A-Za-z0-9_-]+", name):
         return program_problems(data, release)
-    return ["an artifact of a kind this check does not know (a program, a library, a .tar.gz of libraries, a .crate)"]
+    return ["an artifact of a kind this check does not know (a b3sum program, a .crate)"]
 
 
 def expected(release):
     """The file names a release has, as tools/b3sum-release.sh and Cargo
-    name them: b3sum for each machine, and the four crates."""
+    name them: b3sum for each target machine, and the b3sums crate."""
     programs = [f"b3sum-{release.tag}-{target}" for target in B3SUM_TARGETS]
     return programs + [f"{release.crate(folder)}-{release.version}.crate" for folder in CRATE_DIRS]
 
@@ -398,8 +385,8 @@ def request_for(url):
 
 def published(release):
     """What users download for the release, each as (name, bytes or None
-    where it is not there): the four crates from crates.io, and every
-    asset of the GitHub release, each program's digest file among them."""
+    where it is not there): the b3sums crate from crates.io, and every
+    asset of the GitHub release, each program's digest files among them."""
     for folder in CRATE_DIRS:
         crate = release.crate(folder)
         name = f"{crate}-{release.version}.crate"

@@ -59,6 +59,9 @@ jobs:
       - name: Safety controls (Linux)
         if: runner.os == 'Linux'
         run: python3 tools/b3sum_controls.py
+      - name: Release artifact verification tests (Linux)
+        if: runner.os == 'Linux'
+        run: python3 tools/test_release_artifacts.py
 
   b3sum_release_build:
     name: b3sum release build (${{ matrix.runner }})
@@ -73,6 +76,10 @@ jobs:
         with:
           fetch-depth: 2
       - name: Build static Linux binary in pinned container
-        run: |
-          image=$(sed -n 's/^image //p' tools/b3sum-release.toolchain)
-          docker run --rm -e B3SUM_RELEASE_ANY_COMMIT=1 -v "$PWD":/src -w /src "$image" sh tools/b3sum-release-container.sh
+        run: docker run --rm -e B3SUM_RELEASE_ANY_COMMIT=1 -v "$PWD":/src -w /src "$(sed -n 's/^image //p' tools/b3sum-release.toolchain)" sh tools/b3sum-release-container.sh
+      - name: Upload release binary artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: b3sum-${{ runner.arch }}
+          path: dist/
+          if-no-files-found: error

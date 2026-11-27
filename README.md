@@ -2,7 +2,7 @@
 
 A command-line tool that prints [BLAKE3](https://blake3.io) hashes of files or
 standard input, like `sha256sum` or `md5sum`. This is `blake3-servil`'s
-`b3sum` (see the repository's [README](../README.md)).
+`b3sum` (built on [blake3-servil](https://github.com/servil-software-factory/BLAKE3)).
 
 <img src="docs/images/b3sum-epyc-1000-files.svg" alt="Hashing a tree of 1000 files on an AMD EPYC 9255: b3sum on every core and on one thread, beside sha1sum, sha256sum and md5sum, in GB/s" width="720">
 
@@ -11,8 +11,9 @@ standard input, like `sha256sum` or `md5sum`. This is `blake3-servil`'s
 ## Prebuilt Linux binaries
 
 Download `b3sum-VERSION-x86_64-unknown-linux-gnu` or
-`b3sum-VERSION-aarch64-unknown-linux-gnu` and its `.sha256` file from the
-[releases page](https://github.com/servil-software-factory/BLAKE3/releases).
+`b3sum-VERSION-aarch64-unknown-linux-gnu` and its `.sha256` and `.b3` digest
+files from the
+[releases page](https://github.com/servil-software-factory/b3sum/releases).
 These binaries are statically linked, so they start faster when invoked many
 times (for example, once per file). Check the digest, make the binary executable,
 and move it to a directory on your `PATH` as `b3sum`:
@@ -55,7 +56,7 @@ upstream BLAKE3). Installing `b3sums` puts the `b3sum` binary in `~/.cargo/bin`.
 
 Packagers building a release binary from a tag checkout can run
 `sh tools/b3sum-release.sh`. It builds from a fresh clone of the tag's commit
-and writes a `.sha256` file beside the binary.
+and writes `.sha256` and `.b3` digest files beside the binary.
 
 # Example
 
