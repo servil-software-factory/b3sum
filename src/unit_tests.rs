@@ -132,38 +132,35 @@ fn test_filepath_to_string() {
 /// the size was right, each from a reader that gives a few bytes a read.
 #[test]
 fn test_a_files_size_does_not_decide_where_it_ends() {
-    struct Few<'a>(&'a [u8], usize);
-    impl std::io::Read for Few<'_> {
-        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-            let n = self.1.min(buf.len()).min(self.0.len());
-            buf[..n].copy_from_slice(&self.0[..n]);
-            self.0 = &self.0[n..];
-            Ok(n)
-        }
-    }
+    let dir = crate::tempfile::tempdir().unwrap();
     let all: Vec<u8> = (0..1000u32).map(|i| (i * 7) as u8).collect();
-    let mut bytes = vec![0xEE; 5];
     for len in [0usize, 1, 999, 1000] {
+        let path = dir.path().join(format!("file-{len}.bin"));
+        std::fs::write(&path, &all[..len]).unwrap();
         for says in [0, 1, len.saturating_sub(1), len, len + 1, 5000] {
-            for few in [1, 7, 4096] {
-                let mut reader = Few(&all[..len], few);
-                let eof = crate::read_bounded_to_eof(&mut reader, says, 2000, &mut bytes).unwrap();
-                assert!(eof, "len={len} <= cap 2000 must reach EOF (says={says} few={few})");
-                assert_eq!(bytes, &all[..len], "len={len} says={says} few={few}");
-            }
+            // Fresh Vec each iteration so `says < len` genuinely starts with
+            // capacity `says + 1` and exercises buffer growth to EOF (#424).
+            let mut bytes = Vec::new();
+            let mut file = std::fs::File::open(&path).unwrap();
+            let eof = crate::file_end::read_sequential_capped_seeded(&mut file, says, 2000, &mut bytes).unwrap();
+            assert!(eof, "len={len} <= cap 2000 must reach EOF (says={says})");
+            assert_eq!(bytes, &all[..len], "len={len} says={says}");
         }
     }
-    // When actual input exceeds `cap`, `read_bounded_to_eof` stops at `cap`
-    // (`Ok(false)`) and leaves the unread tail in `reader` for streaming; at
+    let mut bytes = vec![0xEE; 5];
+    // When actual input exceeds `cap`, `read_sequential_capped_seeded` stops at
+    // `cap` (`Ok(false)`) and leaves the unread tail in `file` for streaming; at
     // `cap == 0`, returns `Ok(false)` without consuming any byte.
-    let mut reader = Few(&all, 13);
-    assert!(!crate::read_bounded_to_eof(&mut reader, 10, 0, &mut bytes).unwrap());
+    let path = dir.path().join("full.bin");
+    std::fs::write(&path, &all).unwrap();
+    let mut file = std::fs::File::open(&path).unwrap();
+    assert!(!crate::file_end::read_sequential_capped_seeded(&mut file, 10, 0, &mut bytes).unwrap());
     assert!(bytes.is_empty());
-    let eof = crate::read_bounded_to_eof(&mut reader, 10, 256, &mut bytes).unwrap();
+    let eof = crate::file_end::read_sequential_capped_seeded(&mut file, 10, 256, &mut bytes).unwrap();
     assert!(!eof, "input longer than cap must promote to streaming");
     assert_eq!(bytes, &all[..256]);
     let mut tail = Vec::new();
-    std::io::Read::read_to_end(&mut reader, &mut tail).unwrap();
+    std::io::Read::read_to_end(&mut file, &mut tail).unwrap();
     assert_eq!(tail, &all[256..]);
 }
 

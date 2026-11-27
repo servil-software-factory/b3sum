@@ -38,11 +38,13 @@ STAGE_ENTRIES = (
 )
 CONTROL_TIMEOUT_SECS = 180
 
-READ_TO_END = """            let next_len = (bytes.len() * 2).max(4096).min(cap);
-            bytes.try_reserve(next_len - bytes.len()).map_err(|_| io::Error::from(io::ErrorKind::OutOfMemory))?;
-            bytes.resize(next_len, 0);"""
-READ_TO_END_NOT = """            bytes.truncate(got);
-            return Ok(true);"""
+READ_TO_END = """        if buf.len() == buf.capacity() {
+            let grow = buf.len().max(4096).min(cap - buf.len());
+            buf.try_reserve(grow).map_err(|_| io::Error::from(io::ErrorKind::OutOfMemory))?;
+        }"""
+READ_TO_END_NOT = """        if buf.len() == buf.capacity() {
+            return Ok(true);
+        }"""
 
 # (the protection, its file, the text to find once, what replaces it, exact nextest test name)
 CONTROLS = [
@@ -118,7 +120,7 @@ CONTROLS = [
     ),
     (
         "a read for a known size goes on to where a read gives no byte (#424)",
-        "src/main.rs",
+        "src/file_end.rs",
         READ_TO_END,
         READ_TO_END_NOT,
         "unit_tests::test_a_files_size_does_not_decide_where_it_ends",

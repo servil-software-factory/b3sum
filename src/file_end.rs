@@ -550,12 +550,11 @@ pub(crate) fn cached_then_plain(dst_cap: usize, mut at: usize, mut read: impl Fn
 #[derive(Clone, Copy)]
 enum CapReadKind {
     Sequential,
-    #[cfg(target_os = "linux")]
     Positioned,
 }
 
 /// Shared capped growth loop for raw `read`/`pread` syscalls without exposing
-/// uninitialized memory to safe `Read` implementations (M11).
+/// uninitialized memory to safe `Read` implementations.
 fn read_capped_with(fd: RawFd, kind: CapReadKind, buf: &mut Vec<u8>, cap: usize) -> io::Result<bool> {
     loop {
         if buf.len() >= cap {
@@ -563,7 +562,7 @@ fn read_capped_with(fd: RawFd, kind: CapReadKind, buf: &mut Vec<u8>, cap: usize)
         }
         if buf.len() == buf.capacity() {
             let grow = buf.len().max(4096).min(cap - buf.len());
-            buf.reserve(grow);
+            buf.try_reserve(grow).map_err(|_| io::Error::from(io::ErrorKind::OutOfMemory))?;
         }
         let avail = (buf.capacity() - buf.len()).min(cap - buf.len());
         let len = buf.len();
@@ -573,7 +572,6 @@ fn read_capped_with(fd: RawFd, kind: CapReadKind, buf: &mut Vec<u8>, cap: usize)
                 // bytes inside `buf`'s allocation; `libc::read` writes at most `avail` bytes.
                 unsafe { libc::read(fd, buf.as_mut_ptr().add(len).cast(), avail) }
             }
-            #[cfg(target_os = "linux")]
             CapReadKind::Positioned => {
                 let off = libc::off_t::try_from(len).map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "file offset overflow"))?;
                 // Sound: `buf.as_mut_ptr().add(len)` points to `avail` valid writable
@@ -606,10 +604,24 @@ pub(crate) fn read_sequential_capped(file: &mut File, buf: &mut Vec<u8>, cap: us
     read_capped_with(file.as_raw_fd(), CapReadKind::Sequential, buf, cap)
 }
 
+/// Clear `buf`, fallibly reserve capacity seeded from `says + 1` (bounded by
+/// `cap`), and read sequentially up to `cap` via [`read_capped_with`].
+/// At `cap == 0`, returns `Ok(false)` with `buf` empty and `file` untouched.
+pub(crate) fn read_sequential_capped_seeded(file: &mut File, says: usize, cap: usize, buf: &mut Vec<u8>) -> io::Result<bool> {
+    buf.clear();
+    if cap == 0 {
+        return Ok(false);
+    }
+    let initial = says.saturating_add(1).min(cap);
+    if buf.capacity() < initial {
+        buf.try_reserve(initial - buf.len()).map_err(|_| io::Error::from(io::ErrorKind::OutOfMemory))?;
+    }
+    read_capped_with(file.as_raw_fd(), CapReadKind::Sequential, buf, cap)
+}
+
 /// Read the rest of `file` starting at `buf.len()` using `pread` up to `cap`,
 /// falling back to sequential `read` on `ESPIPE` when `buf.is_empty()`.
 /// Returns `Ok((reached_eof, used_sequential))`.
-#[cfg(target_os = "linux")]
 pub(crate) fn pread_rest_capped(file: &mut File, buf: &mut Vec<u8>, cap: usize) -> io::Result<(bool, bool)> {
     match read_capped_with(file.as_raw_fd(), CapReadKind::Positioned, buf, cap) {
         Ok(eof) => Ok((eof, false)),

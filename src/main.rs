@@ -415,30 +415,69 @@ pub(crate) fn stdin_named_twice(paths: &[PathBuf], stdin_ctx: &StdinContext) -> 
 /// offset 0 via `mmap` or positioned `pread`, after opening `path` normally to
 /// preserve OS lookup errors and permissions, without moving the underlying
 /// open-file description's shared offset (#515).
+/// Unified opened input descriptor produced once by [`open_input`] for standard
+/// hashing, extended output, and `--outboard`: keyed-stdin refusal, forbidden
+/// checkfile-stream checks, and byte-stream validation happen in one place.
+enum OpenedInput {
+    /// Standard input as a stream (or non-zero-offset regular file), validated.
+    StdinStream,
+    /// Standard input as a regular file at offset 0 (`b3sum < file`).
+    StdinFile(File, file_end::FdMeta),
+    /// Darwin verified `/dev/fd/<N>` regular file read via `pread` from offset 0
+    /// without mutating the inherited open file description's shared offset.
+    #[cfg(target_os = "macos")]
+    DarwinRegularDevFd(File, file_end::FdMeta),
+    /// Ordinary opened path with `fstat` metadata, validated.
+    File(File, file_end::FdMeta),
+}
+
+fn open_input(args: &Args, path: &Path, stdin_ctx: &StdinContext, forbidden: Option<StreamId>, allow_stdin_file_fast_path: bool) -> err::Result<OpenedInput> {
+    match stdin_ctx.classify(path) {
+        role @ (InputRole::StdinDash | InputRole::StdinStreamAlias) => {
+            if args.keyed() {
+                bail!("Cannot open `-` in keyed mode");
+            }
+            if let Some(forbid) = forbidden
+                && stdin_ctx.stdin_stream_id() == Some(forbid)
+            {
+                bail!("standard input is the checkfile; it cannot also be a file to check");
+            }
+            if allow_stdin_file_fast_path
+                && role == InputRole::StdinDash
+                && let Some((file, meta)) = stdin_file()
+            {
+                return Ok(OpenedInput::StdinFile(file, meta));
+            }
+            file_end::validate_byte_stream_fd(0)?;
+            Ok(OpenedInput::StdinStream)
+        }
+        #[cfg(target_os = "macos")]
+        InputRole::DarwinRegularDevFd => {
+            use std::os::fd::AsRawFd;
+            let file = File::open(path)?;
+            let meta = file_end::validate_byte_stream_fd(file.as_raw_fd())?;
+            Ok(OpenedInput::DarwinRegularDevFd(file, meta))
+        }
+        InputRole::Path => {
+            let (file, meta) = file_end::open_checked(path, forbidden)?;
+            Ok(OpenedInput::File(file, meta))
+        }
+    }
+}
+
+/// Hash a Darwin verified `/dev/fd/<N>` regular file from offset 0 via
+/// positioned `pread` (never mutating the inherited open file description's
+/// shared offset).
 #[cfg(target_os = "macos")]
-fn hash_darwin_regular_dev_fd_hash(args: &Args, path: &Path) -> err::Result<blake3::Hash> {
-    use std::os::fd::{AsFd, AsRawFd};
-    let file = File::open(path)?;
-    let meta = file_end::fstat_fd(file.as_raw_fd())?;
-    file_end::ensure_byte_stream_fd(file.as_raw_fd(), meta.mode_type)?;
+fn hash_darwin_regular_dev_fd_hash(args: &Args, mut file: File, meta: file_end::FdMeta) -> err::Result<blake3::Hash> {
+    use std::os::fd::AsFd;
     if meta.len < MAP_LEN as u64 {
         let mut buf = Vec::with_capacity((usize::try_from(meta.len).expect("len < MAP_LEN") + 1).max(4096).min(SMALL_MEM_CAP + 1));
-        let mut reader = file_end::PreadReader::new(file.as_fd(), 0);
-        let mut chunk = [0u8; 64 * 1024];
-        loop {
-            let n = reader.read(&mut chunk)?;
-            if n == 0 {
-                return Ok(hash_slice_32(args.mode, &buf));
-            }
-            if buf.len() + n > SMALL_MEM_CAP {
-                let mut hasher = args.base_hasher.clone();
-                update(&mut hasher, &buf);
-                update(&mut hasher, &chunk[..n]);
-                update_from(&mut hasher, reader)?;
-                return Ok(hasher.finalize());
-            }
-            buf.extend_from_slice(&chunk[..n]);
+        let (reached_eof, used_seq) = file_end::pread_rest_capped(&mut file, &mut buf, SMALL_MEM_CAP)?;
+        if reached_eof {
+            return Ok(hash_slice_32(args.mode, &buf));
         }
+        return Ok(file_end::finish_hash_streaming_from_prefix(args.mode, &buf, &mut file, used_seq)?.hash);
     }
     if let Ok(len) = usize::try_from(meta.len)
         && len >= MAP_LEN
@@ -458,59 +497,28 @@ fn hash_darwin_regular_dev_fd_hash(args: &Args, path: &Path) -> err::Result<blak
 
 /// Fast standard-mode (`seek == 0 && len <= 32`) single-path hasher.
 pub(crate) fn hash_path_hash(args: &Args, path: &Path, stdin_ctx: &StdinContext, forbidden: Option<StreamId>) -> err::Result<blake3::Hash> {
-    match stdin_ctx.classify(path) {
-        InputRole::StdinDash => {
-            if args.keyed() {
-                bail!("Cannot open `-` in keyed mode");
-            }
-            if let Some(forbid) = forbidden
-                && stdin_ctx.stdin_stream_id() == Some(forbid)
-            {
-                bail!("standard input is the checkfile; it cannot also be a file to check");
-            }
-            // `b3sum < file`: a regular file at offset 0 is hashed as a named
-            // file; if hashing did not move the descriptor cursor (mmap/pread/
-            // direct/ring), advance fd 0 to the exact byte count hashed and
-            // propagate any seek failure.
-            if let Some((file, meta)) = stdin_file() {
-                let hr = hash_open_file_with_meta(args, file, meta)?;
-                if !hr.cursor_moved && hr.bytes_hashed > 0 {
-                    // Sound: `lseek` on open descriptor 0 touches no memory.
-                    let rc = unsafe { libc::lseek(0, hr.bytes_hashed as libc::off_t, libc::SEEK_SET) };
-                    if rc < 0 {
-                        return Err(io::Error::last_os_error().into());
-                    }
-                }
-                return Ok(hr.hash);
-            }
-            file_end::validate_byte_stream_fd(0)?;
+    match open_input(args, path, stdin_ctx, forbidden, true)? {
+        OpenedInput::StdinStream => {
             let mut hasher = args.base_hasher.clone();
             update_from(&mut hasher, io::stdin())?;
             Ok(hasher.finalize())
         }
-        InputRole::StdinStreamAlias => {
-            if args.keyed() {
-                bail!("Cannot open `-` in keyed mode");
+        OpenedInput::StdinFile(file, meta) => {
+            // `b3sum < file`: advance fd 0 to the exact byte count hashed if the
+            // fast path (mmap/pread/direct/ring) left its descriptor cursor at 0.
+            let hr = hash_open_file_with_meta(args, file, meta)?;
+            if !hr.cursor_moved && hr.bytes_hashed > 0 {
+                // Sound: `lseek` on open descriptor 0 touches no memory.
+                let rc = unsafe { libc::lseek(0, hr.bytes_hashed as libc::off_t, libc::SEEK_SET) };
+                if rc < 0 {
+                    return Err(io::Error::last_os_error().into());
+                }
             }
-            if let Some(forbid) = forbidden
-                && stdin_ctx.stdin_stream_id() == Some(forbid)
-            {
-                bail!("standard input is the checkfile; it cannot also be a file to check");
-            }
-            // Reuse fd 0 directly instead of reopening `/dev/stdin` (which
-            // fails with ENXIO on inherited Unix sockets and can block
-            // forever on a closed named FIFO).
-            file_end::validate_byte_stream_fd(0)?;
-            let mut hasher = args.base_hasher.clone();
-            update_from(&mut hasher, io::stdin())?;
-            Ok(hasher.finalize())
+            Ok(hr.hash)
         }
         #[cfg(target_os = "macos")]
-        InputRole::DarwinRegularDevFd => hash_darwin_regular_dev_fd_hash(args, path),
-        InputRole::Path => {
-            let (file, meta) = file_end::open_checked(path, forbidden)?;
-            Ok(hash_open_file_with_meta(args, file, meta)?.hash)
-        }
+        OpenedInput::DarwinRegularDevFd(file, meta) => hash_darwin_regular_dev_fd_hash(args, file, meta),
+        OpenedInput::File(file, meta) => Ok(hash_open_file_with_meta(args, file, meta)?.hash),
     }
 }
 
@@ -583,21 +591,24 @@ pub(crate) fn hash_open_file_with_meta(args: &Args, mut file: File, fd_meta: fil
 
         if let Ok(len) = usize::try_from(size)
             && len >= MAP_LEN
-            && let Some(map) = args.map(&file)
         {
-            let warm = resident(&map);
-            // The tests' seam: a file just written is in the cache.
-            #[cfg(all(test, target_os = "linux"))]
-            let warm = warm && !linux_pipe::force_miss();
-            if warm {
-                // Release the open file descriptor once the mapping is known
-                // warm so tight FD limits (e.g. RLIMIT_NOFILE=4) still have a
-                // spare FD if `hash_slice_32` triggers lazy NUMA sysfs reads.
-                drop(file);
-                let h = hash_slice_32(args.mode, &map);
-                let map_len = map.len() as u64;
-                hold(map);
-                return Ok(HashRead { hash: h, bytes_hashed: map_len, cursor_moved: false });
+            let map = args.map(&file);
+            if let Some(ref map_ref) = map {
+                let warm = resident(map_ref);
+                // The tests' seam: a file just written is in the cache.
+                #[cfg(all(test, target_os = "linux"))]
+                let warm = warm && !linux_pipe::force_miss();
+                if warm {
+                    // Release the open file descriptor once the mapping is known
+                    // warm so tight FD limits (e.g. RLIMIT_NOFILE=4) still have a
+                    // spare FD if `hash_slice_32` triggers lazy NUMA sysfs reads.
+                    drop(file);
+                    let map = map.unwrap();
+                    let h = hash_slice_32(args.mode, &map);
+                    let map_len = map.len() as u64;
+                    hold(map);
+                    return Ok(HashRead { hash: h, bytes_hashed: map_len, cursor_moved: false });
+                }
             }
             #[cfg(target_os = "linux")]
             if threads().get() == 1 {
@@ -619,9 +630,10 @@ pub(crate) fn hash_open_file_with_meta(args: &Args, mut file: File, fd_meta: fil
             } else {
                 // A cold file of 4 MiB or more: read past the page cache,
                 // several reads at once, each thread hashing its piece
-                // (direct.rs). Under `--num-threads`, concurrent file workers
-                // lease extra direct threads from one shared spare permit pool
-                // so total active threads stay within `--num-threads`.
+                // (direct.rs), even when `--no-mmap` is set (L1). Under
+                // `--num-threads`, concurrent file workers lease extra direct
+                // threads from one shared spare permit pool so total active
+                // threads stay within `--num-threads`.
                 let want_total = if args.num_threads().is_some() { pool_threads().get() } else { threads().get() }.min(DIRECT_THREADS);
                 let permits = DirectPermits::acquire(want_total.saturating_sub(1));
                 let direct_threads = 1 + permits.extra;
@@ -634,7 +646,7 @@ pub(crate) fn hash_open_file_with_meta(args: &Args, mut file: File, fd_meta: fil
                         }
                         Err(direct::Failure::Unavailable) => {
                             // O_DIRECT could not be opened or was refused (`EINVAL`) on this
-                            // fd/fs: fall through to the existing mapped multi-core path below.
+                            // fd/fs: fall through to mapped multi-core or streaming below.
                         }
                         Err(direct::Failure::Changed) => {
                             // The direct reader observed the file grew or shrank: discard
@@ -653,14 +665,16 @@ pub(crate) fn hash_open_file_with_meta(args: &Args, mut file: File, fd_meta: fil
                     }
                 }
                 drop(permits);
-                // Multi-threaded single cold file (`>= 512 KiB`): start the pool
-                // only if the budget allows `> 1` threads so a temporary width of 1
-                // does not freeze the global singleton at 1 (M27).
-                let _ = try_init_parallel_pool();
-                let h = hash_slice_32(args.mode, &map);
-                let map_len = map.len() as u64;
-                hold(map);
-                return Ok(HashRead { hash: h, bytes_hashed: map_len, cursor_moved: false });
+                if let Some(map) = map {
+                    // Multi-threaded single cold file (`>= 512 KiB`): start the pool
+                    // only if the budget allows `> 1` threads so a temporary width of 1
+                    // does not freeze the global singleton at 1.
+                    let _ = try_init_parallel_pool();
+                    let h = hash_slice_32(args.mode, &map);
+                    let map_len = map.len() as u64;
+                    hold(map);
+                    return Ok(HashRead { hash: h, bytes_hashed: map_len, cursor_moved: false });
+                }
             }
             #[cfg(not(target_os = "linux"))]
             drop(map);
@@ -674,19 +688,13 @@ pub(crate) fn hash_open_file_with_meta(args: &Args, mut file: File, fd_meta: fil
 
 fn hash_path(args: &Args, path: &Path, stdin_ctx: &StdinContext) -> err::Result<blake3::OutputReader> {
     let mut hasher = args.base_hasher.clone();
-    match stdin_ctx.classify(path) {
-        InputRole::StdinDash | InputRole::StdinStreamAlias => {
-            if args.keyed() {
-                bail!("Cannot open `-` in keyed mode");
-            }
-            file_end::validate_byte_stream_fd(0)?;
+    match open_input(args, path, stdin_ctx, None, false)? {
+        OpenedInput::StdinStream | OpenedInput::StdinFile(..) => {
             update_from(&mut hasher, io::stdin())?;
         }
         #[cfg(target_os = "macos")]
-        InputRole::DarwinRegularDevFd => {
-            use std::os::fd::{AsFd, AsRawFd};
-            let file = File::open(path)?;
-            let meta = file_end::validate_byte_stream_fd(file.as_raw_fd())?;
+        OpenedInput::DarwinRegularDevFd(file, meta) => {
+            use std::os::fd::AsFd;
             if meta.len >= MAP_LEN as u64
                 && let Some(map) = args.map(&file)
                 && resident(&map)
@@ -697,17 +705,13 @@ fn hash_path(args: &Args, path: &Path, stdin_ctx: &StdinContext) -> err::Result<
                 update_from(&mut hasher, file_end::PreadReader::new(file.as_fd(), 0))?;
             }
         }
-        InputRole::Path => {
-            let mut file = File::open(path)?;
-            let fd_meta = {
-                use std::os::fd::AsRawFd;
-                file_end::validate_byte_stream_fd(file.as_raw_fd())?
-            };
-            if fd_meta.is_file() && fd_meta.len < 64 * 1024 {
-                let mut stack_buf = [0u8; 64 * 1024];
-                let (n, eof) = fill(&mut file, &mut stack_buf)?;
-                update(&mut hasher, &stack_buf[..n]);
-                if !eof {
+        OpenedInput::File(mut file, fd_meta) => {
+            if fd_meta.is_file() && fd_meta.len < MAP_LEN as u64 {
+                let mut buf = Vec::new();
+                let reached_eof =
+                    file_end::read_sequential_capped_seeded(&mut file, usize::try_from(fd_meta.len).expect("len < MAP_LEN"), SMALL_MEM_CAP, &mut buf)?;
+                update(&mut hasher, &buf);
+                if !reached_eof {
                     update_from(&mut hasher, file)?;
                 }
             } else if let Some(map) = mapped(args, &file) {
@@ -1670,48 +1674,12 @@ fn outboard_inputs(args: &Args, dir: &Path, stdin_ctx: &StdinContext, out: &mut 
     failed
 }
 
-/// Read up to `cap` bytes from `file` (fallibly allocating at most `cap`,
-/// seeded from `says + 1`), returning `Ok(true)` if actual EOF (`read == 0`)
-/// was observed within `cap`, or `Ok(false)` when `file` reaches `cap` without
-/// EOF so the caller streams the prefix plus remaining bytes without truncating
-/// at `says` (#424, M12). At `cap == 0`, returns `Ok(false)` with `bytes` empty
-/// and `file` untouched.
-pub(crate) fn read_bounded_to_eof(file: &mut impl Read, says: usize, cap: usize, bytes: &mut Vec<u8>) -> io::Result<bool> {
-    bytes.clear();
-    if cap == 0 {
-        return Ok(false);
-    }
-    let initial = says.saturating_add(1).min(cap);
-    bytes.try_reserve(initial).map_err(|_| io::Error::from(io::ErrorKind::OutOfMemory))?;
-    bytes.resize(initial, 0);
-    let mut got = 0usize;
-    loop {
-        if got == bytes.len() {
-            if got >= cap {
-                return Ok(false);
-            }
-            let next_len = (bytes.len() * 2).max(4096).min(cap);
-            bytes.try_reserve(next_len - bytes.len()).map_err(|_| io::Error::from(io::ErrorKind::OutOfMemory))?;
-            bytes.resize(next_len, 0);
-        }
-        match file.read(&mut bytes[got..]) {
-            Ok(0) => {
-                bytes.truncate(got);
-                return Ok(true);
-            }
-            Ok(n) => got += n,
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-            Err(e) => return Err(e),
-        }
-    }
-}
-
 /// The hash of the input at `path` (`-`: standard input), and its
 /// outboard appended to `nodes`. A regular file under MAP_LEN is read into the
 /// bounded thread room (promoting to streaming if it grows past MAP_LEN); a
 /// longer cold file is read directly on Linux; any other regular file is mapped
 /// where it can be (`hold`); stdin, pipes, and non-mapped fallbacks stream in
-/// 16 KiB chunk groups without buffering the entire input in memory (M12).
+/// 16 KiB chunk groups without buffering the entire input in memory.
 fn outboard_of(
     args: &Args,
     path: &Path,
@@ -1723,22 +1691,13 @@ fn outboard_of(
     let mode = args.mode;
     let bytes = &mut rooms.bytes;
     bytes.clear();
-    match stdin_ctx.classify(path) {
-        InputRole::StdinDash | InputRole::StdinStreamAlias => {
-            // The key was standard input, read to its end: no message is
-            // left there, and its tree would be the empty message's.
-            if matches!(mode, blake3::Mode::Keyed(_)) {
-                bail!("Cannot open `-` in keyed mode");
-            }
-            file_end::validate_byte_stream_fd(0)?;
+    let (mut file, fd_meta) = match open_input(args, path, stdin_ctx, None, false)? {
+        OpenedInput::StdinStream | OpenedInput::StdinFile(..) => {
             return Ok(outboard::outboard_from_reader(mode, &mut io::stdin().lock(), &mut rooms.cvs, nodes)?);
         }
         #[cfg(target_os = "macos")]
-        InputRole::DarwinRegularDevFd => {
-            use std::os::fd::{AsFd, AsRawFd};
-            let file = File::open(path)?;
-            let fd = file.as_raw_fd();
-            let meta = file_end::validate_byte_stream_fd(fd)?;
+        OpenedInput::DarwinRegularDevFd(file, meta) => {
+            use std::os::fd::AsFd;
             if meta.len >= MAP_LEN as u64
                 && let Some(map) = args.map(&file)
             {
@@ -1748,15 +1707,10 @@ fn outboard_of(
             }
             return Ok(outboard::outboard_from_reader(mode, &mut file_end::PreadReader::new(file.as_fd(), 0), &mut rooms.cvs, nodes)?);
         }
-        InputRole::Path => {}
-    }
-    let mut file = File::open(path)?;
-    let fd_meta = {
-        use std::os::fd::AsRawFd;
-        file_end::validate_byte_stream_fd(file.as_raw_fd())?
+        OpenedInput::File(file, meta) => (file, meta),
     };
     if fd_meta.is_file() && fd_meta.len < MAP_LEN as u64 {
-        if read_bounded_to_eof(&mut file, usize::try_from(fd_meta.len).expect("len < MAP_LEN"), MAP_LEN, bytes)? {
+        if file_end::read_sequential_capped_seeded(&mut file, usize::try_from(fd_meta.len).expect("len < MAP_LEN"), MAP_LEN, bytes)? {
             return Ok(outboard::outboard(mode, bytes, threads, &mut rooms.cvs, nodes));
         }
         let mut combined = io::Cursor::new(&bytes[..]).chain(&mut file);
@@ -2105,7 +2059,6 @@ fn check_one_checkfile(path: &Path, args: &Args, stdin_ctx: &StdinContext, files
             }
             #[cfg(not(target_os = "macos"))]
             {
-                let _ = &meta;
                 CheckfileReader::Stdin(stdin_lock)
             }
         }
@@ -2156,10 +2109,8 @@ fn check_one_checkfile(path: &Path, args: &Args, stdin_ctx: &StdinContext, files
     // streams: for those every entry is looked at, AND the actual opened
     // descriptor is checked again against `own` before any bytes are read).
     let is_the_checkfile = |entry: &Path| {
-        match stdin_ctx.classify(entry) {
-            InputRole::StdinDash => return checkfile_is_stdin,
-            InputRole::StdinStreamAlias => return checkfile_is_stdin,
-            _ => {}
+        if matches!(stdin_ctx.classify(entry), InputRole::StdinDash | InputRole::StdinStreamAlias) {
+            return checkfile_is_stdin;
         }
         if own.is_some_and(|own| file_end::path_matches_stream(entry, own)) {
             return true;
