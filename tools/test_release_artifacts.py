@@ -51,6 +51,11 @@ class Repository(unittest.TestCase):
     them here."""
 
     def setUp(self):
+        # Repository is a two-crate fixture (root + sub/); patch CRATE_DIRS for
+        # this fixture while Standalone tests verify the real standalone CRATE_DIRS.
+        crate_patch = patch.object(ra, "CRATE_DIRS", ("", "sub"))
+        crate_patch.start()
+        self.addCleanup(crate_patch.stop)
         scratch = tempfile.TemporaryDirectory()
         self.addCleanup(scratch.cleanup)
         self.repo = scratch.name
@@ -307,6 +312,68 @@ class TheNameIsTheSource(Repository):
         self.git("commit", "--allow-empty", "-qm", "empty version commit")
         with self.assertRaisesRegex(ra.NotARelease, "changes no version from its parent"):
             ra.Release(self.tag, self.repo, self.git("rev-parse", "HEAD"))
+
+    def test_unstamped_root_manifest_is_refused(self):
+        # M20: stamping only another file while leaving root [package].version at +dev must fail.
+        why = self.version_commit(lambda: self.write("Cargo.toml", self.read("Cargo.toml").replace(self.version, "0.3.0+dev")))
+        self.assertIn("Cargo.toml [package].version is '0.3.0+dev'", why)
+
+    def test_version_shaped_edit_outside_manifest_and_lock_is_refused(self):
+        # M20: changing a version string in README.md or an undeclared Cargo.toml is refused.
+        self.git("checkout", "-q", "--detach", self.code)
+        self.write("README.md", "version 0.3.0+dev\n")
+        self.git("commit", "-qam", "readme with dev version")
+        new_code = self.git("rev-parse", "HEAD")
+        new_ver = "0.3.0+" + new_code
+        for manifest in ("Cargo.toml", "sub/Cargo.toml"):
+            self.write(manifest, self.read(manifest).replace("0.3.0+dev", new_ver))
+        self.write("README.md", f"version {new_ver}\n")
+        self.git("commit", "-qam", "stamp readme too")
+        with self.assertRaisesRegex(ra.NotARelease, "README.md is not a version stamp file"):
+            ra.Release("v" + new_ver, self.repo, self.git("rev-parse", "HEAD"))
+
+    def test_stamping_git_dependency_version_in_cargo_lock_is_refused(self):
+        # M20: stamping a Git-pinned dependency (like blake3-servil in b3sum's
+        # real Cargo.lock) alongside the local crate must be rejected.
+        self.git("checkout", "-q", "--detach", self.code)
+        lock = (
+            'version = 4\n\n'
+            '[[package]]\nname = "top-crate"\nversion = "0.3.0+dev"\n\n'
+            '[[package]]\nname = "sub-crate"\nversion = "0.3.0+dev"\n\n'
+            '[[package]]\nname = "blake3-servil"\nversion = "0.3.0+dev"\n'
+            'source = "git+https://github.com/servil-software-factory/BLAKE3?rev=d332acb5#d332acb5"\n'
+        )
+        self.write("Cargo.lock", lock)
+        self.git("add", "Cargo.lock")
+        self.git("commit", "-qm", "code with real-shaped lockfile")
+        new_code = self.git("rev-parse", "HEAD")
+        new_ver = "0.3.0+" + new_code
+        for manifest in ("Cargo.toml", "sub/Cargo.toml"):
+            self.write(manifest, self.read(manifest).replace("0.3.0+dev", new_ver))
+        # Stamping EVERY 0.3.0+dev (including blake3-servil!) must fail!
+        self.write("Cargo.lock", lock.replace("0.3.0+dev", new_ver))
+        self.git("commit", "-qam", "over-broad stamp including git dep")
+        with self.assertRaisesRegex(ra.NotARelease, "Cargo.lock changes non-release package 'blake3-servil'"):
+            ra.Release("v" + new_ver, self.repo, self.git("rev-parse", "HEAD"))
+
+    def test_unstamped_cargo_lock_is_refused(self):
+        # M20: when Cargo.lock is present, its local package versions must match the release.
+        self.git("checkout", "-q", "--detach", self.code)
+        self.write("Cargo.lock", 'version = 4\n\n[[package]]\nname = "top-crate"\nversion = "0.3.0+dev"\n\n[[package]]\nname = "sub-crate"\nversion = "0.3.0+dev"\n')
+        self.git("add", "Cargo.lock")
+        self.git("commit", "-qm", "code with lockfile")
+        new_code = self.git("rev-parse", "HEAD")
+        new_ver = "0.3.0+" + new_code
+        for manifest in ("Cargo.toml", "sub/Cargo.toml"):
+            self.write(manifest, self.read(manifest).replace("0.3.0+dev", new_ver))
+        self.git("commit", "-qam", "stamp manifest only, forgetting Cargo.lock")
+        with self.assertRaisesRegex(ra.NotARelease, "Cargo.lock entry for .* has version"):
+            ra.Release("v" + new_ver, self.repo, self.git("rev-parse", "HEAD"))
+        # Stamping Cargo.lock too makes it a valid release commit.
+        self.write("Cargo.lock", self.read("Cargo.lock").replace("0.3.0+dev", new_ver))
+        self.git("commit", "--amend", "-qam", "clean stamp of manifest and Cargo.lock")
+        rel = ra.Release("v" + new_ver, self.repo, self.git("rev-parse", "HEAD"))
+        self.assertEqual(rel.version, new_ver)
 
     def test_main_holds_a_published_releases_commit(self):
         self.assertIsNone(self.release.on_main(), "no origin/main in this clone")
