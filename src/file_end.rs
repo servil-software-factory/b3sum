@@ -24,7 +24,7 @@ use std::fs::File;
 use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
 
-use std::os::fd::{AsRawFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, RawFd};
 
 /// Ceiling for reading a small-hinted file into a single contiguous `Vec<u8>`.
 /// Files whose reads pass this bound promote to incremental streaming hashing.
@@ -473,12 +473,19 @@ pub(crate) fn path_matches_stream(path: &Path, stream: StreamId) -> bool {
 /// waiting for another writer, then re-verifies `fstat(fd)` after open to
 /// close pathname-swap TOCTOU races.
 pub(crate) fn open_checked(path: &Path, forbidden: Option<StreamId>) -> crate::err::Result<(File, FdMeta)> {
+    open_checked_with(path, forbidden, |p| File::open(p))
+}
+
+/// Inner implementation of [`open_checked`] parameterized on the open call so
+/// tests can inject a post-open descriptor swap after the pre-open path check
+/// passes, proving the post-open `fstat` guard fails closed on its own (M13).
+pub(crate) fn open_checked_with(path: &Path, forbidden: Option<StreamId>, open: impl FnOnce(&Path) -> io::Result<File>) -> crate::err::Result<(File, FdMeta)> {
     if let Some(forbid) = forbidden
         && path_matches_stream(path, forbid)
     {
         crate::bail!("this checkfile is a stream, and cannot also be a file to check");
     }
-    let file = File::open(path)?;
+    let file = open(path)?;
     let meta = fstat_fd(file.as_raw_fd())?;
     if let Some(forbid) = forbidden
         && meta.kind == FileKind::Stream
@@ -625,52 +632,82 @@ pub(crate) fn pread_rest_capped(file: &mut File, buf: &mut Vec<u8>, cap: usize) 
     }
 }
 
-/// A `Read` adapter that reads sequentially from a fixed starting offset on a
-/// Unix `RawFd` using `pread`, never modifying the underlying open file
-/// description's cursor. Used both for streaming promotion after positional
-/// reads and for macOS `/dev/stdin` / `/dev/fd/0` on regular files.
-pub(crate) struct PreadReader {
-    fd: RawFd,
+/// Query the current byte offset of a seekable descriptor, propagating OS
+/// errors (`ESPIPE`, `EBADF`, etc.) instead of substituting zero (M2).
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn current_fd_offset(fd: BorrowedFd<'_>) -> io::Result<u64> {
+    // Sound: `lseek(SEEK_CUR)` queries the open file description's current
+    // offset without reading or writing caller memory.
+    let rc = unsafe { libc::lseek(fd.as_raw_fd(), 0, libc::SEEK_CUR) };
+    if rc < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    u64::try_from(rc).map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "negative file offset"))
+}
+
+/// Set the byte offset of a seekable descriptor to `offset`, rejecting
+/// `off_t` overflow and propagating OS errors (M2).
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn set_fd_offset(fd: BorrowedFd<'_>, offset: u64) -> io::Result<()> {
+    let off = libc::off_t::try_from(offset).map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "file offset exceeds off_t"))?;
+    // Sound: `lseek(SEEK_SET)` updates the open file description's offset
+    // without touching caller memory.
+    let rc = unsafe { libc::lseek(fd.as_raw_fd(), off, libc::SEEK_SET) };
+    if rc < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Read from a borrowed Unix descriptor at `*offset` via `pread`, advancing
+/// `*offset` without modifying the open file description's shared cursor.
+pub(crate) fn pread_at(fd: BorrowedFd<'_>, offset: &mut u64, buf: &mut [u8]) -> io::Result<usize> {
+    if buf.is_empty() {
+        return Ok(0);
+    }
+    let off = libc::off_t::try_from(*offset).map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "pread offset exceeds off_t"))?;
+    loop {
+        // Sound: `fd` is borrowed live for this call, and `buf` is a live
+        // exclusive mutable slice for the kernel to fill.
+        let rc = unsafe { libc::pread(fd.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len(), off) };
+        if rc < 0 {
+            let e = io::Error::last_os_error();
+            if e.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(e);
+        }
+        let n = rc as usize;
+        assert!(n <= buf.len(), "kernel pread did not exceed requested length");
+        *offset = offset.checked_add(n as u64).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "pread offset overflow"))?;
+        return Ok(n);
+    }
+}
+
+/// A lifetime-bound `Read` adapter that reads sequentially from a fixed
+/// starting offset on a borrowed Unix descriptor using `pread`, never
+/// modifying the underlying open file description's cursor (M6).
+pub(crate) struct PreadReader<'a> {
+    fd: BorrowedFd<'a>,
     offset: u64,
 }
 
-impl PreadReader {
-    pub(crate) fn new(fd: RawFd, offset: u64) -> Self {
+impl<'a> PreadReader<'a> {
+    pub(crate) fn new(fd: BorrowedFd<'a>, offset: u64) -> Self {
         Self { fd, offset }
-    }
-
-    #[cfg(target_os = "macos")]
-    pub(crate) fn offset(&self) -> u64 {
-        self.offset
     }
 }
 
-impl Read for PreadReader {
+impl Read for PreadReader<'_> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        if buf.is_empty() {
-            return Ok(0);
-        }
-        loop {
-            // Sound: `buf` is a live exclusive mutable slice for the kernel to fill.
-            let rc = unsafe { libc::pread(self.fd, buf.as_mut_ptr().cast(), buf.len(), self.offset as libc::off_t) };
-            if rc < 0 {
-                let e = io::Error::last_os_error();
-                if e.kind() == io::ErrorKind::Interrupted {
-                    continue;
-                }
-                return Err(e);
-            }
-            let n = rc as usize;
-            self.offset += n as u64;
-            return Ok(n);
-        }
+        pread_at(self.fd, &mut self.offset, buf)
     }
 }
 
 /// Copy all bytes of `fd` from offset 0 into `out` via `pread` (never advancing
 /// `fd`'s shared file offset), for `--outboard` on macOS `/dev/stdin` / `/dev/fd/0`.
 #[cfg(target_os = "macos")]
-pub(crate) fn pread_all_into(fd: RawFd, out: &mut Vec<u8>) -> io::Result<()> {
+pub(crate) fn pread_all_into(fd: BorrowedFd<'_>, out: &mut Vec<u8>) -> io::Result<()> {
     let mut reader = PreadReader::new(fd, 0);
     reader.read_to_end(out)?;
     Ok(())
@@ -686,7 +723,7 @@ pub(crate) fn finish_hash_streaming_from_prefix(mode: blake3::Mode<'_>, prefix: 
         let extra = crate::update_from_counted(&mut hasher, file)?;
         Ok(HashRead { hash: hasher.finalize(), bytes_hashed: prefix.len() as u64 + extra, cursor_moved: true })
     } else {
-        let mut reader = PreadReader::new(file.as_raw_fd(), prefix.len() as u64);
+        let mut reader = PreadReader::new(file.as_fd(), prefix.len() as u64);
         let extra = crate::update_from_counted(&mut hasher, &mut reader)?;
         Ok(HashRead { hash: hasher.finalize(), bytes_hashed: prefix.len() as u64 + extra, cursor_moved: false })
     }

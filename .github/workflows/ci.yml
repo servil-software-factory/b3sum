@@ -58,7 +58,10 @@ jobs:
           CFLAGS: -flto
       - name: Safety controls (Linux)
         if: runner.os == 'Linux'
-        run: python3 tools/b3sum_controls.py
+        run: |
+          python3 tools/test_unsafe_reasons.py
+          python3 tools/unsafe_reasons.py
+          python3 tools/b3sum_controls.py
       - name: Release artifact verification tests (Linux)
         if: runner.os == 'Linux'
         run: python3 tools/test_release_artifacts.py
