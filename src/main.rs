@@ -477,9 +477,7 @@ pub(crate) fn hash_path_hash(args: &Args, path: &Path, stdin_ctx: &StdinContext,
                 }
                 return Ok(hr.hash);
             }
-            if let Ok(meta) = file_end::fstat_fd(0) {
-                file_end::ensure_byte_stream_fd(0, meta.mode_type)?;
-            }
+            file_end::validate_byte_stream_fd(0)?;
             let mut hasher = args.base_hasher.clone();
             update_from(&mut hasher, io::stdin())?;
             Ok(hasher.finalize())
@@ -496,9 +494,7 @@ pub(crate) fn hash_path_hash(args: &Args, path: &Path, stdin_ctx: &StdinContext,
             // Reuse fd 0 directly instead of reopening `/dev/stdin` (which
             // fails with ENXIO on inherited Unix sockets and can block
             // forever on a closed named FIFO).
-            if let Ok(meta) = file_end::fstat_fd(0) {
-                file_end::ensure_byte_stream_fd(0, meta.mode_type)?;
-            }
+            file_end::validate_byte_stream_fd(0)?;
             let mut hasher = args.base_hasher.clone();
             update_from(&mut hasher, io::stdin())?;
             Ok(hasher.finalize())
@@ -538,19 +534,27 @@ pub(crate) fn hash_open_file(args: &Args, file: File) -> err::Result<blake3::Has
     Ok(hash_open_file_ex(args, file)?.hash)
 }
 
+/// Stream an already-opened `file` sequentially to actual EOF without creating
+/// a memory mapping (used after an `O_DIRECT` read observes that the file's
+/// length changed, so a stale mapping is never hashed).
+#[cfg(target_os = "linux")]
+pub(crate) fn hash_open_file_streaming(args: &Args, file: File) -> err::Result<blake3::Hash> {
+    use std::os::fd::AsRawFd;
+    file_end::validate_byte_stream_fd(file.as_raw_fd())?;
+    let mut hasher = args.base_hasher.clone();
+    update_from(&mut hasher, file)?;
+    Ok(hasher.finalize())
+}
+
 /// Hash an already-opened `file`, returning the digest along with exact byte
 /// count and whether the file descriptor's cursor was advanced.
 pub(crate) fn hash_open_file_ex(args: &Args, mut file: File) -> err::Result<HashRead> {
-    {
+    let fd_meta = {
         use std::os::fd::AsRawFd;
-        if let Ok(fd_meta) = file_end::fstat_fd(file.as_raw_fd()) {
-            file_end::ensure_byte_stream_fd(file.as_raw_fd(), fd_meta.mode_type)?;
-        }
-    }
-    if let Ok(meta) = file.metadata()
-        && meta.is_file()
-    {
-        let size = meta.len();
+        file_end::validate_byte_stream_fd(file.as_raw_fd())?
+    };
+    if fd_meta.is_file() {
+        let size = fd_meta.len;
         if size < MAP_LEN as u64 {
             let cap = (usize::try_from(size).expect("size < MAP_LEN") + 1).max(4096).min(SMALL_MEM_CAP + 1);
             let mut buf = Vec::with_capacity(cap);
@@ -605,12 +609,32 @@ pub(crate) fn hash_open_file_ex(args: &Args, mut file: File) -> err::Result<Hash
                 let want_total = if args.num_threads().is_some() { pool_threads().get() } else { threads().get() }.min(DIRECT_THREADS);
                 let permits = DirectPermits::acquire(want_total.saturating_sub(1));
                 let direct_threads = 1 + permits.extra;
-                if direct::is_for(&file, size)
-                    && let Some(h) = direct::hash(args.mode, &file, len, direct_threads, &mut direct::Piece::new())
-                {
-                    drop(permits);
-                    drop(map);
-                    return Ok(HashRead { hash: h, bytes_hashed: len as u64, cursor_moved: false });
+                if direct::is_for(&file, size) {
+                    match direct::hash(args.mode, &file, len, direct_threads, &mut direct::Piece::new()) {
+                        Ok(h) => {
+                            drop(permits);
+                            drop(map);
+                            return Ok(HashRead { hash: h, bytes_hashed: len as u64, cursor_moved: false });
+                        }
+                        Err(direct::Failure::Unavailable) => {
+                            // O_DIRECT could not be opened or was refused (`EINVAL`) on this
+                            // fd/fs: fall through to the existing mapped multi-core path below.
+                        }
+                        Err(direct::Failure::Changed) => {
+                            // The direct reader observed the file grew or shrank: discard
+                            // the stale mapping and stream the open descriptor to actual EOF.
+                            drop(permits);
+                            drop(map);
+                            let mut hasher = args.base_hasher.clone();
+                            let bytes_hashed = update_from_counted(&mut hasher, file)?;
+                            return Ok(HashRead { hash: hasher.finalize(), bytes_hashed, cursor_moved: true });
+                        }
+                        Err(direct::Failure::Err(e)) => {
+                            drop(permits);
+                            drop(map);
+                            return Err(e.into());
+                        }
+                    }
                 }
                 drop(permits);
                 // Multi-threaded single cold file (`>= 512 KiB`): start the pool,
@@ -638,18 +662,14 @@ fn hash_path(args: &Args, path: &Path, stdin_ctx: &StdinContext) -> err::Result<
             if args.keyed() {
                 bail!("Cannot open `-` in keyed mode");
             }
-            if let Ok(meta) = file_end::fstat_fd(0) {
-                file_end::ensure_byte_stream_fd(0, meta.mode_type)?;
-            }
+            file_end::validate_byte_stream_fd(0)?;
             update_from(&mut hasher, io::stdin())?;
         }
         InputRole::StdinStreamAlias => {
             if args.keyed() {
                 bail!("Cannot open `-` in keyed mode");
             }
-            if let Ok(meta) = file_end::fstat_fd(0) {
-                file_end::ensure_byte_stream_fd(0, meta.mode_type)?;
-            }
+            file_end::validate_byte_stream_fd(0)?;
             update_from(&mut hasher, io::stdin())?;
         }
         #[cfg(target_os = "macos")]
@@ -657,8 +677,7 @@ fn hash_path(args: &Args, path: &Path, stdin_ctx: &StdinContext) -> err::Result<
             use std::os::fd::AsRawFd;
             let file = File::open(path)?;
             let fd = file.as_raw_fd();
-            let meta = file_end::fstat_fd(fd)?;
-            file_end::ensure_byte_stream_fd(fd, meta.mode_type)?;
+            let meta = file_end::validate_byte_stream_fd(fd)?;
             if meta.len >= MAP_LEN as u64
                 && let Some(map) = args.map(&file)
                 && resident(&map)
@@ -671,16 +690,11 @@ fn hash_path(args: &Args, path: &Path, stdin_ctx: &StdinContext) -> err::Result<
         }
         InputRole::Path => {
             let mut file = File::open(path)?;
-            {
+            let fd_meta = {
                 use std::os::fd::AsRawFd;
-                if let Ok(fd_meta) = file_end::fstat_fd(file.as_raw_fd()) {
-                    file_end::ensure_byte_stream_fd(file.as_raw_fd(), fd_meta.mode_type)?;
-                }
-            }
-            if let Ok(meta) = file.metadata()
-                && meta.is_file()
-                && meta.len() < 64 * 1024
-            {
+                file_end::validate_byte_stream_fd(file.as_raw_fd())?
+            };
+            if fd_meta.is_file() && fd_meta.len < 64 * 1024 {
                 let mut stack_buf = [0u8; 64 * 1024];
                 let (n, eof) = fill(&mut file, &mut stack_buf)?;
                 update(&mut hasher, &stack_buf[..n]);
@@ -1173,9 +1187,7 @@ fn print_output(output: blake3::OutputReader, path: &Path, args: &Args, out: &mu
 }
 
 fn read_key_from_stdin() -> err::Result<[u8; blake3::KEY_LEN]> {
-    if let Ok(meta) = file_end::fstat_fd(0) {
-        file_end::ensure_byte_stream_fd(0, meta.mode_type)?;
-    }
+    file_end::validate_byte_stream_fd(0)?;
     let mut bytes = Vec::with_capacity(blake3::KEY_LEN + 1);
     let n = std::io::stdin().lock().take(blake3::KEY_LEN as u64 + 1).read_to_end(&mut bytes)?;
     if n < blake3::KEY_LEN {
@@ -1235,15 +1247,28 @@ fn unescape(mut path: &str) -> err::Result<String> {
         path = &path[i + 2..];
     }
     unescaped.push_str(path);
+    unescaped.shrink_to_fit();
     Ok(unescaped)
 }
 
 #[derive(Debug)]
 struct ParsedCheckLine {
-    file_string: String,
-    is_escaped: bool,
+    /// Original escaped display text (`\...`), allocated ONLY when the line was
+    /// escaped. Ordinary unescaped paths display directly from `file_path` so
+    /// each path is allocated once.
+    escaped_display: Option<String>,
     file_path: PathBuf,
     expected_hash: blake3::Hash,
+}
+
+impl ParsedCheckLine {
+    fn display_str(&self) -> &str {
+        self.escaped_display.as_deref().unwrap_or_else(|| self.file_path.to_str().expect("checkfile paths are valid UTF-8"))
+    }
+
+    fn retained_bytes(&self) -> usize {
+        self.file_path.capacity() + self.escaped_display.as_ref().map_or(0, String::capacity)
+    }
 }
 
 fn split_untagged_check_line(line_after_slash: &str) -> Option<(&str, &str)> {
@@ -1297,11 +1322,11 @@ fn parse_check_line(mut line: &str) -> err::Result<ParsedCheckLine> {
     }
     let expected_hash: blake3::Hash = hash_bytes.into();
 
-    let file_path_string = if is_escaped { unescape(file_str)? } else { file_str.to_string() };
+    let (file_path_string, escaped_display) = if is_escaped { (unescape(file_str)?, Some("\\".to_string() + file_str)) } else { (file_str.to_string(), None) };
     ensure!(!file_path_string.is_empty(), "empty file path");
     check_for_invalid_characters(&file_path_string)?;
 
-    Ok(ParsedCheckLine { file_string: file_str.to_string(), is_escaped, file_path: file_path_string.into(), expected_hash })
+    Ok(ParsedCheckLine { escaped_display, file_path: file_path_string.into(), expected_hash })
 }
 
 /// Hash `paths` in standard 32-byte mode (`seek == 0 && len <= 32`) across
@@ -1550,9 +1575,7 @@ fn outboard_of(
             if matches!(mode, blake3::Mode::Keyed(_)) {
                 bail!("Cannot open `-` in keyed mode");
             }
-            if let Ok(meta) = file_end::fstat_fd(0) {
-                file_end::ensure_byte_stream_fd(0, meta.mode_type)?;
-            }
+            file_end::validate_byte_stream_fd(0)?;
             file_end::read_stream_to_end(&mut io::stdin().lock(), bytes)?;
             return Ok(outboard::outboard(mode, bytes, threads, &mut rooms.cvs, nodes));
         }
@@ -1560,9 +1583,7 @@ fn outboard_of(
             if matches!(mode, blake3::Mode::Keyed(_)) {
                 bail!("Cannot open `-` in keyed mode");
             }
-            if let Ok(meta) = file_end::fstat_fd(0) {
-                file_end::ensure_byte_stream_fd(0, meta.mode_type)?;
-            }
+            file_end::validate_byte_stream_fd(0)?;
             file_end::read_stream_to_end(&mut io::stdin().lock(), bytes)?;
             return Ok(outboard::outboard(mode, bytes, threads, &mut rooms.cvs, nodes));
         }
@@ -1571,8 +1592,7 @@ fn outboard_of(
             use std::os::fd::AsRawFd;
             let file = File::open(path)?;
             let fd = file.as_raw_fd();
-            let meta = file_end::fstat_fd(fd)?;
-            file_end::ensure_byte_stream_fd(fd, meta.mode_type)?;
+            let meta = file_end::validate_byte_stream_fd(fd)?;
             if meta.len >= MAP_LEN as u64
                 && let Some(map) = args.map(&file)
             {
@@ -1586,31 +1606,37 @@ fn outboard_of(
         InputRole::Path => {}
     }
     let mut file = File::open(path)?;
-    let meta = file.metadata()?;
-    if meta.is_file() && meta.len() < MAP_LEN as u64 {
-        read_to_its_end(&mut file, usize::try_from(meta.len()).expect("len < MAP_LEN"), bytes)?;
+    let fd_meta = {
+        use std::os::fd::AsRawFd;
+        file_end::validate_byte_stream_fd(file.as_raw_fd())?
+    };
+    if fd_meta.is_file() && fd_meta.len < MAP_LEN as u64 {
+        read_to_its_end(&mut file, usize::try_from(fd_meta.len).expect("len < MAP_LEN"), bytes)?;
         return Ok(outboard::outboard(mode, bytes, threads, &mut rooms.cvs, nodes));
     }
     #[cfg(target_os = "linux")]
-    if meta.is_file()
-        && let Some(hash) = outboard::outboard_direct(mode, &file, meta.len(), threads, &mut rooms.piece, &mut rooms.cvs, nodes)
-    {
-        return Ok(hash);
+    let mut skip_map_after_change = false;
+    #[cfg(target_os = "linux")]
+    if fd_meta.is_file() {
+        match outboard::outboard_direct(mode, &file, fd_meta.len, threads, &mut rooms.piece, &mut rooms.cvs, nodes) {
+            Ok(hash) => return Ok(hash),
+            Err(direct::Failure::Unavailable) => {}
+            Err(direct::Failure::Changed) => skip_map_after_change = true,
+            Err(direct::Failure::Err(e)) => return Err(e.into()),
+        }
     }
-    if meta.len() > 0
+    #[cfg(not(target_os = "linux"))]
+    let skip_map_after_change = false;
+    if fd_meta.is_file()
+        && fd_meta.len > 0
+        && !skip_map_after_change
         && let Some(map) = args.map(&file)
     {
         let hash = outboard::outboard(mode, &map, threads, &mut rooms.cvs, nodes);
         hold(map);
         return Ok(hash);
     }
-    {
-        use std::os::fd::AsRawFd;
-        if let Ok(fd_meta) = file_end::fstat_fd(file.as_raw_fd()) {
-            file_end::ensure_byte_stream_fd(file.as_raw_fd(), fd_meta.mode_type)?;
-        }
-    }
-    if meta.is_file() {
+    if fd_meta.is_file() {
         file.read_to_end(bytes)?;
     } else {
         file_end::read_stream_to_end(&mut file, bytes)?;
@@ -1731,9 +1757,7 @@ fn hash_some(
     }
 }
 
-fn emit_checked_entry(parsed: ParsedCheckLine, res: err::Result<blake3::Hash>, args: &Args, out: &mut OutBuf) -> err::Result<bool> {
-    let ParsedCheckLine { file_string, is_escaped, expected_hash, .. } = parsed;
-    let display = if is_escaped { "\\".to_string() + &file_string } else { file_string };
+fn emit_checked_result(display: &str, expected_hash: blake3::Hash, res: err::Result<blake3::Hash>, args: &Args, out: &mut OutBuf) -> err::Result<bool> {
     let found_hash = match res {
         Ok(h) => h,
         Err(e) => {
@@ -1758,16 +1782,38 @@ fn emit_checked_entry(parsed: ParsedCheckLine, res: err::Result<blake3::Hash>, a
     }
 }
 
+fn emit_checked_entry(parsed: ParsedCheckLine, res: err::Result<blake3::Hash>, args: &Args, out: &mut OutBuf) -> err::Result<bool> {
+    emit_checked_result(parsed.display_str(), parsed.expected_hash, res, args, out)
+}
+
 /// Hard byte cap on one `--check` line (1 MiB, well above any OS path limit +
 /// escapes + digest) so pointing `--check` at a giant newline-free file cannot
 /// exhaust memory before reporting a parse error.
 const MAX_CHECK_LINE_BYTES: usize = 1 << 20;
 
+/// Hard byte budget on retained path/display payload across one `--check` batch
+/// (8 MiB), so a manifest of up to `CHECK_CHUNK` long lines cannot retain
+/// gigabytes of paths before hashing and draining.
+const MAX_CHECK_BATCH_BYTES: usize = 8 << 20;
+
+enum CheckBatchEntry {
+    ParseErr(err::Error),
+    Own(ParsedCheckLine),
+    Stdin(ParsedCheckLine),
+    /// Ordinary batchable file path: the `PathBuf` lives once in `batch_paths[batch_idx]`
+    /// (zero duplicate `PathBuf` clone); `escaped_display` is `Some` only when the
+    /// manifest line used backslash escaping so unescaped paths store one copy total.
+    File {
+        escaped_display: Option<String>,
+        expected_hash: blake3::Hash,
+        batch_idx: usize,
+    },
+}
+
 /// Read one line from `reader` with a hard byte bound `max_bytes`, draining
-/// any oversized remainder up to `\n` or EOF without allocating, and decoding
-/// UTF-8 per record so one invalid-UTF-8 line does not discard earlier valid
-/// entries in the same batch.
-fn read_check_line_bounded(reader: &mut impl BufRead, raw: &mut Vec<u8>, max_bytes: usize) -> io::Result<Option<Result<String, err::Error>>> {
+/// any oversized remainder up to `\n` or EOF without allocating, and borrowing
+/// validated UTF-8 directly from `raw`.
+fn read_check_line_bounded<'a>(reader: &mut impl BufRead, raw: &'a mut Vec<u8>, max_bytes: usize) -> io::Result<Option<Result<&'a str, err::Error>>> {
     raw.clear();
     let mut too_long = false;
     let mut saw_any = false;
@@ -1810,19 +1856,89 @@ fn read_check_line_bounded(reader: &mut impl BufRead, raw: &mut Vec<u8>, max_byt
         return Ok(Some(Err(format_err!("Check line exceeds maximum length"))));
     }
     match std::str::from_utf8(raw) {
-        Ok(s) => Ok(Some(Ok(s.to_owned()))),
+        Ok(s) => Ok(Some(Ok(s))),
         Err(_) => Ok(Some(Err(format_err!("Invalid UTF-8 in check line")))),
     }
 }
 
+/// One classified record awaiting placement in a check batch.
+enum PendingCheckRecord {
+    ParseErr(err::Error),
+    Own(ParsedCheckLine),
+    Stdin(ParsedCheckLine),
+    File(ParsedCheckLine),
+}
+
+impl PendingCheckRecord {
+    fn retained_bytes(&self) -> usize {
+        match self {
+            PendingCheckRecord::ParseErr(_) => 64,
+            PendingCheckRecord::Own(p) | PendingCheckRecord::Stdin(p) | PendingCheckRecord::File(p) => p.retained_bytes(),
+        }
+    }
+}
+
+/// Collect up to `max_entries` check entries whose total retained path/display
+/// bytes stay strictly within `max_batch_bytes` (without overshooting on a
+/// second entry; an oversized record is stashed in `pending` for the next batch,
+/// while a single record when `entries.is_empty()` is always accepted for
+/// forward progress). Returns `Ok(true)` when EOF was reached AND `pending` is
+/// empty.
+#[allow(clippy::too_many_arguments)]
+fn collect_check_batch(
+    reader: &mut impl BufRead,
+    raw_line: &mut Vec<u8>,
+    pending: &mut Option<PendingCheckRecord>,
+    entries: &mut Vec<CheckBatchEntry>,
+    batch_paths: &mut Vec<PathBuf>,
+    max_entries: usize,
+    max_batch_bytes: usize,
+    max_line_bytes: usize,
+    stdin_ctx: &StdinContext,
+    is_the_checkfile: &impl Fn(&Path) -> bool,
+) -> io::Result<bool> {
+    entries.clear();
+    batch_paths.clear();
+    let mut retained_bytes: usize = 0;
+    while entries.len() < max_entries {
+        let rec = match pending.take() {
+            Some(r) => r,
+            None => {
+                let Some(line_res) = read_check_line_bounded(reader, raw_line, max_line_bytes)? else {
+                    return Ok(true);
+                };
+                match line_res.and_then(parse_check_line) {
+                    Err(e) => PendingCheckRecord::ParseErr(e),
+                    Ok(parsed) if is_the_checkfile(&parsed.file_path) => PendingCheckRecord::Own(parsed),
+                    Ok(parsed) if matches!(stdin_ctx.classify(&parsed.file_path), InputRole::StdinDash | InputRole::StdinStreamAlias) => {
+                        PendingCheckRecord::Stdin(parsed)
+                    }
+                    Ok(parsed) => PendingCheckRecord::File(parsed),
+                }
+            }
+        };
+        let rec_bytes = rec.retained_bytes();
+        if !entries.is_empty() && retained_bytes.saturating_add(rec_bytes) > max_batch_bytes {
+            *pending = Some(rec);
+            return Ok(false);
+        }
+        retained_bytes = retained_bytes.saturating_add(rec_bytes);
+        match rec {
+            PendingCheckRecord::ParseErr(e) => entries.push(CheckBatchEntry::ParseErr(e)),
+            PendingCheckRecord::Own(parsed) => entries.push(CheckBatchEntry::Own(parsed)),
+            PendingCheckRecord::Stdin(parsed) => entries.push(CheckBatchEntry::Stdin(parsed)),
+            PendingCheckRecord::File(parsed) => {
+                let batch_idx = batch_paths.len();
+                batch_paths.push(parsed.file_path);
+                entries.push(CheckBatchEntry::File { escaped_display: parsed.escaped_display, expected_hash: parsed.expected_hash, batch_idx });
+            }
+        }
+    }
+    Ok(false)
+}
+
 fn check_one_checkfile(path: &Path, args: &Args, stdin_ctx: &StdinContext, files_failed: &mut u64, out: &mut OutBuf) -> err::Result<()> {
     const CHECK_CHUNK: usize = 4096;
-    enum Entry {
-        ParseErr(err::Error),
-        Own(ParsedCheckLine),
-        Stdin(ParsedCheckLine),
-        File { parsed: ParsedCheckLine, batch_idx: usize },
-    }
 
     let mut file;
     let stdin;
@@ -1935,36 +2051,29 @@ fn check_one_checkfile(path: &Path, args: &Args, stdin_ctx: &StdinContext, files
     };
 
     let mut raw_line = Vec::new();
+    let mut pending = None;
     let mut entries = Vec::new();
     let mut batch_paths = Vec::new();
     let mut eof = false;
     let mut saw_line = false;
 
     while !eof {
-        entries.clear();
-        batch_paths.clear();
-        while entries.len() < CHECK_CHUNK {
-            let Some(line_res) = read_check_line_bounded(&mut bufreader, &mut raw_line, MAX_CHECK_LINE_BYTES)? else {
-                eof = true;
-                break;
-            };
-            saw_line = true;
-            let parsed_res = line_res.and_then(|line| parse_check_line(&line));
-            match parsed_res {
-                Err(e) => entries.push(Entry::ParseErr(e)),
-                Ok(parsed) if is_the_checkfile(&parsed.file_path) => entries.push(Entry::Own(parsed)),
-                Ok(parsed) if matches!(stdin_ctx.classify(&parsed.file_path), InputRole::StdinDash) => entries.push(Entry::Stdin(parsed)),
-                Ok(parsed) if matches!(stdin_ctx.classify(&parsed.file_path), InputRole::StdinStreamAlias) => entries.push(Entry::Stdin(parsed)),
-                Ok(parsed) => {
-                    let batch_idx = batch_paths.len();
-                    batch_paths.push(parsed.file_path.clone());
-                    entries.push(Entry::File { parsed, batch_idx });
-                }
-            }
-        }
+        eof = collect_check_batch(
+            &mut bufreader,
+            &mut raw_line,
+            &mut pending,
+            &mut entries,
+            &mut batch_paths,
+            CHECK_CHUNK,
+            MAX_CHECK_BATCH_BYTES,
+            MAX_CHECK_LINE_BYTES,
+            stdin_ctx,
+            &is_the_checkfile,
+        )?;
         if entries.is_empty() {
             break;
         }
+        saw_line = true;
 
         let mut batch_results: Vec<Option<err::Result<blake3::Hash>>> = (0..batch_paths.len()).map(|_| None).collect();
         hash_paths_32(args, &batch_paths, stdin_ctx, own, &mut |idx, res| {
@@ -1974,22 +2083,23 @@ fn check_one_checkfile(path: &Path, args: &Args, stdin_ctx: &StdinContext, files
 
         for entry in entries.drain(..) {
             let ok = match entry {
-                Entry::ParseErr(e) => {
+                CheckBatchEntry::ParseErr(e) => {
                     let _ = out.flush();
                     eprintln_safe!("{}: {}", NAME, e);
                     false
                 }
-                Entry::Own(parsed) => {
+                CheckBatchEntry::Own(parsed) => {
                     let what = if checkfile_is_stdin { "standard input is the checkfile; it" } else { "this checkfile is a stream, and" };
                     emit_checked_entry(parsed, Err(format_err!("{what} cannot also be a file to check")), args, out)?
                 }
-                Entry::Stdin(parsed) => {
+                CheckBatchEntry::Stdin(parsed) => {
                     let res = hash_path_hash(args, &parsed.file_path, stdin_ctx, own);
                     emit_checked_entry(parsed, res, args, out)?
                 }
-                Entry::File { parsed, batch_idx } => {
+                CheckBatchEntry::File { escaped_display, expected_hash, batch_idx } => {
                     let res = batch_results[batch_idx].take().expect("every batch path hashed");
-                    emit_checked_entry(parsed, res, args, out)?
+                    let display = escaped_display.as_deref().unwrap_or_else(|| batch_paths[batch_idx].to_str().expect("checkfile paths are valid UTF-8"));
+                    emit_checked_result(display, expected_hash, res, args, out)?
                 }
             };
             if !ok {
@@ -2010,18 +2120,13 @@ fn check_one_checkfile(path: &Path, args: &Args, stdin_ctx: &StdinContext, files
 fn explain_sigbus() {
     static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     extern "C" fn on_sigbus(_: libc::c_int) {
-        if SAID.swap(true, std::sync::atomic::Ordering::SeqCst) {
-            loop {
-                // Sound: calls a signal handler may make (pause, write,
-                // _exit), on a constant message.
-                unsafe { libc::pause() };
-            }
+        if !SAID.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            const MESSAGE: &[u8] = b"b3sum: a bus error while reading a mapped file; most likely another program truncated it, so no digest of it would be right. Hash the files again once nothing writes to them.\n";
+            file_end::write_fatal_nonblocking(MESSAGE);
         }
-        const MESSAGE: &[u8] = b"b3sum: a bus error while reading a mapped file; most likely another program truncated it, so no digest of it would be right. Hash the files again once nothing writes to them.\n";
-        unsafe {
-            libc::write(2, MESSAGE.as_ptr().cast(), MESSAGE.len());
-            libc::_exit(1);
-        }
+        // Sound: `_exit` is async-signal-safe; terminate immediately without
+        // blocking on stderr or waiting in `pause()` for another handler.
+        unsafe { libc::_exit(1) };
     }
     let handler: extern "C" fn(libc::c_int) = on_sigbus;
     // Sound: the handler makes only calls a signal handler may make, and

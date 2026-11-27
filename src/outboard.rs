@@ -127,9 +127,10 @@ fn build<E>(
 }
 
 /// The hash and outboard of the open `file`, read past the page cache
-/// (`direct::read`): None where that is not the way to read it or where a
-/// read failed, and then `out` is as it was and the caller reads the file
-/// as ever, and reports what fails then.
+/// (`direct::read`): `Err(Failure::Unavailable)` where direct reading does not
+/// apply, `Err(Failure::Changed)` where the file length changed (so callers
+/// discard stale mappings and stream to EOF), and `Err(Failure::Err)` on a real
+/// I/O error; on any `Err`, `out` is rolled back to its prior length.
 #[cfg(target_os = "linux")]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn outboard_direct(
@@ -140,11 +141,12 @@ pub(crate) fn outboard_direct(
     mine: &mut Option<Piece>,
     cvs: &mut Vec<Cv>,
     out: &mut Vec<u8>,
-) -> Option<blake3::Hash> {
+) -> Result<blake3::Hash, crate::direct::Failure> {
     if !crate::direct::is_for(file, len) {
-        return None;
+        return Err(crate::direct::Failure::Unavailable);
     }
-    direct(mode, file, usize::try_from(len).ok()?, threads, mine.get_or_insert_with(Piece::new), cvs, out)
+    let len = usize::try_from(len).map_err(|_| crate::direct::Failure::Unavailable)?;
+    direct(mode, file, len, threads, mine.get_or_insert_with(Piece::new), cvs, out)
 }
 
 /// [`outboard_direct`]'s reading and hashing, for a file of `len` bytes,
@@ -159,9 +161,9 @@ fn direct(
     mine: &mut Piece,
     cvs: &mut Vec<Cv>,
     out: &mut Vec<u8>,
-) -> Option<blake3::Hash> {
+) -> Result<blake3::Hash, crate::direct::Failure> {
     let before = out.len();
-    let done: Result<_, ()> = build(mode, len, cvs, out, |tree, cvs| {
+    let done = build(mode, len, cvs, out, |tree, cvs| {
         // Many of these run at once, one a core: each on its own core's kernels.
         let tree = tree.clone().on_this_core();
         let groups = cvs.len();
@@ -176,14 +178,13 @@ fn direct(
                     *cv = tree.subtree_cv(LEVEL, group as u64, bytes);
                 }
             }
-        })
-        .ok_or(())?;
+        })?;
         Ok(last.into_inner().expect("the last group was read"))
     });
     if done.is_err() {
         out.truncate(before);
     }
-    done.ok()
+    done
 }
 
 /// Each whole group's chaining value into its slot of `cvs` (a slot a
@@ -592,7 +593,7 @@ pub(crate) mod test {
                 let hash = outboard(mode, &all[..len], 1, &mut cvs, &mut want);
                 for threads in [1, 3] {
                     let mut got = vec![0xee; 5];
-                    assert_eq!(direct(mode, &file, len, threads, &mut piece, &mut cvs, &mut got), Some(hash), "len={len} threads={threads}");
+                    assert!(matches!(direct(mode, &file, len, threads, &mut piece, &mut cvs, &mut got), Ok(h) if h == hash), "len={len} threads={threads}");
                     assert_eq!(got[..5], [0xee; 5]);
                     assert_eq!(got[5..], want, "len={len} threads={threads}");
                     for wrong in [len + 1, len - 1, len + PIECE, len - GROUP, len.next_multiple_of(PIECE).saturating_sub(PIECE)] {
@@ -600,7 +601,10 @@ pub(crate) mod test {
                             continue;
                         }
                         let mut got = vec![0xee; 5];
-                        assert_eq!(direct(mode, &file, wrong, threads, &mut piece, &mut cvs, &mut got), None, "len={len} read as {wrong}");
+                        assert!(
+                            matches!(direct(mode, &file, wrong, threads, &mut piece, &mut cvs, &mut got), Err(crate::direct::Failure::Changed)),
+                            "len={len} read as {wrong}"
+                        );
                         assert_eq!(got, [0xee; 5]);
                     }
                 }
@@ -611,9 +615,11 @@ pub(crate) mod test {
         assert!(all.len() as u64 >= DIRECT_MIN);
         let file = std::fs::File::open(&path).unwrap();
         let mut made = None;
-        assert_eq!(
-            outboard_direct(blake3::Mode::Plain, &file, all.len() as u64, 1, &mut made, &mut cvs, &mut Vec::new()),
-            None,
+        assert!(
+            matches!(
+                outboard_direct(blake3::Mode::Plain, &file, all.len() as u64, 1, &mut made, &mut cvs, &mut Vec::new()),
+                Err(crate::direct::Failure::Unavailable)
+            ),
             "just written: the cache holds it"
         );
         assert!(made.is_none(), "no piece is made for a file that is not read directly");
@@ -622,14 +628,23 @@ pub(crate) mod test {
         let mut want = Vec::new();
         let hash = outboard(blake3::Mode::Plain, &all, 1, &mut cvs, &mut want);
         let mut got = Vec::new();
-        assert_eq!(outboard_direct(blake3::Mode::Plain, &file, all.len() as u64, 2, &mut made, &mut cvs, &mut got), Some(hash));
+        assert!(matches!(
+            outboard_direct(blake3::Mode::Plain, &file, all.len() as u64, 2, &mut made, &mut cvs, &mut got),
+            Ok(h) if h == hash
+        ));
         assert_eq!(got, want);
         assert!(made.is_some());
         let short = dir.path().join(format!("file-{}", PIECE + 1));
         let file = std::fs::File::open(&short).unwrap();
         assert!(((PIECE + 1) as u64) < DIRECT_MIN);
-        assert_eq!(outboard_direct(blake3::Mode::Plain, &file, (PIECE + 1) as u64, 1, &mut made, &mut cvs, &mut got), None);
-        assert_eq!(outboard_direct(blake3::Mode::Plain, &file, DIRECT_MIN - 1, 1, &mut made, &mut cvs, &mut got), None, "the length decides");
+        assert!(matches!(
+            outboard_direct(blake3::Mode::Plain, &file, (PIECE + 1) as u64, 1, &mut made, &mut cvs, &mut got),
+            Err(crate::direct::Failure::Unavailable)
+        ));
+        assert!(
+            matches!(outboard_direct(blake3::Mode::Plain, &file, DIRECT_MIN - 1, 1, &mut made, &mut cvs, &mut got), Err(crate::direct::Failure::Unavailable)),
+            "the length decides"
+        );
         TAKE_FOR_COLD.with(|c| c.set(false));
     }
 }

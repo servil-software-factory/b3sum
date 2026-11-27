@@ -515,8 +515,8 @@ fn enter(fd: RawFd, to_submit: u32, min_complete: u32, flags: u32) -> Option<u32
     if err.kind() == io::ErrorKind::Interrupted {
         return None;
     }
-    use std::io::Write;
-    let _ = writeln!(std::io::stderr(), "b3sum: io_uring_enter failed: {err}; stopping before pending reads' buffers can be released");
+    let errno = err.raw_os_error().unwrap_or(0);
+    crate::file_end::write_fatal_fmt(format_args!("b3sum: io_uring_enter failed (errno {errno}); stopping before pending reads' buffers can be released\n"));
     std::process::abort()
 }
 
@@ -527,12 +527,10 @@ impl Drop for Uring {
         // ring frees those buffers next. So a ring dropped with a read in
         // flight (a return or a panic past it) stops the process here.
         if self.in_flight != 0 {
-            use std::io::Write;
-            let _ = writeln!(
-                std::io::stderr(),
-                "b3sum: an io_uring was dropped with {} reads in flight; stopping before their buffers can be released",
+            crate::file_end::write_fatal_fmt(format_args!(
+                "b3sum: an io_uring was dropped with {} reads in flight; stopping before their buffers can be released\n",
                 self.in_flight
-            );
+            ));
             std::process::abort()
         }
         // Sound: the three mappings and the descriptor are this ring's own
@@ -636,6 +634,57 @@ mod test {
         }
         assert_eq!(output.status.signal(), Some(libc::SIGABRT), "{:?}: {:?}", output.status, output.stderr);
         assert!(String::from_utf8_lossy(&output.stderr).contains("dropped with 1 reads in flight"));
+    }
+
+    /// Fatal abort must not block even when fd 2 is a completely full,
+    /// undrained pipe whose reader is still open.
+    #[test]
+    fn failed_enter_aborts_even_with_full_undrained_stderr_pipe() {
+        use std::os::fd::FromRawFd;
+        use std::os::unix::process::ExitStatusExt;
+        const CHILD: &str = "B3SUM_TEST_FAILED_ENTER_FULL_STDERR";
+        if std::env::var_os(CHILD).is_some() {
+            super::enter(-1, 1, 0, 0);
+            std::process::exit(0);
+        }
+        let mut ends = [0i32; 2];
+        assert_eq!(unsafe { libc::pipe(ends.as_mut_ptr()) }, 0);
+        // Set write end non-blocking solely to stuff the pipe completely full,
+        // then restore blocking mode before handing it to the child as stderr.
+        let flags = unsafe { libc::fcntl(ends[1], libc::F_GETFL) };
+        assert!(flags >= 0);
+        assert_eq!(unsafe { libc::fcntl(ends[1], libc::F_SETFL, flags | libc::O_NONBLOCK) }, 0);
+        let chunk = [b'x'; 4096];
+        loop {
+            let n = unsafe { libc::write(ends[1], chunk.as_ptr().cast(), chunk.len()) };
+            if n <= 0 {
+                break;
+            }
+        }
+        assert_eq!(unsafe { libc::fcntl(ends[1], libc::F_SETFL, flags) }, 0);
+        let stderr_file = unsafe { std::fs::File::from_raw_fd(ends[1]) };
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "uring::test::failed_enter_aborts_even_with_full_undrained_stderr_pipe", "--nocapture"])
+            .env(CHILD, "1")
+            .stderr(std::process::Stdio::from(stderr_file))
+            .spawn()
+            .unwrap();
+        // Hold the read end open without ever reading from it; child must abort promptly.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                unsafe { libc::close(ends[0]) };
+                panic!("child hung on full undrained stderr pipe during io_uring_enter abort");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        unsafe { libc::close(ends[0]) };
+        assert_eq!(status.signal(), Some(libc::SIGABRT), "expected immediate SIGABRT with full stderr, got {status:?}");
     }
 
     /// A real failed syscall must abort, even inside catch_unwind. This
