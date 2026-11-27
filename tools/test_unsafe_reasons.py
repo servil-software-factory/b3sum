@@ -504,6 +504,40 @@ class Reasons(unittest.TestCase):
         self.assertEqual(ur.without_reason(multiline), [])
         self.assertEqual(ur.debug_assert_without_reason(multiline), [])
 
+        # Inline `#[cfg(test)] const { ... }` inside an array/tuple with postfix
+        # `.wrapping_add(2),` must stop at `,` (never masking the next shipped
+        # element), a plain `const { 1u8 }, // Sound:` must mask its trailing
+        # comment, and Pattern_White_Space (`\u200E`) between `const` and `{`
+        # must still be recognized as an inline const block.
+        const_array_postfix = (
+            "fn f(p: &u8) -> [u8; 1] {\n"
+            "    [\n"
+            "        #[cfg(test)] const { 1u8 }.wrapping_add(2),\n"
+            "        unsafe { *(p as *const u8) },\n"
+            "    ]\n"
+            "}\n"
+        )
+        self.assertEqual([n for n, _ in ur.without_reason(const_array_postfix)], [4])
+        const_array_trailing_comment = (
+            "fn f(p: &u8) -> [u8; 1] {\n"
+            "    [\n"
+            "        #[cfg(test)] const { 1u8 }, // Sound: test fixture. Debug-only: test fixture.\n"
+            "        { debug_assert!(*p < 255); unsafe { *(p as *const u8) } },\n"
+            "    ]\n"
+            "}\n"
+        )
+        self.assertEqual([n for n, _ in ur.without_reason(const_array_trailing_comment)], [4])
+        self.assertEqual([n for n, _ in ur.debug_assert_without_reason(const_array_trailing_comment)], [4])
+        const_lrm_ws = (
+            "fn f(p: &u8) -> u8 {\n"
+            "    #[cfg(test)] const\u200e{ () }\n"
+            "    debug_assert!(*p < 255);\n"
+            "    unsafe { *(p as *const u8) }\n"
+            "}\n"
+        )
+        self.assertEqual([n for n, _ in ur.debug_assert_without_reason(const_lrm_ws)], [3])
+        self.assertEqual([n for n, _ in ur.without_reason(const_lrm_ws)], [4])
+
     def test_cfg_test_fn_items_are_excluded(self):
         src = (
             "#[cfg(test)]\n"

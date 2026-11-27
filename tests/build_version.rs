@@ -90,16 +90,24 @@ fn git_checkout_clean_dirty_no_object_pollution_worktree_and_release() {
     git(&repo, &["rm", "-q", "--cached", "ignored.rs"]);
     fs::remove_file(repo.join("ignored.rs")).unwrap();
 
-    // 2. Dirty untracked file must mark `.dirty.<tree>` WITHOUT writing ANY
-    //    object into the repository's `.git/objects` (M17).
+    // 2. Dirty untracked file inside a watched source subdirectory must mark
+    //    `.dirty.<tree>` WITHOUT writing ANY object into `.git/objects` (M17),
+    //    whereas an unstaged untracked root file stays outside the incremental
+    //    stamp contract until staged (R3 M3).
     let objects_before = list_object_files(&repo.join(".git/objects"));
-    let untracked = repo.join("untracked secret.txt");
+    let root_scratch = repo.join("root-scratch.txt");
+    fs::write(&root_scratch, b"unstaged root note").unwrap();
+    let (root_scratch_ver, _) = build_version::build_version(&repo, "0.11.0+dev", &scratch);
+    assert_eq!(root_scratch_ver, format!("0.11.0+dev.{head}"), "unstaged untracked root file must match Cargo's incremental watch set (R3 M3)");
+    fs::remove_file(&root_scratch).unwrap();
+
+    let untracked = repo.join("src/untracked secret.txt");
     fs::write(&untracked, b"never write me to .git/objects").unwrap();
     let (dirty_ver, dirty_watched) = build_version::build_version(&repo, "0.11.0+dev", &scratch);
     let objects_after = list_object_files(&repo.join(".git/objects"));
     assert_eq!(objects_before, objects_after, "build_version must not write uncommitted files into .git/objects (M17)");
     assert!(dirty_ver.starts_with(&format!("0.11.0+dev.{head}.dirty.")), "got {dirty_ver}");
-    assert!(dirty_watched.contains(&untracked), "untracked file with spaces must be watched via NUL-delimited ls-files (M17)");
+    assert!(dirty_watched.contains(&untracked), "untracked file with spaces in subdir must be watched via NUL-delimited ls-files (M17)");
     fs::remove_file(&untracked).unwrap();
 
     // 2b. A checkout path containing ':' must still quote its alternate object
@@ -176,4 +184,72 @@ fn package_vcs_info_validates_full_sha_and_dirty_flag() {
     fs::write(dir.path().join(".cargo_vcs_info.json"), format!("{{\"note\":\"\\u+041\",\"git\":{{\"sha1\":\"{sha}\"}}}}")).unwrap();
     let (v, _) = build_version::build_version(dir.path(), &format!("0.11.0+{sha}"), scratch.path());
     assert_eq!(v, format!("0.11.0+{sha}.unverified"));
+}
+
+#[test]
+fn incremental_cargo_build_agrees_with_fresh_build_across_root_and_subdir_changes() {
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let root = tempfile::tempdir().unwrap();
+    let repo = root.path().join("fixture");
+    let target_inc = root.path().join("target-inc");
+    fs::create_dir_all(repo.join("src")).unwrap();
+    fs::write(repo.join("Cargo.toml"), "[package]\nname = \"stamp_fixture\"\nversion = \"0.11.0+dev\"\nedition = \"2024\"\n").unwrap();
+    fs::copy(manifest_dir.join("build.rs"), repo.join("build.rs")).unwrap();
+    fs::copy(manifest_dir.join("build_version.rs"), repo.join("build_version.rs")).unwrap();
+    fs::write(repo.join("src/main.rs"), "fn main() { print!(\"{}\", env!(\"B3SUM_BUILD_VERSION\")); }\n").unwrap();
+    git(&repo, &["init", "-q", "--initial-branch=main"]);
+    git(&repo, &["config", "user.name", "Test"]);
+    git(&repo, &["config", "user.email", "test@example.invalid"]);
+    git(&repo, &["config", "commit.gpgsign", "false"]);
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-qm", "initial"]);
+    let head = git(&repo, &["rev-parse", "HEAD"]);
+
+    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+    let build_and_read = |target_dir: &Path| -> String {
+        let out = Command::new(&cargo).args(["build", "--quiet", "--offline"]).current_dir(&repo).env("CARGO_TARGET_DIR", target_dir).output().unwrap();
+        assert!(out.status.success(), "cargo build failed: {}", String::from_utf8_lossy(&out.stderr));
+        let bin = target_dir.join("debug/stamp_fixture");
+        let run = Command::new(&bin).output().unwrap();
+        assert!(run.status.success());
+        String::from_utf8(run.stdout).unwrap()
+    };
+    let assert_inc_matches_fresh = |label: &str| -> String {
+        let inc = build_and_read(&target_inc);
+        let fresh_dir = tempfile::tempdir().unwrap();
+        let fresh = build_and_read(fresh_dir.path());
+        assert_eq!(inc, fresh, "incremental vs fresh mismatch ({label})");
+        inc
+    };
+
+    // 1. Clean checkout.
+    let v1 = assert_inc_matches_fresh("clean");
+    assert_eq!(v1, format!("0.11.0+dev.{head}"));
+
+    // 2. Unstaged untracked root scratch file: both incremental and fresh stay clean (R3 M3).
+    let scratch_root = repo.join("scratch-note.txt");
+    fs::write(&scratch_root, "local root scratch\n").unwrap();
+    let v2 = assert_inc_matches_fresh("unstaged root file");
+    assert_eq!(v2, format!("0.11.0+dev.{head}"));
+
+    // 3. Staging that root file updates `.git/index`, so incremental flips to dirty immediately.
+    git(&repo, &["add", "scratch-note.txt"]);
+    let v3 = assert_inc_matches_fresh("staged root file");
+    assert!(v3.starts_with(&format!("0.11.0+dev.{head}.dirty.")), "got {v3}");
+    git(&repo, &["rm", "-q", "--cached", "scratch-note.txt"]);
+    fs::remove_file(&scratch_root).unwrap();
+    assert_eq!(assert_inc_matches_fresh("restored clean"), format!("0.11.0+dev.{head}"));
+
+    // 4. Adding an untracked file inside watched `src/` flips incremental to dirty immediately.
+    let sub_extra = repo.join("src/extra.rs");
+    fs::write(&sub_extra, "pub fn extra() {}\n").unwrap();
+    let v4 = assert_inc_matches_fresh("untracked subdir file");
+    assert!(v4.starts_with(&format!("0.11.0+dev.{head}.dirty.")), "got {v4}");
+    fs::remove_file(&sub_extra).unwrap();
+
+    // 5. Editing a tracked root file (`Cargo.toml`) flips incremental to dirty immediately.
+    let orig_toml = fs::read_to_string(repo.join("Cargo.toml")).unwrap();
+    fs::write(repo.join("Cargo.toml"), format!("{orig_toml}# tracked root edit\n")).unwrap();
+    let v5 = assert_inc_matches_fresh("edited tracked root file");
+    assert!(v5.starts_with(&format!("0.11.0+dev.{head}.dirty.")), "got {v5}");
 }

@@ -1399,6 +1399,45 @@ fn hash_paths_32(
     run_ordered_collector(paths.len(), threads, |i| hash_path_hash(args, &paths[i], stdin_ctx, forbidden), on_ordered);
 }
 
+/// Indexed out-of-order result buffer that drains a contiguous prefix in order
+/// and stops immediately on a rejected emission (L10).
+pub(crate) struct OrderedCollector<T> {
+    results: Vec<Option<T>>,
+    emitted: usize,
+    stopped: bool,
+}
+
+impl<T> OrderedCollector<T> {
+    pub(crate) fn new(count: usize) -> Self {
+        Self { results: (0..count).map(|_| None).collect(), emitted: 0, stopped: false }
+    }
+
+    /// Record `item` at `index` and emit every contiguous ready item in order.
+    /// Returns `false` if `emit` declined an item (invoking `on_stop` once).
+    pub(crate) fn insert_and_drain(&mut self, index: usize, item: T, emit: &mut (impl FnMut(usize, T) -> bool + ?Sized), on_stop: impl FnOnce()) -> bool {
+        self.results[index] = Some(item);
+        while self.emitted < self.results.len() {
+            let Some(ready) = self.results[self.emitted].take() else { break };
+            if !emit(self.emitted, ready) {
+                self.stopped = true;
+                on_stop();
+                return false;
+            }
+            self.emitted += 1;
+        }
+        !self.stopped
+    }
+
+    pub(crate) fn finish(self, context: &str) {
+        assert!(
+            self.stopped || self.emitted == self.results.len(),
+            "{context} returned after {}/{} items without cancellation",
+            self.emitted,
+            self.results.len()
+        );
+    }
+}
+
 /// Shared parallel ordered collector for generic plain and extended-output
 /// multi-file runs (M3): workers claim indices via `next`, send results to the
 /// main collector, and emit a contiguous prefix in order. When `on_ordered`
@@ -1440,22 +1479,12 @@ pub(crate) fn run_ordered_collector_inner<O: Send>(
         }
         drop(done_tx);
 
-        let mut emitted = 0usize;
-        let mut stop = false;
-        let mut results: Vec<Option<O>> = (0..count).map(|_| None).collect();
+        let mut collector = OrderedCollector::new(count);
         let mut take = |i: usize, output: O| -> bool {
-            results[i] = Some(output);
-            while emitted < count {
-                let Some(item) = results[emitted].take() else { break };
-                if !on_ordered(emitted, item) {
-                    stop = true;
-                    let claimed_before_close = next.fetch_max(count, Ordering::SeqCst).min(count);
-                    after_cancel(claimed_before_close);
-                    return false;
-                }
-                emitted += 1;
-            }
-            !stop
+            collector.insert_and_drain(i, output, &mut on_ordered, || {
+                let claimed_before_close = next.fetch_max(count, Ordering::SeqCst).min(count);
+                after_cancel(claimed_before_close);
+            })
         };
         let mut keep_going = true;
         loop {
@@ -1485,7 +1514,7 @@ pub(crate) fn run_ordered_collector_inner<O: Send>(
             }
         }
         drop(done_rx);
-        assert!(stop || emitted == count, "ordered collector returned after {emitted}/{count} operands without cancellation");
+        collector.finish("ordered collector");
     });
 }
 

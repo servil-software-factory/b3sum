@@ -430,6 +430,11 @@ def _in_generic_param_list(code, pos):
     return False
 
 
+def _is_rust_ws(ch):
+    # Rust Pattern_White_Space includes Unicode whitespace plus U+200E / U+200F.
+    return ch.isspace() or ch in ("\u200e", "\u200f")
+
+
 def _test_item_spans(code):
     """Return sorted `(start, end)` spans of every outer `#[cfg(...)]` requiring
     `test` together with its stacked attributes and attached item, block,
@@ -447,10 +452,10 @@ def _test_item_spans(code):
             i = attr_end
             continue
         span_start = _preceding_attr_stack_start(code, pos)
-        # Advance past whitespace and any stacked outer `#[...]` attributes.
+        # Advance past Rust whitespace and any stacked outer `#[...]` attributes.
         j = attr_end
         while j < n:
-            while j < n and code[j].isspace():
+            while j < n and _is_rust_ws(code[j]):
                 j += 1
             if j + 1 < n and code[j] == "#" and code[j + 1] == "[":
                 j = _find_attr_end(code, j)
@@ -471,12 +476,15 @@ def _test_item_spans(code):
         is_const_block = False
         if kw == "const":
             rest_pos = m_kw.end()
-            while rest_pos < n and code[rest_pos].isspace():
+            while rest_pos < n and _is_rust_ws(code[rest_pos]):
                 rest_pos += 1
             # Any `const` item (`const NAME:`, `const r#match:`, `const Δ:`,
             # `const _:`) ends at `;`; `const fn` / `const unsafe` / `const
-            # extern` and inline `const { ... }` blocks are brace-terminated.
+            # extern` are brace-terminated items; inline `const { ... }` is an
+            # expression (so inside arrays/tuples/calls it stops at top-level `,`).
             is_const_block = rest_pos < n and code[rest_pos] == "{"
+            if is_const_block:
+                starts_item_kw = False
             is_const_fn = bool(re.match(r"(?:unsafe|extern|fn)\b", code[rest_pos:]))
             must_end_semi = starts_item_kw and not is_const_block and not is_const_fn
         else:
@@ -559,10 +567,10 @@ def _test_item_spans(code):
                     # For inline `const { ... }` block expressions, keep
                     # scanning if followed by a postfix continuation (`.foo`,
                     # `?`, NOT a `..` range expression starting the next
-                    # statement) or consume a trailing `;` (even on the next
-                    # line) so its trailing comment is masked too.
+                    # statement) or consume a trailing `;` or `,` (even on the
+                    # next line) so its trailing comment is masked too.
                     k = j
-                    while k < n and code[k].isspace():
+                    while k < n and _is_rust_ws(code[k]):
                         k += 1
                     if is_const_block and k < n and (
                         code[k] == "?"
@@ -572,7 +580,7 @@ def _test_item_spans(code):
                         seen_top_brace = False
                         j = k + 1
                         continue
-                    if k < n and code[k] == ";":
+                    if k < n and (code[k] == ";" or (is_const_block and code[k] == ",")):
                         end = k + 1
                     else:
                         end = j
@@ -622,7 +630,7 @@ def _extend_trailing_comment_spans(code_text, comm_text, spans):
         c_end = end
         j = end
         while j < n:
-            while j < n and code_text[j] in " \t" and comm_text[j] == " ":
+            while j < n and code_text[j] in (" ", "\t", "\u200e", "\u200f") and comm_text[j] == " ":
                 j += 1
             if j in comment_by_start:
                 tok_end = comment_by_start[j]
