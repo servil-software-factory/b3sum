@@ -853,8 +853,11 @@ class CommandLine(Repository):
             def __exit__(self, *_):
                 return False
 
-            def read(self):
-                return b"bytes"
+            def __init__(self):
+                self._buf = io.BytesIO(b"bytes")
+
+            def read(self, n=-1):
+                return self._buf.read(n)
 
         def urlopen(request, timeout):
             sent[request.full_url] = request.get_header("Authorization")
@@ -1194,6 +1197,31 @@ class StandaloneB3sum(unittest.TestCase):
             with open(crate_path, "rb") as f:
                 second_bytes = f.read()
             self.assertEqual(first_bytes, second_bytes)
+
+    def test_bounded_reads_and_crate_expansion_cap(self):
+        # _read_bounded accepts payloads up to the limit and rejects oversized streams.
+        self.assertEqual(ra._read_bounded(io.BytesIO(b"abcd"), 4, "exact"), b"abcd")
+        with self.assertRaisesRegex(ValueError, "exceeds maximum allowed size"):
+            ra._read_bounded(io.BytesIO(b"abcde"), 4, "too-big")
+
+        # Oversized .crate archive expansion is rejected without allocating the whole payload.
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=buf, mode="w:gz") as tf:
+            payload = b"A" * 1024
+            info = tarfile.TarInfo("b3sums-0.11.0/big.bin")
+            info.size = len(payload)
+            tf.addfile(info, io.BytesIO(payload))
+        probs = ra.crate_problems(buf.getvalue(), None, max_uncompressed_bytes=512)
+        self.assertTrue(any("exceeding maximum (512 bytes)" in p for p in probs), probs)
+
+        # check() stores only digest pairs in `seen` (verified via digest_problems tuple path).
+        data = b"artifact-bytes"
+        digests = ra._artifact_digests(data)
+        sha_line = f"{digests[0]}  sample.bin\n".encode()
+        b3_line = f"{digests[1]}  sample.bin\n".encode()
+        self.assertEqual(ra.digest_problems("sample.bin.sha256", sha_line, {"sample.bin": digests}), [])
+        self.assertEqual(ra.digest_problems("sample.bin.b3", b3_line, {"sample.bin": digests}), [])
+        self.assertTrue(ra.digest_problems("sample.bin.sha256", b"00  sample.bin\n", {"sample.bin": digests}))
 
 
 if __name__ == "__main__":
