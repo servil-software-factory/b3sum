@@ -119,6 +119,7 @@ fn test_filepath_to_string() {
     blake3::initialize();
     let output = crate::filepath_to_string(Path::new("foo"));
     assert_eq!(output.filepath_string, "foo");
+    assert!(matches!(output.filepath_string, std::borrow::Cow::Borrowed("foo")));
     assert!(!output.is_escaped);
 
     let output = crate::filepath_to_string(Path::new("f\\ \t\r\noo"));

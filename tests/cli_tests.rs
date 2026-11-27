@@ -1800,12 +1800,18 @@ fn test_terminal_stdout_flushes_before_opening_blocked_fifo() {
     let x1 = hex(&xof1);
     let x2 = hex(&xof2);
 
+    let out_dir = dir.path().join("outboards");
+    fs::create_dir(&out_dir).unwrap();
+    fs::write(dir.path().join("manifest.b3"), format!("{h1}  first.txt\n{h2}  gate.fifo\n")).unwrap();
+
     let cases: &[(&[&str], String, String)] = &[
         (&["--num-threads", "1", "first.txt", "gate.fifo"], format!("{h1}  first.txt"), format!("{h2}  gate.fifo")),
         (&["first.txt", "gate.fifo"], format!("{h1}  first.txt"), format!("{h2}  gate.fifo")),
         (&["--tag", "first.txt", "gate.fifo"], format!("BLAKE3 (first.txt) = {h1}"), format!("BLAKE3 (gate.fifo) = {h2}")),
         (&["--no-names", "first.txt", "gate.fifo"], h1.clone(), h2.clone()),
         (&["--length", "64", "first.txt", "gate.fifo"], format!("{x1}  first.txt"), format!("{x2}  gate.fifo")),
+        (&["--outboard", "outboards", "first.txt", "gate.fifo"], format!("{h1}  first.txt"), format!("{h2}  gate.fifo")),
+        (&["--check", "manifest.b3"], "first.txt: OK".to_string(), "gate.fifo: OK".to_string()),
     ];
 
     for (cli_args, want1, want2) in cases {
