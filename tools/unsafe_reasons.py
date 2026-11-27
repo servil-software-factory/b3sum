@@ -685,10 +685,14 @@ def _macro_call_end(code, bang_end):
     return j
 
 
+_ATTR_PREFIX = r"(?:#\[[^\]]*\]\s*)*"
+_ITEM_QUAL = r"(?:pub(?:\s*\([^)]*\))?\s+)?(?:(?:default|const|async|unsafe)\s+|extern\s+(?:\"[^\"]*\"\s+)?)*"
 _ITEM_BOUNDARY_RE = re.compile(
-    r"^\s*(?:pub(?:\s*\([^)]*\))?\s+)?(?:(?:const|async|unsafe)\s+|extern\s+(?:\"[^\"]*\"\s+)?)*(?:fn|impl|mod|struct|enum|trait|type|static)\b"
+    rf"^\s*{_ATTR_PREFIX}{_ITEM_QUAL}(?:(?:fn|impl|mod|struct|enum|trait|type|static)\b|const\s+[A-Za-z_]\w*\s*:)"
 )
-_UNSAFE_IMPL_LINE_RE = re.compile(r"^\s*unsafe\s+impl\b")
+_UNSAFE_IMPL_FOR_RE = re.compile(
+    rf"^\s*{_ATTR_PREFIX}unsafe\s+impl\b.*?\bfor\s+([A-Za-z_][A-Za-z0-9_:<>,\s'\"]*?)(?:\s+where\b|\s*\{{|$)"
+)
 
 
 def without_reason(text):
@@ -709,20 +713,42 @@ def without_reason(text):
         if idx in seen_lines:
             continue
         seen_lines.add(idx)
-        cur_is_unsafe_impl = bool(_UNSAFE_IMPL_LINE_RE.match(masked_lines[idx]))
+        cur_line = masked_lines[idx]
+        cur_impl = _UNSAFE_IMPL_FOR_RE.match(cur_line)
+        cur_opens_non_impl_item = bool(_ITEM_BOUNDARY_RE.match(cur_line)) and not cur_impl
         ok = False
         lo = max(0, idx - REACH)
         for ln in range(idx, lo - 1, -1):
             if ln in sound_lines:
                 ok = True
                 break
-            if ln < idx:
-                ml = masked_lines[ln]
-                if ml.startswith("}"):
+            ml = masked_lines[ln]
+            if ln == idx:
+                # If the unsafe site sits directly on a one-line fn/const/etc.
+                # item line (e.g. `fn g() { unsafe { *q } }`), only a `Sound:`
+                # comment immediately above that item (skipping blank lines and
+                # attributes only) may clear it — never cross preceding code.
+                if cur_opens_non_impl_item:
+                    for above in range(idx - 1, lo - 1, -1):
+                        if above in sound_lines:
+                            ok = True
+                            break
+                        aml = masked_lines[above].strip()
+                        if aml and not aml.startswith("#["):
+                            break
                     break
-                if _ITEM_BOUNDARY_RE.match(ml):
-                    if not (cur_is_unsafe_impl and _UNSAFE_IMPL_LINE_RE.match(ml)):
-                        break
+                continue
+            if ml.startswith("}"):
+                break
+            if _ITEM_BOUNDARY_RE.match(ml):
+                # Adjacent `unsafe impl Send` / `unsafe impl Sync` lines for the
+                # SAME target type share one `// Sound:` comment right above;
+                # every other item/function boundary stops rationale attachment.
+                if cur_impl:
+                    prev_impl = _UNSAFE_IMPL_FOR_RE.match(ml)
+                    if prev_impl and prev_impl.group(1).strip() == cur_impl.group(1).strip():
+                        continue
+                break
         if not ok:
             found.append((idx + 1, raw_lines[idx].strip()))
     return found
