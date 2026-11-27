@@ -777,7 +777,7 @@ impl ColdRingState {
 
             let n = cqe.res as usize;
             // The file's end is where a read gives no byte, and nowhere
-            // its size said (b3sum/README.md, "What b3sum reads").
+            // its size said (README.md, "What b3sum reads").
             if n == 0 {
                 drop(st.file);
                 self.free_slot_ids.push(slot_id);

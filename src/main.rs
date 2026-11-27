@@ -200,7 +200,7 @@ impl Args {
     /// The map of `file`, unless `--no-mmap` asked for none or the file
     /// cannot be mapped: the one place b3sum maps a file to hash it. A
     /// mapped file must not be modified in place while being hashed (see
-    /// `b3sum/README.md`; pass `--no-mmap` for live or untrusted files). A
+    /// `README.md`; pass `--no-mmap` for live or untrusted files). A
     /// shortened file stops the process when its lost pages are read
     /// (`explain_sigbus`). (BLAKE3 #432: the option was accepted and did
     /// nothing.)
