@@ -36,7 +36,7 @@ mod mmap;
 #[cfg(test)]
 #[path = "test_temp.rs"]
 mod tempfile;
-use args::{ParseOutcome, ParsedArgs as Inner};
+use args::{Command, KeyMode, ParseOutcome};
 use std::cmp;
 use std::fs::File;
 use std::io;
@@ -76,16 +76,18 @@ macro_rules! eprintln_safe {
 }
 
 struct Args {
-    inner: Inner,
     file_args: Vec<PathBuf>,
+    command: Command,
+    num_threads: Option<std::num::NonZeroUsize>,
+    no_mmap: bool,
     mode: blake3::Mode<'static>,
     base_hasher: blake3::convenience::Hasher,
 }
 
 impl Args {
     fn parse() -> err::Result<Self> {
-        let inner = match args::parse_from(std::env::args_os()) {
-            Ok(ParseOutcome::Parsed(inner)) => inner,
+        let parsed = match args::parse_from(std::env::args_os()) {
+            Ok(ParseOutcome::Parsed(parsed)) => parsed,
             Ok(ParseOutcome::Help) => {
                 let mut stdout = io::stdout().lock();
                 if let Err(e) = stdout.write_all(args::HELP_TEXT.as_bytes()).and_then(|()| stdout.flush()) {
@@ -109,92 +111,100 @@ impl Args {
                 std::process::exit(2);
             }
         };
-        let file_args = if !inner.file.is_empty() { inner.file.clone() } else { vec!["-".into()] };
-        if inner.raw && file_args.len() > 1 {
-            bail!("Only one filename can be provided when using --raw");
-        }
-        // BLAKE3's output is 2^64 - 1 bytes long. A request past its end
-        // was a panic for text, and for --raw fewer bytes than asked for,
-        // with success.
-        if inner.seek.checked_add(inner.length).is_none() {
-            bail!("--seek {} and --length {} ask for output past its end, at 2^64 - 1 bytes", inner.seek, inner.length);
+        let file_args = parsed.files;
+        if let Command::Hash { raw, seek, length, .. } = parsed.command {
+            if raw && file_args.len() > 1 {
+                bail!("Only one filename can be provided when using --raw");
+            }
+            // BLAKE3's output is 2^64 - 1 bytes long. A request past its end
+            // was a panic for text, and for --raw fewer bytes than asked for,
+            // with success.
+            if seek.checked_add(length).is_none() {
+                bail!("--seek {} and --length {} ask for output past its end, at 2^64 - 1 bytes", seek, length);
+            }
         }
         // Crash-only: leak the single key or context string once for `'static` Mode.
-        let mode: blake3::Mode<'static> = if inner.keyed {
-            let key: &'static [u8; blake3::KEY_LEN] = Box::leak(Box::new(read_key_from_stdin()?));
-            blake3::Mode::Keyed(key)
-        } else if let Some(ref context) = inner.derive_key {
-            let ctx: &'static str = Box::leak(context.clone().into_boxed_str());
-            blake3::Mode::DeriveKey(ctx)
-        } else {
-            blake3::Mode::Plain
+        let mode: blake3::Mode<'static> = match parsed.key_mode {
+            KeyMode::Keyed => {
+                let key: &'static [u8; blake3::KEY_LEN] = Box::leak(Box::new(read_key_from_stdin()?));
+                blake3::Mode::Keyed(key)
+            }
+            KeyMode::DeriveKey(context) => {
+                let ctx: &'static str = Box::leak(context.into_boxed_str());
+                blake3::Mode::DeriveKey(ctx)
+            }
+            KeyMode::Plain => blake3::Mode::Plain,
         };
         let base_hasher = blake3::convenience::Hasher::new(mode, None);
-        Ok(Self { inner, file_args, mode, base_hasher })
+        Ok(Self { file_args, command: parsed.command, num_threads: parsed.num_threads, no_mmap: parsed.no_mmap, mode, base_hasher })
     }
 
     #[cfg(test)]
     pub(crate) fn for_test_plain(file_args: Vec<PathBuf>) -> Self {
-        let inner = Inner {
-            file: file_args.clone(),
-            keyed: false,
-            derive_key: None,
-            length: blake3::OUT_LEN as u64,
-            seek: 0,
+        Self {
+            file_args,
+            command: Command::Hash { length: blake3::OUT_LEN as u64, seek: 0, raw: false, tag: false, no_names: false },
             num_threads: None,
             no_mmap: false,
-            no_names: false,
-            raw: false,
-            tag: false,
-            check: false,
-            quiet: false,
-            outboard: None,
-        };
-        Self { inner, file_args, mode: blake3::Mode::Plain, base_hasher: blake3::convenience::Hasher::new(blake3::Mode::Plain, None) }
+            mode: blake3::Mode::Plain,
+            base_hasher: blake3::convenience::Hasher::new(blake3::Mode::Plain, None),
+        }
     }
 
     #[cfg(test)]
     pub(crate) fn for_test_plain_threads(file_args: Vec<PathBuf>, num_threads: usize) -> Self {
         let mut args = Self::for_test_plain(file_args);
-        args.inner.num_threads = std::num::NonZeroUsize::new(num_threads);
+        args.num_threads = std::num::NonZeroUsize::new(num_threads);
         args
     }
 
     #[inline(always)]
     fn is_standard_32(&self) -> bool {
-        self.inner.seek == 0 && self.inner.length <= blake3::OUT_LEN as u64
+        match self.command {
+            Command::Hash { seek, length, .. } => seek == 0 && length <= blake3::OUT_LEN as u64,
+            Command::Check { .. } | Command::Outboard { .. } => true,
+        }
     }
 
     fn num_threads(&self) -> Option<std::num::NonZeroUsize> {
-        self.inner.num_threads
+        self.num_threads
     }
 
     fn check(&self) -> bool {
-        self.inner.check
+        matches!(self.command, Command::Check { .. })
     }
 
     fn outboard(&self) -> Option<&Path> {
-        self.inner.outboard.as_deref()
+        match &self.command {
+            Command::Outboard { dir, .. } => Some(dir.as_path()),
+            _ => None,
+        }
     }
 
     fn raw(&self) -> bool {
-        self.inner.raw
+        matches!(self.command, Command::Hash { raw: true, .. })
     }
 
     fn tag(&self) -> bool {
-        self.inner.tag
+        matches!(self.command, Command::Hash { tag: true, .. } | Command::Outboard { tag: true, .. })
     }
 
     fn no_names(&self) -> bool {
-        self.inner.no_names
+        matches!(self.command, Command::Hash { no_names: true, .. } | Command::Outboard { no_names: true, .. })
     }
 
     fn len(&self) -> u64 {
-        self.inner.length
+        match self.command {
+            Command::Hash { length, .. } => length,
+            Command::Check { .. } | Command::Outboard { .. } => blake3::OUT_LEN as u64,
+        }
     }
 
     fn seek(&self) -> u64 {
-        self.inner.seek
+        match self.command {
+            Command::Hash { seek, .. } => seek,
+            Command::Check { .. } | Command::Outboard { .. } => 0,
+        }
     }
 
     /// The map of `file`, unless `--no-mmap` asked for none or the file
@@ -205,7 +215,7 @@ impl Args {
     /// (`explain_sigbus`). (BLAKE3 #432: the option was accepted and did
     /// nothing.)
     pub(crate) fn map(&self, file: &impl std::os::fd::AsRawFd) -> Option<mmap::Mmap> {
-        if self.inner.no_mmap {
+        if self.no_mmap {
             return None;
         }
         #[cfg(test)]
@@ -217,11 +227,11 @@ impl Args {
     }
 
     fn keyed(&self) -> bool {
-        self.inner.keyed
+        matches!(self.mode, blake3::Mode::Keyed(_))
     }
 
     fn quiet(&self) -> bool {
-        self.inner.quiet
+        matches!(self.command, Command::Check { quiet: true })
     }
 }
 
@@ -2235,7 +2245,7 @@ fn main() -> err::Result<()> {
 #[cfg(test)]
 mod test {
     include!("../tools/require_nextest.rs");
-    use crate::args::{ParseOutcome, parse_from};
+    use crate::args::{Command, ParseOutcome, parse_from};
 
     #[test]
     fn test_args_basics_and_conflicts() {
@@ -2248,10 +2258,9 @@ mod test {
         let Ok(ParseOutcome::Parsed(p)) = parse_from(["b3sum", "-l64", "--seek=8", "--num-threads", "2", "--", "-weird"]) else {
             panic!("expected parsed");
         };
-        assert_eq!(p.length, 64);
-        assert_eq!(p.seek, 8);
+        assert_eq!(p.command, Command::Hash { length: 64, seek: 8, raw: false, tag: false, no_names: false });
         assert_eq!(p.num_threads.unwrap().get(), 2);
-        assert_eq!(p.file, vec![std::path::PathBuf::from("-weird")]);
+        assert_eq!(p.files, vec![std::path::PathBuf::from("-weird")]);
 
         // Conflicts & requirements
         assert!(parse_from(["b3sum", "--keyed"]).is_err());

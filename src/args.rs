@@ -37,21 +37,30 @@ More information: README.md at
 https://github.com/servil-software-factory/b3sum/blob/main/README.md
 ";
 
+/// Validated cryptographic mode chosen at the CLI boundary (L1).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum KeyMode {
+    Plain,
+    Keyed,
+    DeriveKey(String),
+}
+
+/// Validated mutually-exclusive CLI subcommand and its mode-specific options (L1).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Command {
+    Hash { length: u64, seek: u64, raw: bool, tag: bool, no_names: bool },
+    Check { quiet: bool },
+    Outboard { dir: PathBuf, tag: bool, no_names: bool },
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct ParsedArgs {
-    pub(crate) file: Vec<PathBuf>,
-    pub(crate) keyed: bool,
-    pub(crate) derive_key: Option<String>,
-    pub(crate) length: u64,
-    pub(crate) seek: u64,
+    /// Non-empty normalized operand list (defaults to `["-"]` when omitted).
+    pub(crate) files: Vec<PathBuf>,
+    pub(crate) key_mode: KeyMode,
+    pub(crate) command: Command,
     pub(crate) num_threads: Option<std::num::NonZeroUsize>,
     pub(crate) no_mmap: bool,
-    pub(crate) no_names: bool,
-    pub(crate) raw: bool,
-    pub(crate) tag: bool,
-    pub(crate) check: bool,
-    pub(crate) quiet: bool,
-    pub(crate) outboard: Option<PathBuf>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -105,6 +114,20 @@ fn push_positional(file: &mut Vec<PathBuf>, arg: OsString) -> Result<(), String>
     Ok(())
 }
 
+/// Shared value consumer for both `--long` options and short `-l` (L1).
+fn take_flag_val(flag: &str, inline: Option<OsString>, it: &mut dyn Iterator<Item = OsString>) -> Result<OsString, String> {
+    match inline {
+        Some(v) => Ok(v),
+        None => {
+            let v = it.next().ok_or_else(|| format!("a value is required for '{flag}' but none was supplied"))?;
+            if is_option_like(&v) {
+                return Err(format!("a value is required for '{flag}' but none was supplied (found '{}')", v.to_string_lossy()));
+            }
+            Ok(v)
+        }
+    }
+}
+
 pub(crate) fn parse_from<I, T>(iter: I) -> Result<ParseOutcome, String>
 where
     I: IntoIterator<Item = T>,
@@ -153,18 +176,6 @@ where
                 (s.to_owned(), None)
             };
 
-            let take_val = |flag: &str, inline: Option<OsString>, it: &mut dyn Iterator<Item = OsString>| -> Result<OsString, String> {
-                match inline {
-                    Some(v) => Ok(v),
-                    None => {
-                        let v = it.next().ok_or_else(|| format!("a value is required for '{flag}' but none was supplied"))?;
-                        if is_option_like(&v) {
-                            return Err(format!("a value is required for '{flag}' but none was supplied (found '{}')", v.to_string_lossy()));
-                        }
-                        Ok(v)
-                    }
-                }
-            };
             let reject_val = |flag: &str, inline: &Option<OsString>| -> Result<(), String> {
                 if inline.is_some() { Err(format!("unexpected value for '{flag}'")) } else { Ok(()) }
             };
@@ -185,22 +196,22 @@ where
                 }
                 "--derive-key" => {
                     reject_duplicate("--derive-key", derive_key.is_some())?;
-                    let v = take_val("--derive-key", inline_val, &mut it)?;
+                    let v = take_flag_val("--derive-key", inline_val, &mut it)?;
                     derive_key = Some(require_utf8("--derive-key", &v)?);
                 }
                 "--length" => {
                     reject_duplicate("--length", length.is_some())?;
-                    let v = take_val("--length", inline_val, &mut it)?;
+                    let v = take_flag_val("--length", inline_val, &mut it)?;
                     length = Some(parse_u64("--length", &v)?);
                 }
                 "--seek" => {
                     reject_duplicate("--seek", seek.is_some())?;
-                    let v = take_val("--seek", inline_val, &mut it)?;
+                    let v = take_flag_val("--seek", inline_val, &mut it)?;
                     seek = Some(parse_u64("--seek", &v)?);
                 }
                 "--num-threads" => {
                     reject_duplicate("--num-threads", num_threads.is_some())?;
-                    let v = take_val("--num-threads", inline_val, &mut it)?;
+                    let v = take_flag_val("--num-threads", inline_val, &mut it)?;
                     num_threads = Some(parse_nonzero_usize("--num-threads", &v)?);
                 }
                 "--no-mmap" => {
@@ -235,7 +246,7 @@ where
                 }
                 "--outboard" => {
                     reject_duplicate("--outboard", outboard.is_some())?;
-                    let v = take_val("--outboard", inline_val, &mut it)?;
+                    let v = take_flag_val("--outboard", inline_val, &mut it)?;
                     if v.is_empty() {
                         return Err("a value is required for '--outboard <DIR>' but none was supplied".to_owned());
                     }
@@ -262,15 +273,8 @@ where
                     'l' => {
                         reject_duplicate("--length", length.is_some())?;
                         let rest = &s[1 + idx + ch.len_utf8()..];
-                        let val_os = if !rest.is_empty() {
-                            OsString::from(rest.strip_prefix('=').unwrap_or(rest))
-                        } else {
-                            let v = it.next().ok_or_else(|| "a value is required for '--length <LEN>' but none was supplied".to_owned())?;
-                            if is_option_like(&v) {
-                                return Err(format!("a value is required for '--length <LEN>' but none was supplied (found '{}')", v.to_string_lossy()));
-                            }
-                            v
-                        };
+                        let inline = if !rest.is_empty() { Some(OsString::from(rest.strip_prefix('=').unwrap_or(rest))) } else { None };
+                        let val_os = take_flag_val("--length <LEN>", inline, &mut it)?;
                         length = Some(parse_u64("--length", &val_os)?);
                         break;
                     }
@@ -322,21 +326,23 @@ where
         }
     }
 
-    Ok(ParseOutcome::Parsed(ParsedArgs {
-        file,
-        keyed,
-        derive_key,
-        length: length.unwrap_or(blake3::OUT_LEN as u64),
-        seek: seek.unwrap_or(0),
-        num_threads,
-        no_mmap,
-        no_names,
-        raw,
-        tag,
-        check,
-        quiet,
-        outboard,
-    }))
+    let files = if file.is_empty() { vec![PathBuf::from("-")] } else { file };
+    let key_mode = if keyed {
+        KeyMode::Keyed
+    } else if let Some(ctx) = derive_key {
+        KeyMode::DeriveKey(ctx)
+    } else {
+        KeyMode::Plain
+    };
+    let command = if check {
+        Command::Check { quiet }
+    } else if let Some(dir) = outboard {
+        Command::Outboard { dir, tag, no_names }
+    } else {
+        Command::Hash { length: length.unwrap_or(blake3::OUT_LEN as u64), seek: seek.unwrap_or(0), raw, tag, no_names }
+    };
+
+    Ok(ParseOutcome::Parsed(ParsedArgs { files, key_mode, command, num_threads, no_mmap }))
 }
 
 #[cfg(test)]

@@ -205,7 +205,7 @@ fn test_no_mmap_maps_no_file() {
     let mut args = crate::Args::for_test_plain(paths.clone());
     let mapped = run(&args);
     assert!(mapped.iter().all(|&n| n >= 1), "without the option each path maps: {mapped:?}");
-    args.inner.no_mmap = true;
+    args.no_mmap = true;
     assert_eq!(run(&args), [0; 4]);
 }
 
@@ -376,10 +376,11 @@ fn cloning_ptmx_is_not_classified_as_stream_alias() {
 fn record_oriented_sockets_and_packet_pipes_are_rejected() {
     blake3::initialize();
     use std::os::fd::FromRawFd;
-    // SOCK_STREAM must be accepted.
+    // SOCK_STREAM must be accepted (assert socketpair succeeds on supported Unix targets; L10).
     let mut sv = [-1 as libc::c_int; 2];
     // Sound: `sv` is a valid 2-element stack array.
-    if unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, sv.as_mut_ptr()) } == 0 {
+    assert_eq!(unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, sv.as_mut_ptr()) }, 0, "socketpair(AF_UNIX, SOCK_STREAM) failed");
+    {
         let _a = unsafe { std::os::fd::OwnedFd::from_raw_fd(sv[0]) };
         let _b = unsafe { std::os::fd::OwnedFd::from_raw_fd(sv[1]) };
         let meta = crate::file_end::fstat_fd(sv[0]).unwrap();
@@ -387,7 +388,8 @@ fn record_oriented_sockets_and_packet_pipes_are_rejected() {
     }
     // SOCK_DGRAM (and on Linux SOCK_SEQPACKET) must be rejected cleanly.
     let mut dv = [-1 as libc::c_int; 2];
-    if unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_DGRAM, 0, dv.as_mut_ptr()) } == 0 {
+    assert_eq!(unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_DGRAM, 0, dv.as_mut_ptr()) }, 0, "socketpair(AF_UNIX, SOCK_DGRAM) failed");
+    {
         let _a = unsafe { std::os::fd::OwnedFd::from_raw_fd(dv[0]) };
         let _b = unsafe { std::os::fd::OwnedFd::from_raw_fd(dv[1]) };
         let meta = crate::file_end::fstat_fd(dv[0]).unwrap();
@@ -396,12 +398,11 @@ fn record_oriented_sockets_and_packet_pipes_are_rejected() {
     #[cfg(target_os = "linux")]
     {
         let mut qv = [-1 as libc::c_int; 2];
-        if unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_SEQPACKET, 0, qv.as_mut_ptr()) } == 0 {
-            let _a = unsafe { std::os::fd::OwnedFd::from_raw_fd(qv[0]) };
-            let _b = unsafe { std::os::fd::OwnedFd::from_raw_fd(qv[1]) };
-            let meta = crate::file_end::fstat_fd(qv[0]).unwrap();
-            assert!(crate::file_end::ensure_byte_stream_fd(qv[0], meta.mode_type).is_err());
-        }
+        assert_eq!(unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_SEQPACKET, 0, qv.as_mut_ptr()) }, 0, "socketpair(AF_UNIX, SOCK_SEQPACKET) failed");
+        let _a = unsafe { std::os::fd::OwnedFd::from_raw_fd(qv[0]) };
+        let _b = unsafe { std::os::fd::OwnedFd::from_raw_fd(qv[1]) };
+        let meta = crate::file_end::fstat_fd(qv[0]).unwrap();
+        assert!(crate::file_end::ensure_byte_stream_fd(qv[0], meta.mode_type).is_err());
         // Linux packet-mode pipe (`pipe2(O_DIRECT)`): a full 4096-byte packet must
         // be read completely by streaming `outboard_from_reader` (not truncated at 32 bytes).
         let mut pv = [-1 as libc::c_int; 2];
@@ -547,11 +548,7 @@ fn multi_file_path_triggers_numa_confinement_once() {
 #[test]
 fn num_threads_one_skips_confinement() {
     blake3::initialize();
-    let crate::args::ParseOutcome::Parsed(raw) = crate::args::parse_from(["b3sum", "--num-threads", "1", "a"]).unwrap() else {
-        panic!("expected parsed");
-    };
-    let args =
-        crate::Args { inner: raw, mode: blake3::Mode::Plain, base_hasher: blake3::convenience::Hasher::new(blake3::Mode::Plain, None), file_args: Vec::new() };
+    let args = crate::Args::for_test_plain_threads(Vec::new(), 1);
     crate::configure_threads(&args);
     assert_eq!(crate::threads().get(), 1);
     #[cfg(target_os = "linux")]
@@ -561,11 +558,7 @@ fn num_threads_one_skips_confinement() {
 #[test]
 fn num_threads_two_confines_eagerly() {
     blake3::initialize();
-    let crate::args::ParseOutcome::Parsed(raw) = crate::args::parse_from(["b3sum", "--num-threads", "2", "a"]).unwrap() else {
-        panic!("expected parsed");
-    };
-    let args =
-        crate::Args { inner: raw, mode: blake3::Mode::Plain, base_hasher: blake3::convenience::Hasher::new(blake3::Mode::Plain, None), file_args: Vec::new() };
+    let args = crate::Args::for_test_plain_threads(Vec::new(), 2);
     crate::configure_threads(&args);
     assert_eq!(crate::threads().get(), 2);
     #[cfg(target_os = "linux")]
@@ -739,11 +732,7 @@ fn hash_open_file_ex_streams_full_file_when_file_grows_during_direct_read() {
         return;
     }
 
-    let crate::args::ParseOutcome::Parsed(raw) = crate::args::parse_from(["b3sum", "--num-threads", "2", "a"]).unwrap() else {
-        panic!("expected parsed");
-    };
-    let args =
-        crate::Args { inner: raw, mode: blake3::Mode::Plain, base_hasher: blake3::convenience::Hasher::new(blake3::Mode::Plain, None), file_args: Vec::new() };
+    let args = crate::Args::for_test_plain_threads(Vec::new(), 2);
     crate::configure_threads(&args);
     let file = std::fs::File::open(&path).unwrap();
 

@@ -89,6 +89,41 @@ pub(crate) fn hash_single_cold_large_file_1t(args: &Args, file: &File, hint_size
     out
 }
 
+/// Count numeric file descriptors currently open below `nofile_cap` via
+/// `/proc/self/fd` (excluding the directory FD held by `read_dir` itself), so
+/// worker/ring descriptor budgets account for inherited open FDs without
+/// letting FDs above a lowered soft limit throttle capacity (M28). Returns
+/// `None` if `/proc/self/fd` is unavailable or yields an incomplete census.
+fn count_open_fds_below(nofile_cap: usize) -> Option<usize> {
+    let entries = std::fs::read_dir("/proc/self/fd").ok()?;
+    let mut below = 0usize;
+    for entry in entries {
+        let entry = entry.ok()?;
+        let name = entry.file_name();
+        if let Some(fd) = name.to_str().and_then(|s| s.parse::<usize>().ok())
+            && fd < nofile_cap
+        {
+            below += 1;
+        }
+    }
+    // `read_dir` itself opened one FD below `nofile_cap` to enumerate the dir.
+    Some(below.saturating_sub(1))
+}
+
+/// Size multi-file I/O worker count and per-ring slot depth from the effective
+/// `RLIMIT_NOFILE` cap and live open-FD count below that cap (M28). Falls back
+/// conservatively to `(1, 1)` when the live FD census is unknown so workers
+/// cannot starve one another with `EMFILE`.
+fn size_ring_workers(nofile_cap: usize, open_fds: Option<usize>, desired_io_threads: usize, desired_slots: usize) -> (usize, usize) {
+    let Some(open_fds) = open_fds else {
+        return (1, 1);
+    };
+    let usable_fds = nofile_cap.saturating_sub(open_fds.saturating_add(3));
+    let io_threads = if usable_fds < 16 { 1 } else { desired_io_threads.min((usable_fds / 4).max(1)) };
+    let slots_per_ring = desired_slots.min((usable_fds / io_threads).saturating_sub(1).max(1));
+    (io_threads, slots_per_ring)
+}
+
 /// Pre-grow the kernel file-descriptor table while single-threaded, raising
 /// `RLIMIT_NOFILE` up to `rlim_max` where needed and clamping to `rlim_cur - 1`
 /// so `dup2` never fails with `EBADF` when `want > 1024`. Returns the
@@ -896,12 +931,11 @@ fn hash_paths_inner(
     let desired_slots = if desired_io_threads <= 4 { SLOTS_PER_RING_SINGLE } else { SLOTS_PER_RING_MULTI };
 
     let nofile_cap = grow_descriptor_table(desired_io_threads * (desired_slots + 8) + 64);
-    // Keep cross-worker descriptor usage within `RLIMIT_NOFILE`: reserve 6 fds
-    // for stdio/ring/misc, collapse to 1 reader when tight so EMFILE draining
-    // always reclaims its own queued slots, and cap per-ring slots accordingly.
-    let usable_fds = nofile_cap.saturating_sub(6);
-    let io_threads = if usable_fds < 16 { 1 } else { desired_io_threads.min((usable_fds / 4).max(1)) };
-    let slots_per_ring = desired_slots.min((usable_fds / io_threads).saturating_sub(1).max(1));
+    // Keep cross-worker descriptor usage within `RLIMIT_NOFILE`: count actually
+    // open inherited FDs below `nofile_cap` (M28) plus 3 spares for ring/misc,
+    // collapsing to `(1, 1)` if the census is unavailable or to 1 reader when
+    // free slots are tight so EMFILE draining always reclaims its own slots.
+    let (io_threads, slots_per_ring) = size_ring_workers(nofile_cap, count_open_fds_below(nofile_cap), desired_io_threads, desired_slots);
 
     let _file_threads_guard = args.num_threads().map(|_| crate::FileThreadsGuard::enter(io_threads));
 
@@ -2291,5 +2325,17 @@ mod test {
             "zero additional operands may be claimed after next.fetch_max(nfiles) closes the queue (claimed {claimed}, at_close {at_close}; M26)"
         );
         assert!(claimed <= 8, "only initial in-flight worker opens should occur before close (claimed {claimed})");
+    }
+
+    #[test]
+    fn size_ring_workers_accounts_for_inherited_fds_and_unknown_census() {
+        // At RLIMIT_NOFILE=24 with 10 inherited open FDs, only 11 usable FDs
+        // remain (< 16), so sizing collapses to 1 reader (the old `24 - 6 = 18`
+        // formula would have spawned 4 readers and raced on EMFILE; M28).
+        assert_eq!(super::size_ring_workers(24, Some(10), 4, 32), (1, 10));
+        // Unknown census (procfs unavailable / incomplete) falls back to (1, 1).
+        assert_eq!(super::size_ring_workers(64, None, 4, 32), (1, 1));
+        // Generous free budget keeps desired concurrency.
+        assert_eq!(super::size_ring_workers(128, Some(4), 4, 32), (4, 29));
     }
 }
