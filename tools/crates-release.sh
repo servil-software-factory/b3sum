@@ -47,13 +47,16 @@ elif [ "${RELEASE_ANY_COMMIT:-${B3SUM_RELEASE_ANY_COMMIT:-}}" != 1 ]; then
 	echo "crates-release: HEAD is no version commit (version X.Y.Z+<parent commit>)" >&2
 	exit 1
 fi
-have="rustc $(rustc -V | cut -d' ' -f2)"
+# Query rustc and its sysroot inside the staged checkout (outside the caller's
+# directory) so a caller-only rustup directory override cannot select the wrong
+# toolchain or reject a valid candidate.
+have=$(cd "$stage/checkout" && echo "rustc $(rustc -V | cut -d' ' -f2)")
 want=$(grep '^rustc ' "$stage/checkout/tools/b3sum-release.toolchain")
 if [ "$have" != "$want" ]; then
 	echo "crates-release: this machine has $have, and tools/b3sum-release.toolchain names $want: a release's crate is packaged with exactly that" >&2
 	exit 1
 fi
-sysroot=$(rustc --print sysroot)
+sysroot=$(cd "$stage/checkout" && rustc --print sysroot)
 cargo_bin="$sysroot/bin/cargo"
 rustc_bin="$sysroot/bin/rustc"
 if [ ! -x "$cargo_bin" ] || [ ! -x "$rustc_bin" ]; then

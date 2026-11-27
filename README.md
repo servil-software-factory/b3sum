@@ -31,12 +31,13 @@ chmod +x b3sum-VERSION-TARGET
 ## Verify a Linux binary by rebuilding it
 
 The Linux release binaries are reproducible (for releases after 0.9.0). From a
-checkout of a release tag, you can rebuild them in Docker or Podman and verify
-that your build matches the published file byte for byte:
+checkout of a release tag, rebuild into `dist/` in Docker or Podman, then
+compare your rebuilt binary directly against the downloaded release binary
+(exit status `0` means byte-for-byte identical):
 
 ```sh
 docker run --rm -v "$PWD":/src -w /src "$(sed -n 's/^image //p' tools/b3sum-release.toolchain)" sh tools/b3sum-release-container.sh
-sha256sum dist/b3sum-*
+cmp /path/to/downloaded/b3sum-VERSION-TARGET dist/b3sum-VERSION-TARGET
 ```
 
 ## Build from source

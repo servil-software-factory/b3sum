@@ -195,7 +195,7 @@ fn test_no_mmap_maps_no_file() {
         });
         let many = crate::MAPPED.load(Ordering::Relaxed);
         let (mut rooms, mut nodes) = (crate::outboard::Rooms::new(), Vec::new());
-        assert_eq!(crate::outboard_of(args, &paths[0], &stdin_ctx, 1, &mut rooms, &mut nodes).unwrap(), want);
+        assert_eq!(crate::outboard_of(args, &paths[0], &stdin_ctx, Some(1), &mut rooms, &mut nodes).unwrap(), want);
         let outboard = crate::MAPPED.load(Ordering::Relaxed);
         [one - before, xof - one, many - xof, outboard - many]
     };
@@ -505,15 +505,33 @@ fn single_small_file_skips_thread_discovery_and_numa_confinement() {
     let path = dir.path().join("small_16k.bin");
     let data = vec![0x5Au8; 16 * 1024];
     std::fs::write(&path, &data).unwrap();
-    let args = crate::Args::for_test_plain(vec![path]);
     let stdin_ctx = crate::file_end::StdinContext::current();
+    // 1. Plain digest mode.
+    let args = crate::Args::for_test_plain(vec![path.clone()]);
     crate::configure_threads(&args);
     let mut out = crate::OutBuf::new();
-    let failed = crate::hash_inputs(&args, &stdin_ctx, &mut out);
-    assert_eq!(failed, 0);
+    assert_eq!(crate::hash_inputs(&args, &stdin_ctx, &mut out), 0);
     assert!(crate::THREADS.get().is_none(), "single 16 KiB file must not trigger thread discovery (#469)");
     #[cfg(target_os = "linux")]
     assert_eq!(crate::CONFINEMENT_CALLS.load(std::sync::atomic::Ordering::Relaxed), 0, "single 16 KiB file must not invoke NUMA confinement (#469)");
+    // 2. Single-file extended output (--length 64).
+    let mut xof_args = crate::Args::for_test_plain(vec![path.clone()]);
+    xof_args.command = crate::args::Command::Hash { length: 64, seek: 0, format: crate::args::OutputFormat::Text(crate::args::TextFormat::Gnu) };
+    let mut out = crate::OutBuf::new();
+    assert_eq!(crate::hash_inputs(&xof_args, &stdin_ctx, &mut out), 0);
+    assert!(crate::THREADS.get().is_none(), "single 16 KiB XOF file must not trigger thread discovery");
+    #[cfg(target_os = "linux")]
+    assert_eq!(crate::CONFINEMENT_CALLS.load(std::sync::atomic::Ordering::Relaxed), 0);
+    // 3. Single-file --outboard (<= 16 KiB group).
+    let ob_dir = dir.path().join("ob");
+    std::fs::create_dir_all(&ob_dir).unwrap();
+    let mut ob_args = crate::Args::for_test_plain(vec![path]);
+    ob_args.command = crate::args::Command::Outboard { dir: ob_dir, format: crate::args::TextFormat::Gnu };
+    let mut out = crate::OutBuf::new();
+    assert_eq!(crate::hash_inputs(&ob_args, &stdin_ctx, &mut out), 0);
+    assert!(crate::THREADS.get().is_none(), "single 16 KiB --outboard file must not trigger thread discovery");
+    #[cfg(target_os = "linux")]
+    assert_eq!(crate::CONFINEMENT_CALLS.load(std::sync::atomic::Ordering::Relaxed), 0);
     assert!(crate::threads().get() >= 1);
     #[cfg(target_os = "linux")]
     assert_eq!(crate::CONFINEMENT_CALLS.load(std::sync::atomic::Ordering::Relaxed), 1);

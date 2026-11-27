@@ -114,7 +114,7 @@ CONTROLS = [
     (
         "SIGBUS exits promptly without blocking on undrained full stderr pipe (H5)",
         "src/main.rs",
-        "            file_end::write_fatal_nonblocking(MESSAGE);",
+        "            file_end::write_fatal_best_effort(MESSAGE);",
         "            let _ = unsafe { libc::write(2, MESSAGE.as_ptr().cast(), MESSAGE.len()) };",
         "unit_tests::sigbus_exits_promptly_with_full_undrained_stderr_pipe_and_writes_when_writable",
     ),

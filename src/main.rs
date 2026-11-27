@@ -1539,11 +1539,17 @@ const OUTBOARD_WRITERS: usize = 2;
 /// The files are shared out among threads started once for the run, each
 /// with rooms of its own for a file's bytes and chaining values; where
 /// there are fewer files than threads, each file takes several. A thread
-/// hands each outboard to the writers and takes the next file. The lines
-/// are printed in the files' order, once all are done. One file is hashed
-/// and written by the caller's thread alone.
+/// hands each non-empty outboard to the writers and takes the next file.
+/// Completed results are emitted immediately in operand order via
+/// [`OrderedCollector`] (no all-operands output barrier), and one file is
+/// hashed and written directly by the caller's thread without eager thread
+/// discovery.
 fn outboard_inputs(args: &Args, dir: &Path, stdin_ctx: &StdinContext, out: &mut OutBuf) -> u64 {
-    use std::sync::{Mutex, mpsc};
+    use std::sync::{
+        Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        mpsc,
+    };
     let paths = &args.file_args;
     // Before any file is hashed: a run of short files alone would write
     // nothing, and say nothing of a directory that is not there.
@@ -1551,17 +1557,16 @@ fn outboard_inputs(args: &Args, dir: &Path, stdin_ctx: &StdinContext, out: &mut 
         eprintln_safe!("{}: {}: not a directory", NAME, dir.to_string_lossy());
         return paths.len().max(1) as u64;
     }
-    let total = threads().get();
-    // On an interactive terminal, finish writing and printing each operand
-    // before opening the next so progress appears immediately and a later FIFO
-    // cannot hold back earlier lines.
-    if out.is_line_flushed() {
+    // Single operand, interactive terminal, or repeated stdin aliases: run
+    // operands sequentially and emit each line immediately without eager
+    // thread discovery (only large files query `threads()` inside `outboard_of`).
+    if paths.len() <= 1 || out.is_line_flushed() || stdin_named_twice(paths, stdin_ctx) {
         let mut rooms = outboard::Rooms::new();
         let mut nodes = Vec::new();
         let mut failed = 0u64;
         for path in paths {
             nodes.clear();
-            let res = outboard_of(args, path, stdin_ctx, total, &mut rooms, &mut nodes).and_then(|hash| {
+            let res = outboard_of(args, path, stdin_ctx, None, &mut rooms, &mut nodes).and_then(|hash| {
                 if !nodes.is_empty() {
                     outboard::write_in(dir, &hash, &nodes)?;
                 }
@@ -1578,94 +1583,127 @@ fn outboard_inputs(args: &Args, dir: &Path, stdin_ctx: &StdinContext, out: &mut 
         }
         return failed;
     }
+    let total = threads().get();
     let max_workers = if args.num_threads().is_some() { max_file_threads(total) } else { total };
-    let workers = if stdin_named_twice(paths, stdin_ctx) { 1 } else { max_workers.min(paths.len()) };
-    let in_a_file = (total / workers.max(1)).max(1);
-    let next = std::sync::atomic::AtomicUsize::new(0);
-    let done = Mutex::new(Vec::<(usize, err::Result<blake3::Hash>)>::new());
+    let workers = max_workers.min(paths.len());
+    if workers <= 1 {
+        let mut rooms = outboard::Rooms::new();
+        let mut nodes = Vec::new();
+        let mut failed = 0u64;
+        for path in paths {
+            nodes.clear();
+            let res = outboard_of(args, path, stdin_ctx, Some(1), &mut rooms, &mut nodes).and_then(|hash| {
+                if !nodes.is_empty() {
+                    outboard::write_in(dir, &hash, &nodes)?;
+                }
+                print_hash_output(hash, path, args, out)
+            });
+            if let Err(e) = res {
+                failed = failed.saturating_add(1);
+                let _ = out.flush();
+                eprintln_safe!("{}: {}: {}", NAME, path.to_string_lossy(), e);
+                if out.is_poisoned() {
+                    break;
+                }
+            }
+        }
+        return failed;
+    }
+    let in_a_file = (total / workers).max(1);
+    let next = AtomicUsize::new(0);
+    let canceled = AtomicBool::new(false);
     // To the writers: a file's index, its hash, its outboard; no more
     // waiting than a few a writer, so that outboards are not made faster
     // than they are written. Back from them: the outboards' buffers, for
-    // the next files.
+    // the next files; and each completed `(index, result)` flows straight to
+    // the main thread's ordered emitter.
     type Made = (usize, blake3::Hash, Vec<u8>);
     let (to_writers, made) = mpsc::sync_channel::<Made>(8 * OUTBOARD_WRITERS);
     let (to_workers, spare) = mpsc::channel::<Vec<u8>>();
+    let (done_tx, done_rx) = mpsc::channel::<(usize, err::Result<blake3::Hash>)>();
     let (made, spare) = (Mutex::new(made), Mutex::new(spare));
-    let unwritten = Mutex::new(Vec::<(usize, io::Error)>::new());
-    let write = |(i, hash, nodes): Made| {
-        if let Err(e) = outboard::write_in(dir, &hash, &nodes) {
-            unwritten.lock().unwrap().push((i, e));
-        }
-        // No worker may be left to take it.
-        let _ = to_workers.send(nodes);
-    };
-    let work = |hand: &dyn Fn(Made)| {
-        let mut rooms = outboard::Rooms::new();
-        let mut mine = Vec::new();
-        let mut nodes = Vec::new();
-        loop {
-            let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let Some(path) = paths.get(i) else { break };
-            nodes.clear();
-            let hashed = outboard_of(args, path, stdin_ctx, in_a_file, &mut rooms, &mut nodes);
-            // An empty outboard (a file of one chunk group or less) is no
-            // file: there is nothing in it to read, and creating a file
-            // costs more than hashing a short one.
-            if let Ok(hash) = &hashed
-                && !nodes.is_empty()
-            {
-                hand((i, *hash, core::mem::take(&mut nodes)));
-                nodes = spare.lock().unwrap().try_recv().unwrap_or_default();
-            }
-            mine.push((i, hashed));
-        }
-        done.lock().unwrap().append(&mut mine);
-    };
-    if workers <= 1 {
-        work(&write);
-    } else {
-        std::thread::scope(|scope| {
-            for _ in 0..OUTBOARD_WRITERS {
-                scope.spawn(|| {
-                    loop {
-                        // The lock is let go before the file is written.
-                        let next = made.lock().unwrap().recv();
-                        let Ok(next) = next else { break };
-                        write(next);
-                    }
-                });
-            }
-            let work = &work;
-            for _ in 1..workers {
-                let to_writers = to_writers.clone();
-                scope.spawn(move || work(&|made| to_writers.send(made).expect("the writers run until every sender is done")));
-            }
-            work(&|made| to_writers.send(made).expect("the writers run until every sender is done"));
-            // The writers end when the channel does: when every thread's
-            // sender is gone.
-            drop(to_writers);
-        });
-    }
-    let unwritten = unwritten.into_inner().unwrap();
-    let mut results: Vec<Option<err::Result<blake3::Hash>>> = (0..paths.len()).map(|_| None).collect();
-    for (i, result) in done.into_inner().unwrap() {
-        results[i] = Some(result);
-    }
-    for (i, e) in unwritten {
-        results[i] = Some(Err(e.into()));
-    }
     let mut failed = 0u64;
-    for (path, result) in paths.iter().zip(results) {
-        let result = result.expect("every file has its result");
-        if let Err(e) = result.and_then(|hash| print_hash_output(hash, path, args, out)) {
-            failed = failed.saturating_add(1);
-            let _ = out.flush();
-            eprintln_safe!("{}: {}: {}", NAME, path.to_string_lossy(), e);
-            if out.is_poisoned() {
+    std::thread::scope(|scope| {
+        for _ in 0..OUTBOARD_WRITERS {
+            let done_tx = done_tx.clone();
+            let to_workers = to_workers.clone();
+            let made = &made;
+            let canceled = &canceled;
+            scope.spawn(move || {
+                loop {
+                    let next_item = made.lock().unwrap().recv();
+                    let Ok((i, hash, nodes)) = next_item else { break };
+                    if canceled.load(Ordering::Relaxed) {
+                        let _ = to_workers.send(nodes);
+                        continue;
+                    }
+                    let res = outboard::write_in(dir, &hash, &nodes).map(|()| hash).map_err(Into::into);
+                    let _ = to_workers.send(nodes);
+                    let _ = done_tx.send((i, res));
+                }
+            });
+        }
+        for _ in 0..workers {
+            let to_writers = to_writers.clone();
+            let done_tx = done_tx.clone();
+            let next = &next;
+            let spare = &spare;
+            let canceled = &canceled;
+            scope.spawn(move || {
+                let mut rooms = outboard::Rooms::new();
+                let mut nodes = Vec::new();
+                loop {
+                    if canceled.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(path) = paths.get(i) else { break };
+                    nodes.clear();
+                    let hashed = outboard_of(args, path, stdin_ctx, Some(in_a_file), &mut rooms, &mut nodes);
+                    if canceled.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    // An empty outboard (a file of one chunk group or less) is no
+                    // file: there is nothing in it to read, and creating a file
+                    // costs more than hashing a short one.
+                    if let Ok(hash) = &hashed
+                        && !nodes.is_empty()
+                    {
+                        let _ = to_writers.send((i, *hash, core::mem::take(&mut nodes)));
+                        nodes = spare.lock().unwrap().try_recv().unwrap_or_default();
+                    } else if done_tx.send((i, hashed)).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+        drop(to_writers);
+        drop(done_tx);
+
+        let mut collector = OrderedCollector::new(paths.len());
+        let mut on_ordered = |idx: usize, res: err::Result<blake3::Hash>| -> bool {
+            let path = &paths[idx];
+            if let Err(e) = res.and_then(|hash| print_hash_output(hash, path, args, out)) {
+                failed = failed.saturating_add(1);
+                let _ = out.flush();
+                eprintln_safe!("{}: {}: {}", NAME, path.to_string_lossy(), e);
+                if out.is_poisoned() {
+                    return false;
+                }
+            }
+            true
+        };
+        while let Ok((i, res)) = done_rx.recv() {
+            if !collector.insert_and_drain(i, res, &mut on_ordered, || {
+                canceled.store(true, Ordering::Relaxed);
+                next.fetch_max(paths.len(), Ordering::SeqCst);
+            }) {
                 break;
             }
         }
-    }
+        drop(done_rx);
+        collector.finish("outboard collector");
+    });
     failed
 }
 
@@ -1679,13 +1717,14 @@ fn outboard_of(
     args: &Args,
     path: &Path,
     stdin_ctx: &StdinContext,
-    threads: usize,
+    in_a_file: Option<usize>,
     rooms: &mut outboard::Rooms,
     nodes: &mut Vec<u8>,
 ) -> err::Result<blake3::Hash> {
     let mode = args.mode;
     let bytes = &mut rooms.bytes;
     bytes.clear();
+    let resolve_threads = || in_a_file.unwrap_or_else(|| threads().get());
     let (mut file, fd_meta) = match open_input(args, path, stdin_ctx, None, false)? {
         OpenedInput::StdinStream | OpenedInput::StdinFile(..) => {
             return Ok(outboard::outboard_from_reader(mode, &mut io::stdin().lock(), &mut rooms.cvs, nodes)?);
@@ -1696,7 +1735,7 @@ fn outboard_of(
             if meta.len >= MAP_LEN as u64
                 && let Some(map) = args.map(&file)
             {
-                let hash = outboard::outboard(mode, &map, threads, &mut rooms.cvs, nodes);
+                let hash = outboard::outboard(mode, &map, resolve_threads(), &mut rooms.cvs, nodes);
                 hold(map);
                 return Ok(hash);
             }
@@ -1706,7 +1745,8 @@ fn outboard_of(
     };
     if fd_meta.is_file() && fd_meta.len < MAP_LEN as u64 {
         if file_end::read_sequential_capped_seeded(&mut file, usize::try_from(fd_meta.len).expect("len < MAP_LEN"), MAP_LEN, bytes)? {
-            return Ok(outboard::outboard(mode, bytes, threads, &mut rooms.cvs, nodes));
+            let t = if bytes.len() <= outboard::GROUP { 1 } else { resolve_threads() };
+            return Ok(outboard::outboard(mode, bytes, t, &mut rooms.cvs, nodes));
         }
         let mut combined = io::Cursor::new(&bytes[..]).chain(&mut file);
         return Ok(outboard::outboard_from_reader(mode, &mut combined, &mut rooms.cvs, nodes)?);
@@ -1715,7 +1755,7 @@ fn outboard_of(
     let mut skip_map_after_change = false;
     #[cfg(target_os = "linux")]
     if fd_meta.is_file() {
-        match outboard::outboard_direct(mode, &file, fd_meta.len, threads, &mut rooms.piece, &mut rooms.cvs, nodes) {
+        match outboard::outboard_direct(mode, &file, fd_meta.len, resolve_threads(), &mut rooms.piece, &mut rooms.cvs, nodes) {
             Ok(hash) => return Ok(hash),
             Err(direct::Failure::Unavailable) => {}
             Err(direct::Failure::Changed) => skip_map_after_change = true,
@@ -1729,7 +1769,7 @@ fn outboard_of(
         && !skip_map_after_change
         && let Some(map) = args.map(&file)
     {
-        let hash = outboard::outboard(mode, &map, threads, &mut rooms.cvs, nodes);
+        let hash = outboard::outboard(mode, &map, resolve_threads(), &mut rooms.cvs, nodes);
         hold(map);
         return Ok(hash);
     }
@@ -1780,13 +1820,28 @@ fn hash_inputs(args: &Args, stdin_ctx: &StdinContext, out: &mut OutBuf) -> u64 {
         return failed;
     }
 
+    // Single operand or repeated stdin aliases: stream directly without
+    // triggering thread discovery or NUMA confinement for small files.
+    if args.file_args.len() <= 1 || stdin_named_twice(&args.file_args, stdin_ctx) {
+        let mut failed = 0u64;
+        for path in &args.file_args {
+            if let Err(e) = hash_path(args, path, stdin_ctx).and_then(|output| print_output(output, path, args, out)) {
+                failed = failed.saturating_add(1);
+                let _ = out.flush();
+                eprintln_safe!("{}: {}: {}", NAME, path.to_string_lossy(), e);
+                if out.is_poisoned() {
+                    break;
+                }
+            }
+        }
+        return failed;
+    }
+
     let total = threads().get();
     let max_workers = if args.num_threads().is_some() { max_file_threads(total) } else { total };
-    let worker_threads = if args.file_args.len() == 1 || stdin_named_twice(&args.file_args, stdin_ctx) { 1 } else { max_workers.min(args.file_args.len()) };
+    let worker_threads = max_workers.min(args.file_args.len());
     let _file_threads_guard = args.num_threads().map(|_| FileThreadsGuard::enter(worker_threads));
     let mut failed = 0u64;
-    // On one worker thread there is no reordering problem: stream operands
-    // directly without reserving a result slot per path.
     if worker_threads <= 1 {
         for path in &args.file_args {
             if let Err(e) = hash_path(args, path, stdin_ctx).and_then(|output| print_output(output, path, args, out)) {
@@ -2202,7 +2257,7 @@ fn explain_sigbus() {
     extern "C" fn on_sigbus(_: libc::c_int) {
         if !SAID.swap(true, std::sync::atomic::Ordering::SeqCst) {
             const MESSAGE: &[u8] = b"b3sum: a bus error while reading a mapped file; most likely another program truncated it, so no digest of it would be right. Hash the files again once nothing writes to them.\n";
-            file_end::write_fatal_nonblocking(MESSAGE);
+            file_end::write_fatal_best_effort(MESSAGE);
         }
         // Sound: `_exit` is async-signal-safe; terminate immediately without
         // blocking on stderr or waiting in `pause()` for another handler.

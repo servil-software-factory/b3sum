@@ -184,6 +184,18 @@ fn package_vcs_info_validates_full_sha_and_dirty_flag() {
     fs::write(dir.path().join(".cargo_vcs_info.json"), format!("{{\"note\":\"\\u+041\",\"git\":{{\"sha1\":\"{sha}\"}}}}")).unwrap();
     let (v, _) = build_version::build_version(dir.path(), &format!("0.11.0+{sha}"), scratch.path());
     assert_eq!(v, format!("0.11.0+{sha}.unverified"));
+
+    // Oversized (> 64 KiB) `.cargo_vcs_info.json` must fail closed as `.unverified`.
+    let huge = format!("{{\"pad\":\"{}\",\"git\":{{\"sha1\":\"{sha}\"}}}}", "a".repeat(70 * 1024));
+    fs::write(dir.path().join(".cargo_vcs_info.json"), huge).unwrap();
+    let (v, _) = build_version::build_version(dir.path(), &format!("0.11.0+{sha}"), scratch.path());
+    assert_eq!(v, format!("0.11.0+{sha}.unverified"));
+
+    // Deeply nested (> 32 levels) JSON must fail closed as `.unverified` without stack overflow.
+    let deep = format!("{{\"a\":{}0{},\"git\":{{\"sha1\":\"{sha}\"}}}}", "[".repeat(40), "]".repeat(40));
+    fs::write(dir.path().join(".cargo_vcs_info.json"), deep).unwrap();
+    let (v, _) = build_version::build_version(dir.path(), &format!("0.11.0+{sha}"), scratch.path());
+    assert_eq!(v, format!("0.11.0+{sha}.unverified"));
 }
 
 #[test]
@@ -253,6 +265,20 @@ fn incremental_cargo_build_agrees_with_fresh_build_across_root_and_subdir_change
     let v5 = assert_inc_matches_fresh("edited tracked root file");
     assert!(v5.starts_with(&format!("0.11.0+dev.{head}.dirty.")), "got {v5}");
     fs::write(repo.join("Cargo.toml"), &orig_toml).unwrap();
+
+    // 5b. Deleting a tracked root file, building, then restoring it by write
+    // without touching `.git/index` must flip incremental back to clean.
+    fs::write(repo.join("README.md"), "tracked root doc\n").unwrap();
+    git(&repo, &["add", "README.md"]);
+    git(&repo, &["commit", "-qm", "add tracked root doc"]);
+    let head = git(&repo, &["rev-parse", "HEAD"]);
+    assert_eq!(assert_inc_matches_fresh("clean with README"), format!("0.11.0+dev.{head}"));
+    fs::remove_file(repo.join("README.md")).unwrap();
+    let v_del = assert_inc_matches_fresh("deleted tracked root doc");
+    assert!(v_del.starts_with(&format!("0.11.0+dev.{head}.dirty.")), "got {v_del}");
+    fs::write(repo.join("README.md"), "tracked root doc\n").unwrap();
+    let v_restored = assert_inc_matches_fresh("restored tracked root doc by write");
+    assert_eq!(v_restored, format!("0.11.0+dev.{head}"));
 
     // 6. Exported foreign `GIT_DIR` must NOT spoof `build_version`'s commit.
     let foreign = root.path().join("foreign");

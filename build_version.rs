@@ -218,9 +218,15 @@ enum JsonVal {
     Object(Vec<(String, JsonVal)>),
 }
 
+/// Maximum `.cargo_vcs_info.json` size read before rejecting as `.unverified`.
+const MAX_VCS_INFO_BYTES: usize = 64 * 1024;
+/// Maximum JSON container nesting depth accepted in `.cargo_vcs_info.json`.
+const MAX_JSON_DEPTH: usize = 32;
+
 struct JsonParser<'a> {
     bytes: &'a [u8],
     pos: usize,
+    depth: usize,
 }
 
 impl<'a> JsonParser<'a> {
@@ -315,11 +321,16 @@ impl<'a> JsonParser<'a> {
         match *self.bytes.get(self.pos)? {
             b'"' => Some(JsonVal::Str(self.parse_str()?)),
             b'{' => {
+                if self.depth >= MAX_JSON_DEPTH {
+                    return None;
+                }
+                self.depth += 1;
                 self.pos += 1;
                 self.skip_ws();
                 let mut pairs = Vec::new();
                 if self.bytes.get(self.pos) == Some(&b'}') {
                     self.pos += 1;
+                    self.depth -= 1;
                     return Some(JsonVal::Object(pairs));
                 }
                 loop {
@@ -337,6 +348,7 @@ impl<'a> JsonParser<'a> {
                         b',' => self.pos += 1,
                         b'}' => {
                             self.pos += 1;
+                            self.depth -= 1;
                             return Some(JsonVal::Object(pairs));
                         }
                         _ => return None,
@@ -344,10 +356,15 @@ impl<'a> JsonParser<'a> {
                 }
             }
             b'[' => {
+                if self.depth >= MAX_JSON_DEPTH {
+                    return None;
+                }
+                self.depth += 1;
                 self.pos += 1;
                 self.skip_ws();
                 if self.bytes.get(self.pos) == Some(&b']') {
                     self.pos += 1;
+                    self.depth -= 1;
                     return Some(JsonVal::Other);
                 }
                 loop {
@@ -357,6 +374,7 @@ impl<'a> JsonParser<'a> {
                         b',' => self.pos += 1,
                         b']' => {
                             self.pos += 1;
+                            self.depth -= 1;
                             return Some(JsonVal::Other);
                         }
                         _ => return None,
@@ -418,7 +436,7 @@ impl<'a> JsonParser<'a> {
 }
 
 fn parse_json(text: &str) -> Option<JsonVal> {
-    let mut parser = JsonParser { bytes: text.as_bytes(), pos: 0 };
+    let mut parser = JsonParser { bytes: text.as_bytes(), pos: 0, depth: 0 };
     let val = parser.parse_value()?;
     parser.skip_ws();
     (parser.pos == parser.bytes.len()).then_some(val)
@@ -432,15 +450,21 @@ fn obj_get<'a>(val: &'a JsonVal, key: &str) -> Option<&'a JsonVal> {
 /// A package's build: its validated 40-hex `git.sha1` and optional `git.dirty`
 /// flag as `cargo package` wrote them. Missing `.cargo_vcs_info.json`
 /// (`ErrorKind::NotFound`) returns the bare manifest version; a *present* file
-/// that is unreadable, non-UTF-8, malformed, or truncated returns
+/// that is unreadable, oversized (`> MAX_VCS_INFO_BYTES`), too deeply nested
+/// (`> MAX_JSON_DEPTH`), non-UTF-8, malformed, or truncated returns
 /// `{version}.unverified` so corrupt provenance is never mistaken for clean.
 fn from_package_info(dir: &Path, version: &str) -> String {
+    use std::io::Read as _;
     let unverified = || format!("{version}.unverified");
-    let raw = match std::fs::read(dir.join(".cargo_vcs_info.json")) {
-        Ok(bytes) => bytes,
+    let file = match std::fs::File::open(dir.join(".cargo_vcs_info.json")) {
+        Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return version.to_owned(),
         Err(_) => return unverified(),
     };
+    let mut raw = Vec::new();
+    if file.take((MAX_VCS_INFO_BYTES + 1) as u64).read_to_end(&mut raw).is_err() || raw.len() > MAX_VCS_INFO_BYTES {
+        return unverified();
+    }
     let Ok(info) = String::from_utf8(raw) else {
         return unverified();
     };
@@ -478,11 +502,11 @@ fn watched(dir: &Path, git_dir: &Path, common: &Path, cached_raw: &[u8], top_dir
             set.insert(p);
         }
     }
+    // Watch every indexed path unconditionally (even if currently deleted on
+    // disk) so restoring a deleted tracked root file by write without touching
+    // `.git/index` still triggers a rebuild.
     for raw in cached_raw.split(|&b| b == 0).filter(|s| !s.is_empty()) {
-        let full = dir.join(OsStr::from_bytes(raw));
-        if full.symlink_metadata().is_ok() {
-            set.insert(full);
-        }
+        set.insert(dir.join(OsStr::from_bytes(raw)));
     }
     for top in top_dirs {
         let top_path = dir.join(top);
