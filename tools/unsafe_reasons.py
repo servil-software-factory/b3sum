@@ -1,21 +1,15 @@
 #!/usr/bin/env python3
-"""Every `unsafe` block and `unsafe impl` in shipped Rust code says why it is sound.
+"""Check that every `unsafe` block, `unsafe impl`, and `debug_assert*!` in
+shipped `b3sum` Rust code has an accompanying rationale comment.
 
     python3 tools/unsafe_reasons.py
 
-A reason is a comment with "Sound:" in the eight lines above the block
-(blocks that stand together share one). Exit status 1 names each block
-without one. Covers every shipped `.rs` file across all four crates (`src/`,
-`threads/src/`, `capi/src/`, `version/src/`, plus all build
-scripts and helpers: `build.rs`, `threads/build.rs` (if present),
-`version/build.rs`, and `version/build_version.rs`), excluding only the explicit list of test-only
-source files (`TEST_ONLY_FILES`) and inline `mod ... { ... }` blocks whose
-attached `#[cfg(...)]` requires `test`.
-
-Why: the 0.10.0 audit's memory-safety findings were in files whose unsafe
-blocks stated no reason (threads/src/pipeline.rs had 79 and none), while
-the files that state theirs had none (BLAKE3 #411, #417, #418, #427;
-Approved Default 2).
+For `unsafe` sites, checks for a non-empty `Sound:` comment within the eight
+preceding lines (proximity check; adjacent blocks sharing one proof may share
+one comment). For `debug_assert*!` sites, checks for a non-empty `Debug-only:`
+comment attached above the assertion. Covers every shipped `.rs` file in this
+standalone crate (`src/**/*.rs`, `build.rs`, `build_version.rs`), excluding
+only `TEST_ONLY_FILES` and `#[cfg(test)]` items.
 """
 
 import bisect
@@ -818,7 +812,7 @@ def main():
             print(f"{path}:{number}: no reason (a `// Debug-only: ...` comment above): {line[:100]}")
     if bad or bad_da:
         sys.exit(f"unsafe_reasons: {bad} unsafe blocks and {bad_da} debug_asserts state no reason")
-    print(f"unsafe_reasons: every unsafe block and debug_assert across all {len(files)} shipped Rust files states its reason")
+    print(f"unsafe_reasons: all {len(files)} shipped Rust files pass Sound:/Debug-only: rationale checks")
 
 
 if __name__ == "__main__":

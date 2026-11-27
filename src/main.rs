@@ -1791,6 +1791,21 @@ fn hash_inputs(args: &Args, stdin_ctx: &StdinContext, out: &mut OutBuf) -> u64 {
     let worker_threads = if args.file_args.len() == 1 || stdin_named_twice(&args.file_args, stdin_ctx) { 1 } else { max_workers.min(args.file_args.len()) };
     let _file_threads_guard = args.num_threads().map(|_| FileThreadsGuard::enter(worker_threads));
     let mut failed = 0u64;
+    // On one worker thread there is no reordering problem: stream operands
+    // directly without reserving a result slot per path (M8).
+    if worker_threads <= 1 {
+        for path in &args.file_args {
+            if let Err(e) = hash_path(args, path, stdin_ctx).and_then(|output| print_output(output, path, args, out)) {
+                failed = failed.saturating_add(1);
+                let _ = out.flush();
+                eprintln_safe!("{}: {}: {}", NAME, path.to_string_lossy(), e);
+                if out.is_poisoned() {
+                    break;
+                }
+            }
+        }
+        return failed;
+    }
     run_ordered_collector(
         args.file_args.len(),
         worker_threads,

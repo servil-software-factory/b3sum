@@ -218,6 +218,10 @@ class Programs(Repository):
             ra.program_problems(self.program("." + self.code), self.release),
             [f"its build version is {self.version}.{self.code}: built at another commit ({self.code[:12]})"],
         )
+        self.assertEqual(
+            ra.program_problems(self.program(".unverified"), self.release),
+            [f"its build version is {self.version}.unverified: built with unreadable or malformed VCS metadata"],
+        )
 
     def test_one_dirty_version_among_clean_ones_is_not_clean(self):
         # A program holds its packages' plain versions beside its build version.

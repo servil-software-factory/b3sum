@@ -32,39 +32,21 @@ cd "$(git rev-parse --show-toplevel)"
 root=$PWD
 commit=$(git rev-parse HEAD)
 parent=$(git rev-parse "${commit}^")
-target=$(rustc -vV | sed -n 's/^host: //p')
 # Read [package].version from the pinned commit's Cargo.toml (not dirty working
 # tree or a stray `version =` line in another TOML table; M16).
 pkg_version=$(git show "$commit:Cargo.toml" | python3 -c 'import sys, tomllib; print(tomllib.loads(sys.stdin.read())["package"]["version"])')
 version=$pkg_version
 if [ "${version#*+}" = "$parent" ]; then
-	name="b3sum-v$version-$target"
+	is_release=1
 	expected_version="b3sums $version"
 elif [ "${B3SUM_RELEASE_ANY_COMMIT:-}" = 1 ]; then
+	is_release=0
 	version=""
-	name="b3sum-$commit-$target"
 	expected_version="b3sums $pkg_version.$commit"
 else
 	echo "b3sum-release: HEAD is no version commit (stamp Cargo.toml and Cargo.lock to X.Y.Z+<parent-commit>)" >&2
 	exit 1
 fi
-# Pass compiler arguments through CARGO_ENCODED_RUSTFLAGS (unit-separator 0x1f)
-# so spaces in CARGO_HOME, sysroot, or CC never split an argument.
-us=$(printf '\037')
-encoded_flags="--remap-path-prefix=${CARGO_HOME:-$HOME/.cargo}=/cargo${us}--remap-path-prefix=$(rustc --print sysroot)=/rust"
-case "$target" in
-*-linux-gnu)
-	export CC="${CC:-clang}"
-	have="rustc $(rustc -V | cut -d' ' -f2)
-libc6-dev $(dpkg-query -W -f='${Version}' libc6-dev)"
-	want=$(grep '^rustc \|^libc6-dev ' tools/b3sum-release.toolchain)
-	if [ "$have" != "$want" ]; then
-		printf 'b3sum-release: this machine has\n%s\nand tools/b3sum-release.toolchain names\n%s\nA release binary is built with exactly those.\n' "$have" "$want" >&2
-		exit 1
-	fi
-	encoded_flags="${encoded_flags}${us}-C${us}target-feature=+crt-static${us}-C${us}linker=$CC"
-	;;
-esac
 # Reserve the fixed reproducible build path exclusively (M19): never delete an
 # existing directory we did not create, and remove our own reservation exactly
 # once on EXIT (signals exit nonzero so EXIT runs cleanly without racing a
@@ -81,6 +63,34 @@ trap 'exit 143' TERM
 
 git clone --quiet --no-checkout . "$build/source"
 git -C "$build/source" checkout --quiet --detach "$commit"
+
+# Query host target, rustc version, sysroot, and toolchain pin strictly inside
+# the fresh clone (`$build/source`) so caller-only `rust-toolchain.toml` or
+# dirty caller-tree edits cannot diverge from the compiler Cargo invokes (M5).
+target=$(cd "$build/source" && rustc -vV | sed -n 's/^host: //p')
+sysroot=$(cd "$build/source" && rustc --print sysroot)
+if [ "$is_release" = 1 ]; then
+	name="b3sum-v$version-$target"
+else
+	name="b3sum-$commit-$target"
+fi
+us=$(printf '\037')
+encoded_flags="--remap-path-prefix=${CARGO_HOME:-$HOME/.cargo}=/cargo${us}--remap-path-prefix=$sysroot=/rust"
+case "$target" in
+*-linux-gnu)
+	export CC="${CC:-clang}"
+	rustc_ver=$(cd "$build/source" && rustc -V | cut -d' ' -f2)
+	have="rustc $rustc_ver
+libc6-dev $(dpkg-query -W -f='${Version}' libc6-dev)"
+	want=$(grep '^rustc \|^libc6-dev ' "$build/source/tools/b3sum-release.toolchain")
+	if [ "$have" != "$want" ]; then
+		printf 'b3sum-release: this machine has\n%s\nand tools/b3sum-release.toolchain names\n%s\nA release binary is built with exactly those.\n' "$have" "$want" >&2
+		exit 1
+	fi
+	encoded_flags="${encoded_flags}${us}-C${us}target-feature=+crt-static${us}-C${us}linker=$CC"
+	;;
+esac
+
 # Run Cargo from inside the fresh clone so an untracked `.cargo/config.toml` in
 # the caller's checkout cannot alter compiler or linker settings.
 (cd "$build/source" && CARGO_ENCODED_RUSTFLAGS="$encoded_flags" cargo build --release --locked --target "$target" --target-dir "$build/target")
@@ -94,7 +104,7 @@ staged_bin="$stage/$name"
 cp "$build/target/$target/release/b3sum" "$staged_bin"
 
 # Verify exact `--version` stdout (byte-for-byte including trailing LF) and exit
-# status (M16), and for a release commit run release_artifacts.py as well.
+# status (M16), and for a release commit run release_artifacts.py from the clone.
 printf '%s\n' "$expected_version" > "$stage/version.want"
 "$staged_bin" --version > "$stage/version.out"
 if ! cmp -s "$stage/version.out" "$stage/version.want"; then
@@ -103,14 +113,14 @@ if ! cmp -s "$stage/version.out" "$stage/version.want"; then
 	exit 1
 fi
 if [ -n "$version" ]; then
-	python3 "$root/tools/release_artifacts.py" "v$version" "$staged_bin" --commit "$commit"
+	python3 "$build/source/tools/release_artifacts.py" "v$version" "$staged_bin" --commit "$commit"
 fi
 # The binary checks itself against BLAKE3's published digest of nothing,
 # then both .sha256 and .b3 are written independently of the binary under
-# check (tools/blake3_ref.py) and cross-checked against it.
+# check (tools/blake3_ref.py from the clone) and cross-checked against it.
 test "$(printf '' | "$staged_bin" --no-names)" = af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262
 (cd "$stage" && { sha256sum "$name" 2>/dev/null || shasum -a 256 "$name"; } > "$name.sha256")
-(cd "$stage" && python3 "$root/tools/blake3_ref.py" "$name" > "$name.b3")
+(cd "$stage" && python3 "$build/source/tools/blake3_ref.py" "$name" > "$name.b3")
 test "$(cd "$stage" && "$staged_bin" "$name")" = "$(cat "$stage/$name.b3")"
 
 # Publish verified artifacts atomically into `dist/`.

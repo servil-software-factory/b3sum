@@ -4,33 +4,12 @@
 
 #[path = "../build_version.rs"]
 mod build_version;
+#[path = "../src/test_temp.rs"]
+mod tempfile;
 
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-
-struct TempDir(PathBuf);
-
-impl TempDir {
-    fn new(tag: &str) -> Self {
-        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!("b3sum-build-ver-{tag}-{}-{n}", std::process::id()));
-        let _ = fs::remove_dir_all(&path);
-        fs::create_dir_all(&path).unwrap();
-        Self(path)
-    }
-
-    fn path(&self) -> &Path {
-        &self.0
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
-}
 
 fn git(dir: &Path, args: &[&str]) -> String {
     let out = Command::new("git").arg("-C").arg(dir).args(args).output().unwrap();
@@ -74,24 +53,45 @@ fn init_repo(dir: &Path) -> String {
 
 #[test]
 fn git_checkout_clean_dirty_no_object_pollution_worktree_and_release() {
-    let root = TempDir::new("git");
+    let root = tempfile::tempdir().unwrap();
     let repo = root.path().join("repo");
     let scratch = root.path().join("scratch");
     fs::create_dir_all(&repo).unwrap();
     fs::create_dir_all(&scratch).unwrap();
     let head = init_repo(&repo);
 
-    // 1. Clean dev commit.
-    let (ver, _watched) = build_version::build_version(&repo, "0.11.0+dev", &scratch);
-    assert_eq!(ver, format!("0.11.0+dev.{head}"));
-
-    // 2. Dirty untracked file must mark `.dirty.<tree>` WITHOUT writing ANY
-    //    object into the repository's `.git/objects` (M17), and the repo root
-    //    directory itself must be watched so newly added root files invalidate
-    //    a cached clean build (F8).
+    // 1. Clean dev commit: repo root itself must NOT be in watched (avoids
+    //    Cargo recursively scanning target/ and .git/ on every build; M2),
+    //    while source subdirs like `src` ARE watched.
     let (clean_ver, clean_watched) = build_version::build_version(&repo, "0.11.0+dev", &scratch);
     assert_eq!(clean_ver, format!("0.11.0+dev.{head}"));
-    assert!(clean_watched.contains(&repo), "repo root directory must be watched so new root files trigger rerun");
+    assert!(!clean_watched.contains(&repo), "repo root must not be watched directly (Cargo would scan target/ and .git/; M2)");
+    assert!(clean_watched.contains(&repo.join("src")), "source subdirectory must be watched");
+
+    // 1b. `git update-index --assume-unchanged` must NEVER hide modified bytes
+    //     as clean (M1).
+    git(&repo, &["update-index", "--assume-unchanged", "src/main.rs"]);
+    fs::write(repo.join("src/main.rs"), "fn main() { println!(\"changed\"); }\n").unwrap();
+    let (assumed_dirty, _) = build_version::build_version(&repo, "0.11.0+dev", &scratch);
+    assert!(assumed_dirty.starts_with(&format!("0.11.0+dev.{head}.dirty.")), "assume-unchanged edit must report dirty (M1), got {assumed_dirty}");
+    git(&repo, &["update-index", "--no-assume-unchanged", "src/main.rs"]);
+    fs::write(repo.join("src/main.rs"), "fn main() {}\n").unwrap();
+
+    // 1c. Force-added ignored file (`git add -f`) in the real index must also
+    //     mark the tree dirty even though HEAD does not track it (M1).
+    fs::write(repo.join(".gitignore"), "ignored.rs\n").unwrap();
+    git(&repo, &["add", ".gitignore"]);
+    git(&repo, &["commit", "-qm", "add gitignore"]);
+    let head = git(&repo, &["rev-parse", "HEAD"]);
+    fs::write(repo.join("ignored.rs"), "pub fn extra() {}\n").unwrap();
+    git(&repo, &["add", "-f", "ignored.rs"]);
+    let (forced_dirty, _) = build_version::build_version(&repo, "0.11.0+dev", &scratch);
+    assert!(forced_dirty.starts_with(&format!("0.11.0+dev.{head}.dirty.")), "force-added ignored file must report dirty (M1), got {forced_dirty}");
+    git(&repo, &["rm", "-q", "--cached", "ignored.rs"]);
+    fs::remove_file(repo.join("ignored.rs")).unwrap();
+
+    // 2. Dirty untracked file must mark `.dirty.<tree>` WITHOUT writing ANY
+    //    object into the repository's `.git/objects` (M17).
     let objects_before = list_object_files(&repo.join(".git/objects"));
     let untracked = repo.join("untracked secret.txt");
     fs::write(&untracked, b"never write me to .git/objects").unwrap();
@@ -126,16 +126,17 @@ fn git_checkout_clean_dirty_no_object_pollution_worktree_and_release() {
 
 #[test]
 fn package_vcs_info_validates_full_sha_and_dirty_flag() {
-    let dir = TempDir::new("pkg");
-    let scratch = TempDir::new("pkg-scratch");
+    let dir = tempfile::tempdir().unwrap();
+    let scratch = tempfile::tempdir().unwrap();
     let sha = "0123456789abcdef0123456789abcdef01234567";
 
     // Missing VCS info returns bare manifest version.
     let (v, _) = build_version::build_version(dir.path(), "0.11.0+dev", scratch.path());
     assert_eq!(v, "0.11.0+dev");
 
-    // Clean packaged dev build appends full 40-hex SHA.
-    fs::write(dir.path().join(".cargo_vcs_info.json"), format!("{{\"git\":{{\"sha1\":\"{sha}\"}},\"path_in_vcs\":\"\"}}")).unwrap();
+    // Clean packaged dev build appends full 40-hex SHA, even alongside escaped
+    // non-BMP UTF-16 surrogate pairs in an unrelated JSON string (M3).
+    fs::write(dir.path().join(".cargo_vcs_info.json"), format!("{{\"note\":\"\\uD83D\\uDE00\",\"git\":{{\"sha1\":\"{sha}\"}},\"path_in_vcs\":\"\"}}")).unwrap();
     let (v, _) = build_version::build_version(dir.path(), "0.11.0+dev", scratch.path());
     assert_eq!(v, format!("0.11.0+dev.{sha}"));
 
@@ -144,24 +145,35 @@ fn package_vcs_info_validates_full_sha_and_dirty_flag() {
     let (v, _) = build_version::build_version(dir.path(), &format!("0.11.0+{sha}"), scratch.path());
     assert_eq!(v, format!("0.11.0+{sha}.{sha}.dirty"));
 
-    // Truncated / malformed SHA, truncated JSON, trailing garbage, and top-level
-    // `dirty` shadowing `git.dirty` are all handled strictly (M16).
+    // Truncated / malformed SHA, truncated JSON, and trailing garbage report
+    // `.unverified` rather than looking like clean release provenance (M3/M16).
     fs::write(dir.path().join(".cargo_vcs_info.json"), "{\"git\":{\"sha1\":\"deadbeef\"},\"path_in_vcs\":\"\"}").unwrap();
     let (v, _) = build_version::build_version(dir.path(), "0.11.0+dev", scratch.path());
-    assert_eq!(v, "0.11.0+dev");
+    assert_eq!(v, "0.11.0+dev.unverified");
 
-    // Truncated JSON after sha1 must be rejected.
+    // Truncated JSON after sha1 must be flagged unverified.
     fs::write(dir.path().join(".cargo_vcs_info.json"), format!("{{\"git\":{{\"sha1\":\"{sha}\"")).unwrap();
     let (v, _) = build_version::build_version(dir.path(), "0.11.0+dev", scratch.path());
-    assert_eq!(v, "0.11.0+dev");
+    assert_eq!(v, "0.11.0+dev.unverified");
 
-    // Trailing garbage after closing brace must be rejected.
+    // Trailing garbage after closing brace must be flagged unverified.
     fs::write(dir.path().join(".cargo_vcs_info.json"), format!("{{\"git\":{{\"sha1\":\"{sha}\"}}}} garbage")).unwrap();
     let (v, _) = build_version::build_version(dir.path(), "0.11.0+dev", scratch.path());
-    assert_eq!(v, "0.11.0+dev");
+    assert_eq!(v, "0.11.0+dev.unverified");
 
     // Top-level `"dirty": false` before `"git": {"dirty": true}` must NOT mask git.dirty!
     fs::write(dir.path().join(".cargo_vcs_info.json"), format!("{{\"dirty\":false,\"git\":{{\"sha1\":\"{sha}\",\"dirty\":true}}}}")).unwrap();
     let (v, _) = build_version::build_version(dir.path(), &format!("0.11.0+{sha}"), scratch.path());
     assert_eq!(v, format!("0.11.0+{sha}.{sha}.dirty"));
+
+    // Invalid UTF-8 bytes in a present `.cargo_vcs_info.json` must report
+    // `.unverified`, NOT look like a missing file / clean provenance (M3).
+    fs::write(dir.path().join(".cargo_vcs_info.json"), [0xFFu8, 0xFEu8]).unwrap();
+    let (v, _) = build_version::build_version(dir.path(), &format!("0.11.0+{sha}"), scratch.path());
+    assert_eq!(v, format!("0.11.0+{sha}.unverified"));
+
+    // Leading `+` in a `\u` escape is not valid JSON and must report `.unverified` (M3).
+    fs::write(dir.path().join(".cargo_vcs_info.json"), format!("{{\"note\":\"\\u+041\",\"git\":{{\"sha1\":\"{sha}\"}}}}")).unwrap();
+    let (v, _) = build_version::build_version(dir.path(), &format!("0.11.0+{sha}"), scratch.path());
+    assert_eq!(v, format!("0.11.0+{sha}.unverified"));
 }
