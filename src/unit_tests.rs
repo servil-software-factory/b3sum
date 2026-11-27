@@ -146,11 +146,25 @@ fn test_a_files_size_does_not_decide_where_it_ends() {
     for len in [0usize, 1, 999, 1000] {
         for says in [0, 1, len.saturating_sub(1), len, len + 1, 5000] {
             for few in [1, 7, 4096] {
-                crate::read_to_its_end(&mut Few(&all[..len], few), says, &mut bytes).unwrap();
+                let mut reader = Few(&all[..len], few);
+                let eof = crate::read_bounded_to_eof(&mut reader, says, 2000, &mut bytes).unwrap();
+                assert!(eof, "len={len} <= cap 2000 must reach EOF (says={says} few={few})");
                 assert_eq!(bytes, &all[..len], "len={len} says={says} few={few}");
             }
         }
     }
+    // When actual input exceeds `cap`, `read_bounded_to_eof` stops at `cap`
+    // (`Ok(false)`) and leaves the unread tail in `reader` for streaming; at
+    // `cap == 0`, returns `Ok(false)` without consuming any byte.
+    let mut reader = Few(&all, 13);
+    assert!(!crate::read_bounded_to_eof(&mut reader, 10, 0, &mut bytes).unwrap());
+    assert!(bytes.is_empty());
+    let eof = crate::read_bounded_to_eof(&mut reader, 10, 256, &mut bytes).unwrap();
+    assert!(!eof, "input longer than cap must promote to streaming");
+    assert_eq!(bytes, &all[..256]);
+    let mut tail = Vec::new();
+    std::io::Read::read_to_end(&mut reader, &mut tail).unwrap();
+    assert_eq!(tail, &all[256..]);
 }
 
 /// `--no-mmap` maps no file, on each path that maps one without it: the
@@ -389,7 +403,7 @@ fn record_oriented_sockets_and_packet_pipes_are_rejected() {
             assert!(crate::file_end::ensure_byte_stream_fd(qv[0], meta.mode_type).is_err());
         }
         // Linux packet-mode pipe (`pipe2(O_DIRECT)`): a full 4096-byte packet must
-        // be read completely by `read_stream_to_end` (not truncated at 32 bytes).
+        // be read completely by streaming `outboard_from_reader` (not truncated at 32 bytes).
         let mut pv = [-1 as libc::c_int; 2];
         if unsafe { libc::pipe2(pv.as_mut_ptr(), libc::O_DIRECT) } == 0 {
             let mut r = unsafe { std::fs::File::from_raw_fd(pv[0]) };
@@ -398,9 +412,11 @@ fn record_oriented_sockets_and_packet_pipes_are_rejected() {
             use std::io::Write;
             w.write_all(&payload).unwrap();
             drop(w);
-            let mut got = Vec::new();
-            crate::file_end::read_stream_to_end(&mut r, &mut got).unwrap();
-            assert_eq!(got, payload, "read_stream_to_end must preserve full PIPE_BUF packet-mode pipe writes");
+            let mut cvs = Vec::new();
+            let mut out = Vec::new();
+            let got = crate::outboard::outboard_from_reader(blake3::Mode::Plain, &mut r, &mut cvs, &mut out).unwrap();
+            assert_eq!(got, blake3::convenience::hash(&payload), "outboard_from_reader must preserve full PIPE_BUF packet-mode pipe writes");
+            assert!(out.is_empty(), "4096-byte payload is <= 1 chunk group");
         }
         // Packet-mode pipe across a 4 MiB piece boundary (`fill()`): 1 byte +
         // 1024 x 4096-byte packets must never truncate the final byte.
@@ -849,4 +865,126 @@ fn post_open_forbidden_stream_guard_rejects_swapped_descriptor() {
 
     let err = crate::file_end::open_checked_with(&ordinary, Some(forbid), |_| std::fs::File::open(&fifo)).unwrap_err();
     assert!(err.to_string().contains("checkfile is a stream"), "post-open fstat guard must reject swapped stream, got {err}");
+}
+
+#[test]
+fn run_ordered_collector_emits_in_order_and_stops_claiming_on_cancel() {
+    use std::sync::{
+        Arc, Condvar, Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    };
+    // 1. Normal completion emits all indices in strict 0..N order.
+    let mut got = Vec::new();
+    crate::run_ordered_collector(
+        32,
+        4,
+        |i| i * 3 + 1,
+        |i, v| {
+            got.push((i, v));
+            true
+        },
+    );
+    assert_eq!(got, (0..32).map(|i| (i, i * 3 + 1)).collect::<Vec<_>>());
+
+    // 2. Cancellation on index 0 publishes `next >= count` strictly BEFORE
+    // helpers are released from the gate (`after_cancel(claimed_before_close)`),
+    // proving EVERY index executed by any thread was claimed strictly BEFORE
+    // `next.fetch_max(count, SeqCst)` (`max_index_executed < claimed_before_close`)
+    // — 100% scheduling-independent (M3).
+    let main_tid = std::thread::current().id();
+    let arrived = Arc::new((Mutex::new(0usize), Condvar::new()));
+    let gate = Arc::new((Mutex::new(false), Condvar::new()));
+    let timed_out = Arc::new(AtomicBool::new(false));
+    let max_index_plus_one = AtomicUsize::new(0);
+    let claimed_before_close = AtomicUsize::new(0);
+    let mut emitted = Vec::new();
+    crate::run_ordered_collector_inner(
+        128,
+        4,
+        |i| {
+            max_index_plus_one.fetch_max(i + 1, Ordering::SeqCst);
+            if i > 0 && std::thread::current().id() != main_tid {
+                let (lock, cvar) = &*arrived;
+                *lock.lock().unwrap() += 1;
+                cvar.notify_all();
+                let (glock, gcvar) = &*gate;
+                let g = glock.lock().unwrap();
+                let (_g, res) = gcvar.wait_timeout_while(g, std::time::Duration::from_secs(5), |done| !*done).unwrap();
+                if res.timed_out() {
+                    timed_out.store(true, Ordering::SeqCst);
+                }
+            }
+            i
+        },
+        |i, v| {
+            emitted.push((i, v));
+            let (lock, cvar) = &*arrived;
+            let g = lock.lock().unwrap();
+            let (_g, res) = cvar.wait_timeout_while(g, std::time::Duration::from_secs(5), |n| *n == 0).unwrap();
+            assert!(!res.timed_out(), "at least one helper must reach the gate before cancelling");
+            false
+        },
+        |prev_next| {
+            // Runs strictly AFTER `next.fetch_max(count, SeqCst)` returns `prev_next`.
+            claimed_before_close.store(prev_next, Ordering::SeqCst);
+            let (glock, gcvar) = &*gate;
+            *glock.lock().unwrap() = true;
+            gcvar.notify_all();
+        },
+    );
+    assert!(!timed_out.load(Ordering::SeqCst), "collector cancellation gate must not time out");
+    assert_eq!(emitted, vec![(0, 0)]);
+    let max_seen = max_index_plus_one.load(Ordering::SeqCst);
+    let pre_close = claimed_before_close.load(Ordering::SeqCst);
+    assert!(
+        max_seen <= pre_close && pre_close < 128,
+        "no index >= claimed_before_close may be claimed after cancel (max_seen={max_seen}, claimed_before_close={pre_close}; M3)"
+    );
+}
+
+#[test]
+fn single_named_file_uses_one_fstat_call() {
+    blake3::initialize();
+    let dir = crate::tempfile::tempdir().unwrap();
+    let small = dir.path().join("small.bin");
+    std::fs::write(&small, b"hello single fstat").unwrap();
+    let args = crate::Args::for_test_plain_threads(vec![small.clone()], 1);
+    let stdin_ctx = crate::file_end::StdinContext::current();
+
+    let before = crate::file_end::FSTAT_CALLS.with(|c| c.get());
+    let h = crate::hash_path_hash(&args, &small, &stdin_ctx, None).unwrap();
+    let after = crate::file_end::FSTAT_CALLS.with(|c| c.get());
+    assert_eq!(h, blake3::convenience::hash(b"hello single fstat"));
+    assert_eq!(after - before, 1, "single named file must reuse open_checked's fstat without redundant fstat calls (M5)");
+}
+
+#[test]
+fn streaming_small_input_does_not_allocate_second_buffer() {
+    blake3::initialize();
+    let second_allocated = std::thread::spawn(|| {
+        let mut hasher = blake3::convenience::Hasher::new(blake3::Mode::Plain, None);
+        let data = vec![0xABu8; 4096];
+        let n = crate::update_from_counted(&mut hasher, std::io::Cursor::new(&data)).unwrap();
+        assert_eq!(n, 4096);
+        assert_eq!(hasher.finalize(), blake3::convenience::hash(&data));
+        crate::BUFFERS.with_borrow(|b| b.second.is_some())
+    })
+    .join()
+    .unwrap();
+    assert!(!second_allocated, "streaming <= 1 piece must not eagerly allocate a second 4 MiB buffer (M11)");
+}
+
+#[test]
+fn use_pool_for_respects_actual_pool_width_vs_prospective_budget() {
+    // Under a fully occupied FileThreadsGuard, prospective `pool_threads()` is 1
+    // so `use_pool_for` must not attempt to start a 1-thread singleton (M27).
+    let total = crate::threads().get();
+    let _guard = crate::FileThreadsGuard::enter(total);
+    assert_eq!(crate::pool_threads().get(), 1);
+    if crate::actual_pool_threads() == 0 {
+        assert!(!crate::use_pool_for(crate::POOL_START_LEN * 2), "must not initialize a 1-thread pool singleton");
+        assert_eq!(crate::actual_pool_threads(), 0, "pool must remain uninitialized while width is 1");
+    } else if crate::actual_pool_threads() == 1 {
+        assert!(!crate::use_pool_for(crate::POOL_START_LEN * 2), "a 1-thread pool must never be used as multithreaded");
+    }
 }

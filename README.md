@@ -212,8 +212,11 @@ that part arrives.
 - Files of 16 KiB or less have no parent nodes, so no `.obao4` file is written.
 - `DIR` must already exist.
 - Works in plain mode and `--keyed` mode.
-- Standard input (`-`) and any named file whose fallback reads instead of
-  mapping are held whole in memory when building the outboard tree.
+- Standard input (`-`), pipes, and non-mapped regular files stream in 16 KiB
+  chunk groups, retaining only the tree's chaining values and parent nodes
+  rather than buffering the whole input in memory (small regular files under
+  512 KiB are read directly into a bounded buffer and promote to streaming if
+  they grow past that cap).
 
 ```bash
 $ mkdir outboards && b3sum --outboard outboards big.iso

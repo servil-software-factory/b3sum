@@ -220,32 +220,16 @@ pub(crate) fn write_fatal_fmt(args: core::fmt::Arguments<'_>) {
     write_fatal_nonblocking(&out.buf[..out.len]);
 }
 
-/// Read a stream completely into `out` using read requests at least one kernel
-/// page wide (`>= 64 KiB`), avoiding `Read::read_to_end`'s initial 32-byte
-/// probe that silently truncates Linux `pipe2(O_DIRECT)` packet-mode pipes
-/// (which buffer up to `PAGE_SIZE` bytes per packet in `fs/pipe.c`), and using
-/// fallible `try_reserve` so OOM returns an I/O error instead of aborting (#515).
-pub(crate) fn read_stream_to_end(reader: &mut impl Read, out: &mut Vec<u8>) -> io::Result<()> {
-    let chunk_len = crate::min_packet_read_len().max(64 * 1024);
-    let mut chunk = Vec::new();
-    chunk.try_reserve_exact(chunk_len).map_err(|_| io::Error::new(io::ErrorKind::OutOfMemory, "out of memory"))?;
-    chunk.resize(chunk_len, 0);
-    loop {
-        match reader.read(&mut chunk) {
-            Ok(0) => return Ok(()),
-            Ok(n) => {
-                out.try_reserve(n).map_err(|_| io::Error::new(io::ErrorKind::OutOfMemory, "out of memory"))?;
-                out.extend_from_slice(&chunk[..n]);
-            }
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-            Err(e) => return Err(e),
-        }
-    }
+#[cfg(test)]
+thread_local! {
+    pub(crate) static FSTAT_CALLS: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
 }
 
 /// Query `(dev, ino, kind, len)` directly on `fd` using `fstat`, without
 /// duplicating the descriptor.
 pub(crate) fn fstat_fd(fd: RawFd) -> io::Result<FdMeta> {
+    #[cfg(test)]
+    FSTAT_CALLS.with(|c| c.set(c.get() + 1));
     let mut st = core::mem::MaybeUninit::<libc::stat>::zeroed();
     // Sound: `st` is valid writable storage for `libc::stat`.
     let rc = unsafe { libc::fstat(fd, st.as_mut_ptr()) };
@@ -429,41 +413,36 @@ fn is_verified_darwin_regular_dev_fd(path: &Path) -> bool {
     darwin_dev_fd_number(path).is_some() && std::fs::metadata(path).is_ok_and(|meta| meta.is_file())
 }
 
+/// Shared OS `stat` helper for pathname-to-identity checks (L3): rejects
+/// trailing slashes and Linux cloning PTY master devices (`/dev/ptmx`),
+/// returning `(S_IFMT file-type bits, StreamId)` on match.
+fn stat_path_identity(path: &Path) -> Option<(u32, StreamId)> {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::MetadataExt;
+    if path.as_os_str().as_bytes().ends_with(b"/") {
+        return None;
+    }
+    let meta = std::fs::metadata(path).ok()?;
+    let mode_type = meta.mode() & u32::from(libc::S_IFMT);
+    #[cfg(target_os = "linux")]
+    if mode_type == u32::from(libc::S_IFCHR) && is_ptmx_rdev(meta.rdev()) {
+        return None;
+    }
+    Some((mode_type, StreamId { dev: meta.dev(), ino: meta.ino() }))
+}
+
 /// Whether `path` currently resolves via OS `stat` to the exact same `(dev, ino)`
 /// AND file type (`S_IFMT`) as `target` (preserving symlinks, `..`, and trailing
 /// directory requirements), excluding cloning PTY master devices.
 pub(crate) fn path_matches_fd_meta(path: &Path, target: FdMeta) -> bool {
-    use std::os::unix::ffi::OsStrExt;
-    use std::os::unix::fs::MetadataExt;
-    if path.as_os_str().as_bytes().ends_with(b"/") {
-        return false;
-    }
-    std::fs::metadata(path).is_ok_and(|meta| {
-        let mode_type = meta.mode() & u32::from(libc::S_IFMT);
-        #[cfg(target_os = "linux")]
-        if mode_type == u32::from(libc::S_IFCHR) && is_ptmx_rdev(meta.rdev()) {
-            return false;
-        }
-        mode_type == u32::from(target.mode_type) && StreamId { dev: meta.dev(), ino: meta.ino() } == target.id
-    })
+    stat_path_identity(path).is_some_and(|(mode_type, id)| mode_type == u32::from(target.mode_type) && id == target.id)
 }
 
 /// Whether `path` currently resolves via OS `stat` to a stream matching `stream`
 /// (excluding cloning PTY master devices).
 pub(crate) fn path_matches_stream(path: &Path, stream: StreamId) -> bool {
-    use std::os::unix::ffi::OsStrExt;
-    use std::os::unix::fs::MetadataExt;
-    if path.as_os_str().as_bytes().ends_with(b"/") {
-        return false;
-    }
-    std::fs::metadata(path).is_ok_and(|meta| {
-        let mode_type = meta.mode() & u32::from(libc::S_IFMT);
-        #[cfg(target_os = "linux")]
-        if mode_type == u32::from(libc::S_IFCHR) && is_ptmx_rdev(meta.rdev()) {
-            return false;
-        }
-        (mode_type == u32::from(libc::S_IFIFO) || mode_type == u32::from(libc::S_IFSOCK) || mode_type == u32::from(libc::S_IFCHR))
-            && StreamId { dev: meta.dev(), ino: meta.ino() } == stream
+    stat_path_identity(path).is_some_and(|(mode_type, id)| {
+        (mode_type == u32::from(libc::S_IFIFO) || mode_type == u32::from(libc::S_IFSOCK) || mode_type == u32::from(libc::S_IFCHR)) && id == stream
     })
 }
 
@@ -560,11 +539,16 @@ pub(crate) fn cached_then_plain(dst_cap: usize, mut at: usize, mut read: impl Fn
     }
 }
 
-/// Read into `buf` (preserving `buf[..buf.len()]` as the initialized prefix)
-/// sequentially up to `cap`. Returns `Ok(true)` if EOF was reached within
-/// `cap`, or `Ok(false)` when `buf.len() >= cap` and the caller must promote
-/// to incremental streaming hashing.
-pub(crate) fn read_sequential_capped(file: &mut File, buf: &mut Vec<u8>, cap: usize) -> io::Result<bool> {
+#[derive(Clone, Copy)]
+enum CapReadKind {
+    Sequential,
+    #[cfg(target_os = "linux")]
+    Positioned,
+}
+
+/// Shared capped growth loop for raw `read`/`pread` syscalls without exposing
+/// uninitialized memory to safe `Read` implementations (M11).
+fn read_capped_with(fd: RawFd, kind: CapReadKind, buf: &mut Vec<u8>, cap: usize) -> io::Result<bool> {
     loop {
         if buf.len() >= cap {
             return Ok(false);
@@ -574,9 +558,21 @@ pub(crate) fn read_sequential_capped(file: &mut File, buf: &mut Vec<u8>, cap: us
             buf.reserve(grow);
         }
         let avail = (buf.capacity() - buf.len()).min(cap - buf.len());
-        // Sound: `buf.spare_capacity_mut()[..avail]` is valid writable
-        // storage inside `buf`'s allocation; the kernel writes at most `avail` bytes.
-        let rc = unsafe { libc::read(file.as_raw_fd(), buf.as_mut_ptr().add(buf.len()).cast(), avail) };
+        let len = buf.len();
+        let rc = match kind {
+            CapReadKind::Sequential => {
+                // Sound: `buf.as_mut_ptr().add(len)` points to `avail` valid writable
+                // bytes inside `buf`'s allocation; `libc::read` writes at most `avail` bytes.
+                unsafe { libc::read(fd, buf.as_mut_ptr().add(len).cast(), avail) }
+            }
+            #[cfg(target_os = "linux")]
+            CapReadKind::Positioned => {
+                let off = libc::off_t::try_from(len).map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "file offset overflow"))?;
+                // Sound: `buf.as_mut_ptr().add(len)` points to `avail` valid writable
+                // bytes inside `buf`'s allocation; `libc::pread` writes at most `avail` bytes.
+                unsafe { libc::pread(fd, buf.as_mut_ptr().add(len).cast(), avail, off) }
+            }
+        };
         if rc == 0 {
             return Ok(true);
         }
@@ -589,9 +585,17 @@ pub(crate) fn read_sequential_capped(file: &mut File, buf: &mut Vec<u8>, cap: us
         }
         let n = rc as usize;
         assert!(n <= avail, "kernel read did not exceed requested length");
-        // Sound: `libc::read` initialized `n` bytes starting at `buf.len()`.
-        unsafe { buf.set_len(buf.len() + n) };
+        // Sound: the kernel `read`/`pread` syscall initialized `n` bytes starting at `len`.
+        unsafe { buf.set_len(len + n) };
     }
+}
+
+/// Read into `buf` (preserving `buf[..buf.len()]` as the initialized prefix)
+/// sequentially up to `cap`. Returns `Ok(true)` if EOF was reached within
+/// `cap`, or `Ok(false)` when `buf.len() >= cap` and the caller must promote
+/// to incremental streaming hashing.
+pub(crate) fn read_sequential_capped(file: &mut File, buf: &mut Vec<u8>, cap: usize) -> io::Result<bool> {
+    read_capped_with(file.as_raw_fd(), CapReadKind::Sequential, buf, cap)
 }
 
 /// Read the rest of `file` starting at `buf.len()` using `pread` up to `cap`,
@@ -599,36 +603,10 @@ pub(crate) fn read_sequential_capped(file: &mut File, buf: &mut Vec<u8>, cap: us
 /// Returns `Ok((reached_eof, used_sequential))`.
 #[cfg(target_os = "linux")]
 pub(crate) fn pread_rest_capped(file: &mut File, buf: &mut Vec<u8>, cap: usize) -> io::Result<(bool, bool)> {
-    loop {
-        if buf.len() >= cap {
-            return Ok((false, false));
-        }
-        if buf.len() == buf.capacity() {
-            let grow = buf.len().max(4096).min(cap - buf.len());
-            buf.reserve(grow);
-        }
-        let avail = (buf.capacity() - buf.len()).min(cap - buf.len());
-        let off = buf.len() as libc::off_t;
-        // Sound: `avail` writable bytes sit at `buf.as_mut_ptr().add(buf.len())`.
-        let rc = unsafe { libc::pread(file.as_raw_fd(), buf.as_mut_ptr().add(buf.len()).cast(), avail, off) };
-        if rc == 0 {
-            return Ok((true, false));
-        }
-        if rc < 0 {
-            let e = io::Error::last_os_error();
-            if e.kind() == io::ErrorKind::Interrupted {
-                continue;
-            }
-            if e.raw_os_error() == Some(libc::ESPIPE) && buf.is_empty() {
-                let eof = read_sequential_capped(file, buf, cap)?;
-                return Ok((eof, true));
-            }
-            return Err(e);
-        }
-        let n = rc as usize;
-        assert!(n <= avail, "kernel pread did not exceed requested length");
-        // Sound: `libc::pread` initialized `n` bytes starting at `buf.len()`.
-        unsafe { buf.set_len(buf.len() + n) };
+    match read_capped_with(file.as_raw_fd(), CapReadKind::Positioned, buf, cap) {
+        Ok(eof) => Ok((eof, false)),
+        Err(e) if e.raw_os_error() == Some(libc::ESPIPE) && buf.is_empty() => Ok((read_sequential_capped(file, buf, cap)?, true)),
+        Err(e) => Err(e),
     }
 }
 
@@ -702,15 +680,6 @@ impl Read for PreadReader<'_> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         pread_at(self.fd, &mut self.offset, buf)
     }
-}
-
-/// Copy all bytes of `fd` from offset 0 into `out` via `pread` (never advancing
-/// `fd`'s shared file offset), for `--outboard` on macOS `/dev/stdin` / `/dev/fd/0`.
-#[cfg(target_os = "macos")]
-pub(crate) fn pread_all_into(fd: BorrowedFd<'_>, out: &mut Vec<u8>) -> io::Result<()> {
-    let mut reader = PreadReader::new(fd, 0);
-    reader.read_to_end(out)?;
-    Ok(())
 }
 
 /// Hash `prefix` followed by the remainder of `file` starting at `prefix.len()`

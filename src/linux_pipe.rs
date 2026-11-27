@@ -1116,8 +1116,9 @@ fn run_hybrid_worker(
 
         // From here on the file is the one opened above, on every path:
         // nothing opens its name again, which may name another file by now.
+        // Pass the already-queried `FdMeta` to avoid redundant `fstat` calls (M5).
         if !meta.is_file() {
-            sink.put(i, crate::hash_open_file(args, file));
+            sink.put(i, crate::hash_open_file_with_meta(args, file, meta).map(|hr| hr.hash));
             continue;
         }
 
@@ -1167,7 +1168,7 @@ fn run_hybrid_worker(
                     continue;
                 }
                 Ok(CacheRead::NonSeekable(0)) => {
-                    sink.put(i, crate::hash_open_file(args, file));
+                    sink.put(i, crate::hash_open_file_with_meta(args, file, meta).map(|hr| hr.hash));
                     continue;
                 }
                 Ok(CacheRead::NeedMore(partial_at) | CacheRead::NonSeekable(partial_at)) => {
@@ -1207,7 +1208,7 @@ fn run_hybrid_worker(
                     continue;
                 }
                 Ok(CacheRead::NonSeekable(0)) => {
-                    sink.put(i, crate::hash_open_file(args, file));
+                    sink.put(i, crate::hash_open_file_with_meta(args, file, meta).map(|hr| hr.hash));
                     continue;
                 }
                 Ok(CacheRead::NeedMore(partial_at) | CacheRead::NonSeekable(partial_at)) => {
@@ -1242,6 +1243,15 @@ fn run_hybrid_worker(
                     continue;
                 }
                 let pool_workers = if args.num_threads().is_some() { (total_threads - io_threads + 1).max(1) } else { total_threads };
+                // Don't start a 1-thread global pool singleton when a local
+                // hash suffices; keeps the singleton available for later
+                // parallel batches (M27).
+                if pool_workers <= 1 && crate::actual_pool_threads() == 0 {
+                    let h = blake3::convenience::hash_with(args.mode, &map);
+                    crate::hold(map);
+                    sink.put(i, Ok(h));
+                    continue;
+                }
                 crate::init_pool_once(pool_workers);
                 let wp = warm_pipe.get_or_insert_with(|| WarmLargePipe::new(args.mode));
                 wp.submit_owned(i, size, map, &mut sink);
@@ -1334,7 +1344,11 @@ fn run_hybrid_worker(
                         if matches!(e.raw_os_error(), Some(libc::EINVAL | libc::EOPNOTSUPP)) {
                             retire_cold_ring = true;
                         }
-                        let res = if direct_changed { crate::hash_open_file_streaming(args, file) } else { crate::hash_open_file(args, file) };
+                        let res = if direct_changed {
+                            crate::hash_open_file_streaming_with_meta(args, file, meta)
+                        } else {
+                            crate::hash_open_file_with_meta(args, file, meta).map(|hr| hr.hash)
+                        };
                         sink.put(i, res);
                     } else {
                         sink.put(i, Err(e.into()));
@@ -1342,7 +1356,11 @@ fn run_hybrid_worker(
                 }
             }
         } else {
-            let res = if direct_changed { crate::hash_open_file_streaming(args, file) } else { crate::hash_open_file(args, file) };
+            let res = if direct_changed {
+                crate::hash_open_file_streaming_with_meta(args, file, meta)
+            } else {
+                crate::hash_open_file_with_meta(args, file, meta).map(|hr| hr.hash)
+            };
             sink.put(i, res);
         }
         if retire_cold_ring {
@@ -2078,7 +2096,7 @@ mod test {
         // the worker checks `sink.open` before calling `next.fetch_add` for
         // operand 1 (preventing opening a subsequent operand such as a
         // blocking FIFO; #564).
-        blake3::initialize_multithreaded(std::num::NonZeroUsize::new(1));
+        crate::init_pool_once(1);
         let dir = crate::tempfile::tempdir().unwrap();
         let warm0 = dir.path().join("warm-stop-0.bin");
         let warm1 = dir.path().join("warm-stop-1.bin");
