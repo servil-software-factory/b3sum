@@ -38,8 +38,11 @@ STAGE_ENTRIES = (
 )
 CONTROL_TIMEOUT_SECS = 180
 
-READ_TO_END = "    file.read_to_end(bytes)?;\n    Ok(())\n}\n\n/// The hash of the input at `path`"
-READ_TO_END_NOT = "    bytes.truncate(says);\n    Ok(())\n}\n\n/// The hash of the input at `path`"
+READ_TO_END = """            let next_len = (bytes.len() * 2).max(4096).min(cap);
+            bytes.try_reserve(next_len - bytes.len()).map_err(|_| io::Error::from(io::ErrorKind::OutOfMemory))?;
+            bytes.resize(next_len, 0);"""
+READ_TO_END_NOT = """            bytes.truncate(got);
+            return Ok(true);"""
 
 # (the protection, its file, the text to find once, what replaces it, exact nextest test name)
 CONTROLS = [
@@ -165,7 +168,7 @@ CONTROLS = [
     (
         "the file opened is the file hashed where there is no io_uring",
         "src/linux_pipe.rs",
-        "        } else {\n            let res = if direct_changed { crate::hash_open_file_streaming(args, file) } else { crate::hash_open_file(args, file) };\n            sink.put(i, res);\n        }\n",
+        "        } else {\n            let res = if direct_changed {\n                crate::hash_open_file_streaming_with_meta(args, file, meta)\n            } else {\n                crate::hash_open_file_with_meta(args, file, meta).map(|hr| hr.hash)\n            };\n            sink.put(i, res);\n        }\n",
         "        } else {\n            drop(file);\n            let ctx = crate::file_end::StdinContext::current();\n            sink.put(i, crate::hash_path_hash(args, &paths[i], &ctx, forbidden));\n        }\n",
         "linux_pipe::test::without_a_ring_the_file_opened_is_the_file_hashed",
     ),

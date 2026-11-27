@@ -463,8 +463,8 @@ pub(crate) fn hash_path_hash(args: &Args, path: &Path, stdin_ctx: &StdinContext,
             // file; if hashing did not move the descriptor cursor (mmap/pread/
             // direct/ring), advance fd 0 to the exact byte count hashed and
             // propagate any seek failure.
-            if let Some(file) = stdin_file() {
-                let hr = hash_open_file_ex(args, file)?;
+            if let Some((file, meta)) = stdin_file() {
+                let hr = hash_open_file_with_meta(args, file, meta)?;
                 if !hr.cursor_moved && hr.bytes_hashed > 0 {
                     // Sound: `lseek` on open descriptor 0 touches no memory.
                     let rc = unsafe { libc::lseek(0, hr.bytes_hashed as libc::off_t, libc::SEEK_SET) };
@@ -499,8 +499,8 @@ pub(crate) fn hash_path_hash(args: &Args, path: &Path, stdin_ctx: &StdinContext,
         #[cfg(target_os = "macos")]
         InputRole::DarwinRegularDevFd => hash_darwin_regular_dev_fd_hash(args, path),
         InputRole::Path => {
-            let (file, _) = file_end::open_checked(path, forbidden)?;
-            Ok(hash_open_file_ex(args, file)?.hash)
+            let (file, meta) = file_end::open_checked(path, forbidden)?;
+            Ok(hash_open_file_with_meta(args, file, meta)?.hash)
         }
     }
 }
@@ -509,8 +509,8 @@ pub(crate) fn hash_path_hash(args: &Args, path: &Path, stdin_ctx: &StdinContext,
 /// start (`b3sum < file`): the same file, its position shared (the
 /// caller moves it past the consumed bytes once hashed). Uses `fstat(0)`
 /// and `lseek(0, 0, SEEK_CUR)` first so no spare descriptor is touched
-/// unless needed.
-fn stdin_file() -> Option<File> {
+/// unless needed, returning the already-queried [`file_end::FdMeta`] (M5).
+fn stdin_file() -> Option<(File, file_end::FdMeta)> {
     use std::os::fd::AsFd;
     let meta = file_end::fstat_fd(0).ok()?;
     if !meta.is_file() {
@@ -521,35 +521,45 @@ fn stdin_file() -> Option<File> {
     if pos != 0 {
         return None;
     }
-    Some(File::from(io::stdin().as_fd().try_clone_to_owned().ok()?))
-}
-
-/// [`hash_path_hash`] for an open file. Every path hashes this file,
-/// including when its original pathname has since been replaced.
-#[cfg(target_os = "linux")]
-pub(crate) fn hash_open_file(args: &Args, file: File) -> err::Result<blake3::Hash> {
-    Ok(hash_open_file_ex(args, file)?.hash)
+    Some((File::from(io::stdin().as_fd().try_clone_to_owned().ok()?), meta))
 }
 
 /// Stream an already-opened `file` sequentially to actual EOF without creating
 /// a memory mapping (used after an `O_DIRECT` read observes that the file's
-/// length changed, so a stale mapping is never hashed).
+/// length changed, so a stale mapping is never hashed), using the already-
+/// queried `fd_meta` to avoid a redundant `fstat` (M5).
 #[cfg(target_os = "linux")]
-pub(crate) fn hash_open_file_streaming(args: &Args, file: File) -> err::Result<blake3::Hash> {
+pub(crate) fn hash_open_file_streaming_with_meta(args: &Args, file: File, fd_meta: file_end::FdMeta) -> err::Result<blake3::Hash> {
     use std::os::fd::AsRawFd;
-    file_end::validate_byte_stream_fd(file.as_raw_fd())?;
+    file_end::ensure_byte_stream_fd(file.as_raw_fd(), fd_meta.mode_type)?;
     let mut hasher = args.base_hasher.clone();
     update_from(&mut hasher, file)?;
     Ok(hasher.finalize())
 }
 
-/// Hash an already-opened `file`, returning the digest along with exact byte
-/// count and whether the file descriptor's cursor was advanced.
-pub(crate) fn hash_open_file_ex(args: &Args, mut file: File) -> err::Result<HashRead> {
-    let fd_meta = {
+/// Test convenience wrapper for hashing an open file without pre-queried metadata.
+#[cfg(test)]
+pub(crate) fn hash_open_file(args: &Args, file: File) -> err::Result<blake3::Hash> {
+    Ok(hash_open_file_ex(args, file)?.hash)
+}
+
+/// Hash an already-opened `file`, querying `fstat` once and forwarding to
+/// [`hash_open_file_with_meta`].
+#[cfg(test)]
+pub(crate) fn hash_open_file_ex(args: &Args, file: File) -> err::Result<HashRead> {
+    use std::os::fd::AsRawFd;
+    let meta = file_end::fstat_fd(file.as_raw_fd())?;
+    hash_open_file_with_meta(args, file, meta)
+}
+
+/// Hash an already-opened `file` using its already-queried `fd_meta` (M5),
+/// returning the digest along with exact byte count and whether the file
+/// descriptor's cursor was advanced.
+pub(crate) fn hash_open_file_with_meta(args: &Args, mut file: File, fd_meta: file_end::FdMeta) -> err::Result<HashRead> {
+    {
         use std::os::fd::AsRawFd;
-        file_end::validate_byte_stream_fd(file.as_raw_fd())?
-    };
+        file_end::ensure_byte_stream_fd(file.as_raw_fd(), fd_meta.mode_type)?;
+    }
     if fd_meta.is_file() {
         let size = fd_meta.len;
         if size < MAP_LEN as u64 {
@@ -634,9 +644,10 @@ pub(crate) fn hash_open_file_ex(args: &Args, mut file: File) -> err::Result<Hash
                     }
                 }
                 drop(permits);
-                // Multi-threaded single cold file (`>= 512 KiB`): start the pool,
-                // whose workers fault disjoint subtrees in parallel.
-                init_pool_once(pool_threads().get());
+                // Multi-threaded single cold file (`>= 512 KiB`): start the pool
+                // only if the budget allows `> 1` threads so a temporary width of 1
+                // does not freeze the global singleton at 1 (M27).
+                let _ = try_init_parallel_pool();
                 let h = hash_slice_32(args.mode, &map);
                 let map_len = map.len() as u64;
                 hold(map);
@@ -655,14 +666,7 @@ pub(crate) fn hash_open_file_ex(args: &Args, mut file: File) -> err::Result<Hash
 fn hash_path(args: &Args, path: &Path, stdin_ctx: &StdinContext) -> err::Result<blake3::OutputReader> {
     let mut hasher = args.base_hasher.clone();
     match stdin_ctx.classify(path) {
-        InputRole::StdinDash => {
-            if args.keyed() {
-                bail!("Cannot open `-` in keyed mode");
-            }
-            file_end::validate_byte_stream_fd(0)?;
-            update_from(&mut hasher, io::stdin())?;
-        }
-        InputRole::StdinStreamAlias => {
+        InputRole::StdinDash | InputRole::StdinStreamAlias => {
             if args.keyed() {
                 bail!("Cannot open `-` in keyed mode");
             }
@@ -786,6 +790,9 @@ pub(crate) const DIRECT_THREADS: usize = 16;
 const MAX_THREADS: usize = 1024;
 
 static POOL_ONCE: std::sync::Once = std::sync::Once::new();
+/// Actual width of the initialized global pool (0 before initialization),
+/// distinct from prospective [`pool_threads()`] budget (M27).
+static ACTUAL_POOL_THREADS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 struct ThreadBudget {
     file_threads: usize,
@@ -801,17 +808,48 @@ fn lock_budget() -> std::sync::MutexGuard<'static, ThreadBudget> {
     THREAD_BUDGET.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+#[cfg(any(target_os = "linux", test))]
 pub(crate) fn init_pool_once(n: usize) {
-    POOL_ONCE.call_once(|| {
-        let clamped = {
-            let mut b = lock_budget();
-            let limit = if b.strict { threads().get().saturating_sub(b.file_threads.saturating_add(b.leased_direct)).saturating_add(1) } else { MAX_THREADS };
+    let _ = init_pool_inner(n, true);
+}
+
+/// Start the global thread pool only when the budget currently allows more than
+/// one thread, reserving the width atomically under `THREAD_BUDGET` so a
+/// temporary width of 1 (during a strict file batch or direct-I/O lease) leaves
+/// the singleton uninitialized for later parallel work (M27).
+fn try_init_parallel_pool() -> bool {
+    init_pool_inner(MAX_THREADS, false) > 1
+}
+
+fn init_pool_inner(n: usize, allow_single: bool) -> usize {
+    let actual = actual_pool_threads();
+    if actual != 0 {
+        return actual;
+    }
+    {
+        let mut b = lock_budget();
+        if b.pool_threads == 0 {
+            let leased = if b.strict { b.leased_direct } else { 0 };
+            let limit =
+                if b.strict || !allow_single { threads().get().saturating_sub(b.file_threads.saturating_add(leased)).saturating_add(1) } else { MAX_THREADS };
             let chosen = n.min(limit).clamp(1, MAX_THREADS);
+            if !allow_single && chosen <= 1 {
+                return 0;
+            }
             b.pool_threads = chosen;
-            chosen
-        };
-        blake3::initialize_multithreaded(std::num::NonZeroUsize::new(clamped));
+        }
+    }
+    POOL_ONCE.call_once(|| {
+        let chosen = lock_budget().pool_threads;
+        blake3::initialize_multithreaded(std::num::NonZeroUsize::new(chosen));
+        ACTUAL_POOL_THREADS.store(chosen, std::sync::atomic::Ordering::Release);
     });
+    actual_pool_threads()
+}
+
+/// Actual initialized width of the global thread pool (0 if not yet started; M27).
+pub(crate) fn actual_pool_threads() -> usize {
+    ACTUAL_POOL_THREADS.load(std::sync::atomic::Ordering::Acquire)
 }
 
 /// Cap on file-worker threads for a batch, respecting any background worker
@@ -824,11 +862,11 @@ pub(crate) fn max_file_threads(total: usize) -> usize {
 
 #[inline]
 fn use_pool_for(len: usize) -> bool {
-    if POOL_ONCE.is_completed() {
-        len >= POOL_LEN && pool_threads().get() > 1
-    } else if len >= POOL_START_LEN && pool_threads().get() > 1 {
-        init_pool_once(pool_threads().get());
-        true
+    let actual = actual_pool_threads();
+    if actual != 0 {
+        len >= POOL_LEN && actual > 1
+    } else if len >= POOL_START_LEN {
+        try_init_parallel_pool()
     } else {
         false
     }
@@ -952,6 +990,7 @@ impl Drop for DirectPermits {
     }
 }
 
+#[cfg(any(target_os = "linux", test))]
 pub(crate) fn pool_threads() -> std::num::NonZeroUsize {
     let b = lock_budget();
     let leased_direct = if b.strict { b.leased_direct } else { 0 };
@@ -968,8 +1007,16 @@ pub(crate) fn update(hasher: &mut blake3::convenience::Hasher, input: &[u8]) {
 
 const PIECE: usize = 4 << 20;
 
+struct StreamBuffers {
+    first: Vec<u8>,
+    /// Allocated lazily only on the multi-threaded overlap branch (M11), so
+    /// single-threaded runs and streams that finish within the first 4 MiB
+    /// piece never allocate a second 4 MiB buffer.
+    second: Option<Vec<u8>>,
+}
+
 thread_local! {
-    static BUFFERS: std::cell::RefCell<[Vec<u8>; 2]> = std::cell::RefCell::new([vec![0; PIECE], vec![0; PIECE]]);
+    static BUFFERS: std::cell::RefCell<StreamBuffers> = std::cell::RefCell::new(StreamBuffers { first: vec![0; PIECE], second: None });
 }
 
 /// Minimum read request length so Linux `pipe2(O_DIRECT)` packet-mode pipes
@@ -1016,7 +1063,8 @@ fn update_from(hasher: &mut blake3::convenience::Hasher, reader: impl Read + Sen
 pub(crate) fn update_from_counted(hasher: &mut blake3::convenience::Hasher, mut reader: impl Read + Send) -> io::Result<u64> {
     #[cfg(test)]
     STREAMED.with(|streamed| streamed.set(streamed.get() + 1));
-    BUFFERS.with_borrow_mut(|[first, second]| {
+    BUFFERS.with_borrow_mut(|bufs| {
+        let first = &mut bufs.first;
         let (mut len, mut eof) = fill(&mut reader, first)?;
         let mut total = len as u64;
         if eof {
@@ -1035,6 +1083,7 @@ pub(crate) fn update_from_counted(hasher: &mut blake3::convenience::Hasher, mut 
                 total += len as u64;
             }
         }
+        let second = bufs.second.get_or_insert_with(|| vec![0; PIECE]);
         std::thread::scope(|scope| {
             let (free_tx, free_rx) = std::sync::mpsc::sync_channel::<&mut [u8]>(1);
             let (full_tx, full_rx) = std::sync::mpsc::sync_channel::<(&mut [u8], io::Result<(usize, bool)>)>(1);
@@ -1331,18 +1380,43 @@ fn hash_paths_32(
     let max_workers = if args.num_threads().is_some() { max_file_threads(total) } else { total };
     let threads = max_workers.min(paths.len());
     let _file_threads_guard = args.num_threads().map(|_| FileThreadsGuard::enter(threads));
-    let next = std::sync::atomic::AtomicUsize::new(0);
+    run_ordered_collector(paths.len(), threads, |i| hash_path_hash(args, &paths[i], stdin_ctx, forbidden), on_ordered);
+}
+
+/// Shared parallel ordered collector for generic plain and extended-output
+/// multi-file runs (M3): workers claim indices via `next`, send results to the
+/// main collector, and emit a contiguous prefix in order. When `on_ordered`
+/// returns `false`, one close path publishes `next.fetch_max(count, SeqCst)`
+/// and drops `done_rx` before joining workers so helpers stop claiming new
+/// operands immediately. Asserts `emitted == count` on normal completion (M30).
+pub(crate) fn run_ordered_collector<O: Send>(count: usize, threads: usize, work: impl Fn(usize) -> O + Sync, on_ordered: impl FnMut(usize, O) -> bool) {
+    run_ordered_collector_inner(count, threads, work, on_ordered, |_| {});
+}
+
+pub(crate) fn run_ordered_collector_inner<O: Send>(
+    count: usize,
+    threads: usize,
+    work: impl Fn(usize) -> O + Sync,
+    mut on_ordered: impl FnMut(usize, O) -> bool,
+    mut after_cancel: impl FnMut(usize),
+) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let next = AtomicUsize::new(0);
     let (done_tx, done_rx) = std::sync::mpsc::channel();
     std::thread::scope(|scope| {
         for _ in 1..threads {
-            if next.load(std::sync::atomic::Ordering::Relaxed) >= paths.len() {
+            if next.load(Ordering::Acquire) >= count {
                 break;
             }
-            let (next, done_tx) = (&next, done_tx.clone());
+            let (next, done_tx, work) = (&next, done_tx.clone(), &work);
             scope.spawn(move || {
                 loop {
-                    let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    if i >= paths.len() || done_tx.send((i, hash_path_hash(args, &paths[i], stdin_ctx, forbidden))).is_err() {
+                    let i = next.fetch_add(1, Ordering::AcqRel);
+                    if i >= count {
+                        break;
+                    }
+                    let output = work(i);
+                    if done_tx.send((i, output)).is_err() {
                         break;
                     }
                 }
@@ -1352,14 +1426,15 @@ fn hash_paths_32(
 
         let mut emitted = 0usize;
         let mut stop = false;
-        let mut results: Vec<Option<err::Result<blake3::Hash>>> = (0..paths.len()).map(|_| None).collect();
-        let mut take = |i: usize, output: err::Result<blake3::Hash>| -> bool {
+        let mut results: Vec<Option<O>> = (0..count).map(|_| None).collect();
+        let mut take = |i: usize, output: O| -> bool {
             results[i] = Some(output);
-            while emitted < paths.len() {
+            while emitted < count {
                 let Some(item) = results[emitted].take() else { break };
                 if !on_ordered(emitted, item) {
                     stop = true;
-                    next.fetch_max(paths.len(), std::sync::atomic::Ordering::Relaxed);
+                    let claimed_before_close = next.fetch_max(count, Ordering::SeqCst).min(count);
+                    after_cancel(claimed_before_close);
                     return false;
                 }
                 emitted += 1;
@@ -1368,12 +1443,21 @@ fn hash_paths_32(
         };
         let mut keep_going = true;
         loop {
-            let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if i >= paths.len() {
+            let i = next.fetch_add(1, Ordering::AcqRel);
+            if i >= count {
                 break;
             }
-            if !take(i, hash_path_hash(args, &paths[i], stdin_ctx, forbidden)) {
+            if !take(i, work(i)) {
                 keep_going = false;
+                break;
+            }
+            while let Ok((wi, wout)) = done_rx.try_recv() {
+                if !take(wi, wout) {
+                    keep_going = false;
+                    break;
+                }
+            }
+            if !keep_going {
                 break;
             }
         }
@@ -1385,7 +1469,7 @@ fn hash_paths_32(
             }
         }
         drop(done_rx);
-        assert!(stop || emitted == paths.len(), "ordered collector returned after {emitted}/{} operands without cancellation", paths.len());
+        assert!(stop || emitted == count, "ordered collector returned after {emitted}/{count} operands without cancellation");
     });
 }
 
@@ -1531,34 +1615,48 @@ fn outboard_inputs(args: &Args, dir: &Path, stdin_ctx: &StdinContext, out: &mut 
     failed
 }
 
-/// Read all of `file` into `bytes` until a waiting read returns `Ok(0)`:
-/// asks for `says + 1` bytes first (a positive short read is NOT EOF, so
-/// the loop continues until `Ok(0)` or the initial buffer fills, then
-/// `read_to_end` collects any bytes past `says`; BLAKE3 #424).
-fn read_to_its_end(file: &mut impl Read, says: usize, bytes: &mut Vec<u8>) -> io::Result<()> {
-    bytes.resize(says + 1, 0);
-    let mut got = 0;
-    while got <= says {
+/// Read up to `cap` bytes from `file` (fallibly allocating at most `cap`,
+/// seeded from `says + 1`), returning `Ok(true)` if actual EOF (`read == 0`)
+/// was observed within `cap`, or `Ok(false)` when `file` reaches `cap` without
+/// EOF so the caller streams the prefix plus remaining bytes without truncating
+/// at `says` (#424, M12). At `cap == 0`, returns `Ok(false)` with `bytes` empty
+/// and `file` untouched.
+pub(crate) fn read_bounded_to_eof(file: &mut impl Read, says: usize, cap: usize, bytes: &mut Vec<u8>) -> io::Result<bool> {
+    bytes.clear();
+    if cap == 0 {
+        return Ok(false);
+    }
+    let initial = says.saturating_add(1).min(cap);
+    bytes.try_reserve(initial).map_err(|_| io::Error::from(io::ErrorKind::OutOfMemory))?;
+    bytes.resize(initial, 0);
+    let mut got = 0usize;
+    loop {
+        if got == bytes.len() {
+            if got >= cap {
+                return Ok(false);
+            }
+            let next_len = (bytes.len() * 2).max(4096).min(cap);
+            bytes.try_reserve(next_len - bytes.len()).map_err(|_| io::Error::from(io::ErrorKind::OutOfMemory))?;
+            bytes.resize(next_len, 0);
+        }
         match file.read(&mut bytes[got..]) {
             Ok(0) => {
                 bytes.truncate(got);
-                return Ok(());
+                return Ok(true);
             }
             Ok(n) => got += n,
             Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
             Err(e) => return Err(e),
         }
     }
-    file.read_to_end(bytes)?;
-    Ok(())
 }
 
 /// The hash of the input at `path` (`-`: standard input), and its
-/// outboard appended to `nodes`. A file under MAP_LEN is read into the
-/// thread's room by one read; a longer one that the page cache does not
-/// hold is read directly, where the system has such reads (Linux); any
-/// other is mapped where it can be (the mapping then held, as every
-/// mapping b3sum makes: `hold`), else read whole into memory.
+/// outboard appended to `nodes`. A regular file under MAP_LEN is read into the
+/// bounded thread room (promoting to streaming if it grows past MAP_LEN); a
+/// longer cold file is read directly on Linux; any other regular file is mapped
+/// where it can be (`hold`); stdin, pipes, and non-mapped fallbacks stream in
+/// 16 KiB chunk groups without buffering the entire input in memory (M12).
 fn outboard_of(
     args: &Args,
     path: &Path,
@@ -1571,23 +1669,14 @@ fn outboard_of(
     let bytes = &mut rooms.bytes;
     bytes.clear();
     match stdin_ctx.classify(path) {
-        InputRole::StdinDash => {
+        InputRole::StdinDash | InputRole::StdinStreamAlias => {
             // The key was standard input, read to its end: no message is
             // left there, and its tree would be the empty message's.
             if matches!(mode, blake3::Mode::Keyed(_)) {
                 bail!("Cannot open `-` in keyed mode");
             }
             file_end::validate_byte_stream_fd(0)?;
-            file_end::read_stream_to_end(&mut io::stdin().lock(), bytes)?;
-            return Ok(outboard::outboard(mode, bytes, threads, &mut rooms.cvs, nodes));
-        }
-        InputRole::StdinStreamAlias => {
-            if matches!(mode, blake3::Mode::Keyed(_)) {
-                bail!("Cannot open `-` in keyed mode");
-            }
-            file_end::validate_byte_stream_fd(0)?;
-            file_end::read_stream_to_end(&mut io::stdin().lock(), bytes)?;
-            return Ok(outboard::outboard(mode, bytes, threads, &mut rooms.cvs, nodes));
+            return Ok(outboard::outboard_from_reader(mode, &mut io::stdin().lock(), &mut rooms.cvs, nodes)?);
         }
         #[cfg(target_os = "macos")]
         InputRole::DarwinRegularDevFd => {
@@ -1602,8 +1691,7 @@ fn outboard_of(
                 hold(map);
                 return Ok(hash);
             }
-            file_end::pread_all_into(file.as_fd(), bytes)?;
-            return Ok(outboard::outboard(mode, bytes, threads, &mut rooms.cvs, nodes));
+            return Ok(outboard::outboard_from_reader(mode, &mut file_end::PreadReader::new(file.as_fd(), 0), &mut rooms.cvs, nodes)?);
         }
         InputRole::Path => {}
     }
@@ -1613,8 +1701,11 @@ fn outboard_of(
         file_end::validate_byte_stream_fd(file.as_raw_fd())?
     };
     if fd_meta.is_file() && fd_meta.len < MAP_LEN as u64 {
-        read_to_its_end(&mut file, usize::try_from(fd_meta.len).expect("len < MAP_LEN"), bytes)?;
-        return Ok(outboard::outboard(mode, bytes, threads, &mut rooms.cvs, nodes));
+        if read_bounded_to_eof(&mut file, usize::try_from(fd_meta.len).expect("len < MAP_LEN"), MAP_LEN, bytes)? {
+            return Ok(outboard::outboard(mode, bytes, threads, &mut rooms.cvs, nodes));
+        }
+        let mut combined = io::Cursor::new(&bytes[..]).chain(&mut file);
+        return Ok(outboard::outboard_from_reader(mode, &mut combined, &mut rooms.cvs, nodes)?);
     }
     #[cfg(target_os = "linux")]
     let mut skip_map_after_change = false;
@@ -1638,12 +1729,7 @@ fn outboard_of(
         hold(map);
         return Ok(hash);
     }
-    if fd_meta.is_file() {
-        file.read_to_end(bytes)?;
-    } else {
-        file_end::read_stream_to_end(&mut file, bytes)?;
-    }
-    Ok(outboard::outboard(mode, bytes, threads, &mut rooms.cvs, nodes))
+    Ok(outboard::outboard_from_reader(mode, &mut file, &mut rooms.cvs, nodes)?)
 }
 
 fn hash_inputs(args: &Args, stdin_ctx: &StdinContext, out: &mut OutBuf) -> u64 {
@@ -1692,85 +1778,27 @@ fn hash_inputs(args: &Args, stdin_ctx: &StdinContext, out: &mut OutBuf) -> u64 {
 
     let total = threads().get();
     let max_workers = if args.num_threads().is_some() { max_file_threads(total) } else { total };
-    let threads = if args.file_args.len() == 1 || stdin_named_twice(&args.file_args, stdin_ctx) { 1 } else { max_workers.min(args.file_args.len()) };
-    hash_inputs_with(args, threads, out, |args, next, done| hash_some(args, stdin_ctx, next, done), print_output)
-}
-
-fn hash_inputs_with<O: Send>(
-    args: &Args,
-    threads: usize,
-    out: &mut OutBuf,
-    work: impl Fn(&Args, &std::sync::atomic::AtomicUsize, &mut dyn FnMut(usize, err::Result<O>) -> bool) + Sync,
-    print_one: impl Fn(O, &Path, &Args, &mut OutBuf) -> err::Result<()>,
-) -> u64 {
-    let _file_threads_guard = args.num_threads().map(|_| FileThreadsGuard::enter(threads));
-    let paths = &args.file_args;
-    let next = std::sync::atomic::AtomicUsize::new(0);
-    let (done_tx, done_rx) = std::sync::mpsc::channel();
-    std::thread::scope(|scope| {
-        for _ in 1..threads {
-            if next.load(std::sync::atomic::Ordering::Relaxed) >= paths.len() {
-                break;
-            }
-            let (next, done_tx, work) = (&next, done_tx.clone(), &work);
-            scope.spawn(move || work(args, next, &mut |i, output| done_tx.send((i, output)).is_ok()));
-        }
-        drop(done_tx);
-        let mut failed = 0u64;
-        let mut printed = 0usize;
-        let mut stop = false;
-        let mut results: Vec<Option<err::Result<O>>> = (0..paths.len()).map(|_| None).collect();
-        let mut take = |i: usize, output: err::Result<O>| {
-            results[i] = Some(output);
-            while printed < paths.len() {
-                let Some(item) = results[printed].take() else { break };
-                if let Err(e) = item.and_then(|output| print_one(output, &paths[printed], args, out)) {
-                    failed = failed.saturating_add(1);
-                    let _ = out.flush();
-                    eprintln_safe!("{}: {}: {}", NAME, paths[printed].to_string_lossy(), e);
-                    if out.is_poisoned() {
-                        stop = true;
-                        next.fetch_max(paths.len(), std::sync::atomic::Ordering::Relaxed);
-                        return false;
-                    }
-                }
-                printed += 1;
-            }
-            true
-        };
-        let mut keep_going = true;
-        work(args, &next, &mut |i, output| {
-            if !take(i, output) {
-                keep_going = false;
-                return false;
-            }
-            true
-        });
-        if keep_going {
-            while let Ok((i, output)) = done_rx.recv() {
-                if !take(i, output) {
-                    break;
+    let worker_threads = if args.file_args.len() == 1 || stdin_named_twice(&args.file_args, stdin_ctx) { 1 } else { max_workers.min(args.file_args.len()) };
+    let _file_threads_guard = args.num_threads().map(|_| FileThreadsGuard::enter(worker_threads));
+    let mut failed = 0u64;
+    run_ordered_collector(
+        args.file_args.len(),
+        worker_threads,
+        |i| hash_path(args, &args.file_args[i], stdin_ctx),
+        |idx, res| {
+            let path = &args.file_args[idx];
+            if let Err(e) = res.and_then(|output| print_output(output, path, args, out)) {
+                failed = failed.saturating_add(1);
+                let _ = out.flush();
+                eprintln_safe!("{}: {}: {}", NAME, path.to_string_lossy(), e);
+                if out.is_poisoned() {
+                    return false;
                 }
             }
-        }
-        drop(done_rx);
-        assert!(stop || printed == paths.len(), "ordered input collector returned after {printed}/{} operands without cancellation", paths.len());
-        failed
-    })
-}
-
-fn hash_some(
-    args: &Args,
-    stdin_ctx: &StdinContext,
-    next: &std::sync::atomic::AtomicUsize,
-    done: &mut dyn FnMut(usize, err::Result<blake3::OutputReader>) -> bool,
-) {
-    loop {
-        let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if i >= args.file_args.len() || !done(i, hash_path(args, &args.file_args[i], stdin_ctx)) {
-            return;
-        }
-    }
+            true
+        },
+    );
+    failed
 }
 
 fn emit_checked_result(display: &str, expected_hash: blake3::Hash, res: err::Result<blake3::Hash>, args: &Args, out: &mut OutBuf) -> err::Result<bool> {

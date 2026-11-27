@@ -85,6 +85,37 @@ struct Layer {
     last: LastCv,
 }
 
+/// Build all parent layers above the `whole_groups` whole-group leaf CVs in
+/// `cvs[..whole_groups]` (with total length `len > GROUP` and final group CV
+/// `last`), write the pre-order Bao parent nodes into `out`, and return the
+/// root hash. `cvs` must already have length `2 * (whole_groups + 1)`, and
+/// `out` must already have capacity for `64 * whole_groups` bytes (fallibly
+/// reserved by streaming callers so this performs no heap allocation).
+fn finish_tree(tree: &TreeHasher, len: u64, whole_groups: usize, last: LastCv, cvs: &mut [Cv], out: &mut Vec<u8>) -> blake3::Hash {
+    // A binary tree over `whole_groups` (which fits in `usize`) has at most
+    // `usize::BITS` (<= 64) layers, so fixed stack storage avoids any fallible
+    // heap allocation during finalization.
+    let mut layers = [Layer { at: 0, whole: whole_groups, last }; 64];
+    let mut depth = 1usize;
+    loop {
+        let Layer { at, whole, last } = layers[depth - 1];
+        if whole == 1 {
+            break;
+        }
+        let (children, parents) = cvs[at..].split_at_mut(whole);
+        let pairs = whole / 2;
+        tree.parent_cvs(&children[..2 * pairs], &mut parents[..pairs]);
+        // An odd whole one out is the last subtree's left sibling; with
+        // none, the last goes up as it is.
+        let last = if whole % 2 == 1 { tree.last_parent_cv(&children[whole - 1], &last) } else { last };
+        layers[depth] = Layer { at: at + whole, whole: pairs, last };
+        depth += 1;
+    }
+    let top = layers[depth - 1];
+    node(cvs, &layers[..depth], depth, 0, out);
+    tree.root_hash(&cvs[top.at], &top.last, len)
+}
+
 /// The hash and outboard of a message of `len` bytes, more than a group.
 /// `fill` is given a slot a group: it writes the whole groups' chaining
 /// values (every group's but the last, whose slot it leaves) and returns
@@ -106,24 +137,66 @@ fn build<E>(
     cvs.clear();
     cvs.resize(2 * groups, Cv::unset());
     let last = fill(&tree, &mut cvs[..groups])?;
-    let mut layers: Vec<Layer> = vec![Layer { at: 0, whole: groups - 1, last }];
-    loop {
-        let Layer { at, whole, last } = *layers.last().unwrap();
-        if whole == 1 {
-            break;
-        }
-        let (children, parents) = cvs[at..].split_at_mut(whole);
-        let pairs = whole / 2;
-        tree.parent_cvs(&children[..2 * pairs], &mut parents[..pairs]);
-        // An odd whole one out is the last subtree's left sibling; with
-        // none, the last goes up as it is.
-        let last = if whole % 2 == 1 { tree.last_parent_cv(&children[whole - 1], &last) } else { last };
-        layers.push(Layer { at: at + whole, whole: pairs, last });
-    }
-    let top = *layers.last().unwrap();
     out.reserve(64 * (groups - 1));
-    node(cvs, &layers, layers.len(), 0, out);
-    Ok(tree.root_hash(&cvs[top.at], &top.last, len as u64))
+    Ok(finish_tree(&tree, len as u64, groups - 1, last, cvs, out))
+}
+
+/// Stream `reader` in 16 KiB chunk groups to compute its root hash and Bao
+/// outboard without holding the full input in memory (M12). Retains only a
+/// single-group (16 KiB) lookahead buffer to distinguish the final group plus
+/// the group chaining values and parent nodes, reading in chunks of at least
+/// `min_packet_read_len()` so Linux `pipe2(O_DIRECT)` packet-mode pipes never
+/// truncate a packet, and using non-allocating `ErrorKind::OutOfMemory` on
+/// fallible `try_reserve` failure.
+pub(crate) fn outboard_from_reader(mode: blake3::Mode, reader: &mut impl std::io::Read, cvs: &mut Vec<Cv>, out: &mut Vec<u8>) -> std::io::Result<blake3::Hash> {
+    let oom = || std::io::Error::from(std::io::ErrorKind::OutOfMemory);
+    let chunk_cap = crate::min_packet_read_len().max(64 * 1024);
+    let mut read_buf = Vec::new();
+    read_buf.try_reserve_exact(chunk_cap).map_err(|_| oom())?;
+    read_buf.resize(chunk_cap, 0);
+
+    let tree = TreeHasher::new(mode).on_this_core();
+    cvs.clear();
+    let mut pending = [0u8; GROUP];
+    let mut pending_len = 0usize;
+    let mut total_len = 0u64;
+    let mut group_idx = 0u64;
+
+    loop {
+        let n = match reader.read(&mut read_buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
+        let mut src = &read_buf[..n];
+        while !src.is_empty() {
+            if pending_len == GROUP {
+                // More bytes follow, so `pending` is strictly a non-final group.
+                cvs.try_reserve(1).map_err(|_| oom())?;
+                cvs.push(tree.subtree_cv(LEVEL, group_idx, &pending));
+                group_idx += 1;
+                pending_len = 0;
+            }
+            let take = (GROUP - pending_len).min(src.len());
+            pending[pending_len..pending_len + take].copy_from_slice(&src[..take]);
+            pending_len += take;
+            total_len = total_len.checked_add(take as u64).ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "input length overflow"))?;
+            src = &src[take..];
+        }
+    }
+
+    if group_idx == 0 {
+        return Ok(blake3::convenience::hash_with(mode, &pending[..pending_len]));
+    }
+    let last = tree.last_cv(group_idx << LEVEL, &pending[..pending_len]);
+    let whole_groups = cvs.len();
+    let target_cvs = whole_groups.checked_add(1).and_then(|g| g.checked_mul(2)).ok_or_else(oom)?;
+    cvs.try_reserve(target_cvs - whole_groups).map_err(|_| oom())?;
+    cvs.resize(target_cvs, Cv::unset());
+    let out_bytes = whole_groups.checked_mul(64).ok_or_else(oom)?;
+    out.try_reserve(out_bytes).map_err(|_| oom())?;
+    Ok(finish_tree(&tree, total_len, whole_groups, last, cvs, out))
 }
 
 /// The hash and outboard of the open `file`, read past the page cache
@@ -646,5 +719,47 @@ pub(crate) mod test {
             "the length decides"
         );
         TAKE_FOR_COLD.with(|c| c.set(false));
+    }
+
+    #[test]
+    fn streaming_outboard_matches_in_memory_and_reference_across_group_boundaries() {
+        blake3::initialize();
+        struct Chunked<'a> {
+            data: &'a [u8],
+            step: usize,
+            eintr_every: usize,
+            calls: usize,
+        }
+        impl std::io::Read for Chunked<'_> {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                self.calls += 1;
+                if self.eintr_every > 0 && self.calls % self.eintr_every == 0 {
+                    return Err(std::io::Error::from(std::io::ErrorKind::Interrupted));
+                }
+                let n = self.step.min(buf.len()).min(self.data.len());
+                buf[..n].copy_from_slice(&self.data[..n]);
+                self.data = &self.data[n..];
+                Ok(n)
+            }
+        }
+        let key = [0x42u8; blake3::KEY_LEN];
+        let modes = [blake3::Mode::Plain, blake3::Mode::Keyed(&key), blake3::Mode::DeriveKey("b3sum streaming outboard test")];
+        let lens = [0, 1, 1023, 1024, 1025, GROUP - 1, GROUP, GROUP + 1, 2 * GROUP - 1, 2 * GROUP, 2 * GROUP + 1, 3 * GROUP, 4 * GROUP + 37, 100_000];
+        let mut cvs_mem = Vec::new();
+        let mut cvs_stream = Vec::new();
+        for mode in modes {
+            for &len in &lens {
+                let data = painted(len);
+                let mut want_out = Vec::new();
+                let want_hash = outboard(mode, &data, 1, &mut cvs_mem, &mut want_out);
+                for &(step, eintr_every) in &[(17, 5), (GROUP, 0), (65_536, 3)] {
+                    let mut got_out = Vec::new();
+                    let mut reader = Chunked { data: &data, step, eintr_every, calls: 0 };
+                    let got_hash = outboard_from_reader(mode, &mut reader, &mut cvs_stream, &mut got_out).unwrap();
+                    assert_eq!(got_hash, want_hash, "root hash mismatch at len={len}, step={step}");
+                    assert_eq!(got_out, want_out, "outboard bytes mismatch at len={len}, step={step}");
+                }
+            }
+        }
     }
 }
