@@ -1,7 +1,7 @@
 #!/bin/sh
 # The b3sums crate archive for a release, packaged from a fresh clone of
 # the version commit with the dependency versions the repository names and
-# no others. Writes dist/b3sums-VERSION.crate with its .sha256 and .b3
+# no others. Writes dist/b3sums-VERSION.crate with its.sha256 and.b3
 # digest files beside it.
 #
 #     sh tools/crates-release.sh [--no-verify]
@@ -62,7 +62,7 @@ if [ ! -x "$cargo_bin" ] || [ ! -x "$rustc_bin" ]; then
 fi
 cp "$stage/checkout/Cargo.lock" "$stage/Cargo.lock.orig"
 # Run Cargo inside the staged checkout (outside the caller's tree) so Cargo
-# cannot inherit a caller-only .cargo/config.toml and uses any committed
+# cannot inherit a caller-only.cargo/config.toml and uses any committed
 # config in the release commit. Fetch locked dependencies first, then
 # package strictly frozen with the verified sysroot cargo and rustc.
 (
@@ -75,7 +75,7 @@ cmp -s "$stage/Cargo.lock.orig" "$stage/checkout/Cargo.lock" || { echo "crates-r
 # Stage archive and digest sidecars privately inside `$stage/out`, verify
 # before exposing anything in `$root/dist`, and publish atomically by rename
 # on the destination filesystem so a failed check never exposes partial files
-# or removes an existing good `dist/` artifact (R3 M8).
+# or removes an existing good `dist/` artifact.
 mkdir -p "$stage/out"
 cp "$stage"/target/package/*.crate "$stage/out/"
 (

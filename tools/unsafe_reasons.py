@@ -471,7 +471,7 @@ def _test_item_spans(code):
                 rest_pos += 1
             # Any `const` item (`const NAME:`, `const r#match:`, `const Δ:`,
             # `const _:`) ends at `;`; `const fn` / `const unsafe` / `const
-            # extern` are brace-terminated items; inline `const { ... }` is an
+            # extern` are brace-terminated items; inline `const {... }` is an
             # expression (so inside arrays/tuples/calls it stops at top-level `,`).
             is_const_block = rest_pos < n and code[rest_pos] == "{"
             if is_const_block:
@@ -555,7 +555,7 @@ def _test_item_spans(code):
                         seen_top_brace = False
                         j = m_else.end()
                         continue
-                    # For inline `const { ... }` block expressions, keep
+                    # For inline `const {... }` block expressions, keep
                     # scanning if followed by a postfix continuation (`.foo`,
                     # `?`, NOT a `..` range expression starting the next
                     # statement) or consume a trailing `;` or `,` (even on the
@@ -685,12 +685,21 @@ def _macro_call_end(code, bang_end):
     return j
 
 
+_ITEM_BOUNDARY_RE = re.compile(
+    r"^\s*(?:pub(?:\s*\([^)]*\))?\s+)?(?:(?:const|async|unsafe)\s+|extern\s+(?:\"[^\"]*\"\s+)?)*(?:fn|impl|mod|struct|enum|trait|type|static)\b"
+)
+_UNSAFE_IMPL_LINE_RE = re.compile(r"^\s*unsafe\s+impl\b")
+
+
 def without_reason(text):
     """The lines (numbers from 1, and the line) of `text`'s unsafe blocks
-    that have no non-empty `Sound:` comment within REACH lines above, skipping
-    test-only `#[cfg(test)]` modules/items."""
+    that have no non-empty `Sound:` comment within REACH lines above (stopping
+    at function/item boundaries so a rationale in one function cannot clear an
+    unrelated unsafe site in the next), skipping test-only `#[cfg(test)]`
+    modules/items."""
     raw_lines = text.split("\n")
     masked, comm_text = masked_code(text)
+    masked_lines = masked.split("\n")
     starts = _line_starts(masked)
     sound_lines = _lines_with_reason(comm_text, starts, SOUND_RE)
     found = []
@@ -700,7 +709,21 @@ def without_reason(text):
         if idx in seen_lines:
             continue
         seen_lines.add(idx)
-        if not any(ln in sound_lines for ln in range(max(0, idx - REACH), idx + 1)):
+        cur_is_unsafe_impl = bool(_UNSAFE_IMPL_LINE_RE.match(masked_lines[idx]))
+        ok = False
+        lo = max(0, idx - REACH)
+        for ln in range(idx, lo - 1, -1):
+            if ln in sound_lines:
+                ok = True
+                break
+            if ln < idx:
+                ml = masked_lines[ln]
+                if ml.startswith("}"):
+                    break
+                if _ITEM_BOUNDARY_RE.match(ml):
+                    if not (cur_is_unsafe_impl and _UNSAFE_IMPL_LINE_RE.match(ml)):
+                        break
+        if not ok:
             found.append((idx + 1, raw_lines[idx].strip()))
     return found
 

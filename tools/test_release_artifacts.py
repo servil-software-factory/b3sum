@@ -318,12 +318,12 @@ class TheNameIsTheSource(Repository):
             ra.Release(self.tag, self.repo, self.git("rev-parse", "HEAD"))
 
     def test_unstamped_root_manifest_is_refused(self):
-        # M20: stamping only another file while leaving root [package].version at +dev must fail.
+        # stamping only another file while leaving root [package].version at +dev must fail.
         why = self.version_commit(lambda: self.write("Cargo.toml", self.read("Cargo.toml").replace(self.version, "0.3.0+dev")))
         self.assertIn("Cargo.toml [package].version is '0.3.0+dev'", why)
 
     def test_version_shaped_edit_outside_manifest_and_lock_is_refused(self):
-        # M20: changing a version string in README.md or an undeclared Cargo.toml is refused.
+        # changing a version string in README.md or an undeclared Cargo.toml is refused.
         self.git("checkout", "-q", "--detach", self.code)
         self.write("README.md", "version 0.3.0+dev\n")
         self.git("commit", "-qam", "readme with dev version")
@@ -337,7 +337,7 @@ class TheNameIsTheSource(Repository):
             ra.Release("v" + new_ver, self.repo, self.git("rev-parse", "HEAD"))
 
     def test_stamping_git_dependency_version_in_cargo_lock_is_refused(self):
-        # M20: stamping a Git-pinned dependency (like blake3-servil in b3sum's
+        # stamping a Git-pinned dependency (like blake3-servil in b3sum's
         # real Cargo.lock) alongside the local crate must be rejected.
         self.git("checkout", "-q", "--detach", self.code)
         lock = (
@@ -361,7 +361,7 @@ class TheNameIsTheSource(Repository):
             ra.Release("v" + new_ver, self.repo, self.git("rev-parse", "HEAD"))
 
     def test_unstamped_cargo_lock_is_refused(self):
-        # M20: when Cargo.lock is present, its local package versions must match the release.
+        # when Cargo.lock is present, its local package versions must match the release.
         self.git("checkout", "-q", "--detach", self.code)
         self.write("Cargo.lock", 'version = 4\n\n[[package]]\nname = "top-crate"\nversion = "0.3.0+dev"\n\n[[package]]\nname = "sub-crate"\nversion = "0.3.0+dev"\n')
         self.git("add", "Cargo.lock")
@@ -505,7 +505,7 @@ class Published(Repository):
         self.assertTrue(all(line.startswith("clean      ") for line in lines), lines)
 
     def test_a_digest_file_of_other_bytes_or_of_nothing_here_or_of_another_kind_fails(self):
-        # BLAKE3 #439, #446: both .sha256 and .b3 digest files are held to their artifacts.
+        # BLAKE3 #439, #446: both.sha256 and.b3 digest files are held to their artifacts.
         program = f"b3sum-{self.tag}-x86_64-unknown-linux-gnu"
         bad_sha = f"{hashlib.sha256(b'another program').hexdigest()}  {program}\n".encode()
         bad_b3 = f"{ra.blake3_ref.blake3_hex(b'another program')}  {program}\n".encode()
@@ -1150,7 +1150,7 @@ class StandaloneB3sum(unittest.TestCase):
 
             # Dirty working tree edits (reverting [package].version to +dev,
             # corrupting the toolchain pin, and adding a poisoned caller-only
-            # .cargo/config.toml) must all be ignored because crates-release.sh
+            #.cargo/config.toml) must all be ignored because crates-release.sh
             # runs Cargo inside a fresh staged clone outside the caller's tree.
             with open(os.path.join(tmp, "Cargo.toml"), encoding="utf-8") as f:
                 dirty_manifest = f.read().replace(version, "0.12.0+dev")
@@ -1162,7 +1162,7 @@ class StandaloneB3sum(unittest.TestCase):
             with open(os.path.join(tmp, ".cargo", "config.toml"), "w", encoding="utf-8") as f:
                 f.write('[build]\nrustc = "/nonexistent/poison-rustc"\n')
 
-            # Positive run #1: packages clean reproducible .crate + .sha256 + .b3 and self-verifies.
+            # Positive run #1: packages clean reproducible.crate +.sha256 +.b3 and self-verifies.
             ok1 = subprocess.run(["sh", "tools/crates-release.sh", "--no-verify"], cwd=tmp, capture_output=True, text=True)
             self.assertEqual(ok1.returncode, 0, ok1.stdout + ok1.stderr)
             crate_name = f"b3sums-{version}.crate"
@@ -1204,7 +1204,7 @@ class StandaloneB3sum(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "exceeds maximum allowed size"):
             ra._read_bounded(io.BytesIO(b"abcde"), 4, "too-big")
 
-        # Oversized .crate archive expansion is rejected at the gzip stream layer
+        # Oversized.crate archive expansion is rejected at the gzip stream layer
         # before tarfile traversal, and member-count caps stop archive iteration early.
         buf = io.BytesIO()
         with tarfile.open(fileobj=buf, mode="w:gz") as tf:

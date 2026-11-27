@@ -140,7 +140,7 @@ pub(crate) fn validate_byte_stream_fd(fd: RawFd) -> crate::err::Result<FdMeta> {
 ///   completes promptly, though a stalled FUSE or network mount can still wait
 ///   on regular-file `write(2)` — an intentional trade-off so stderr redirected
 ///   to a log file still captures the fatal message before `_exit`/`abort`).
-/// - `S_IFSOCK`: uses per-call `send(2, ..., MSG_DONTWAIT)` (atomic non-blocking
+/// - `S_IFSOCK`: uses per-call `send(2,..., MSG_DONTWAIT)` (atomic non-blocking
 ///   without mutating fd flags).
 /// - `S_IFIFO` (pipes/FIFOs have no seek offset and no `TOSTOP`/`SIGTTOU`): on
 ///   Linux, reopens `/proc/self/fd/2` with `O_WRONLY | O_NONBLOCK | O_CLOEXEC`
@@ -421,7 +421,7 @@ fn is_verified_darwin_regular_dev_fd(path: &Path) -> bool {
     darwin_dev_fd_number(path).is_some() && std::fs::metadata(path).is_ok_and(|meta| meta.is_file())
 }
 
-/// Shared OS `stat` helper for pathname-to-identity checks (L3): rejects
+/// Shared OS `stat` helper for pathname-to-identity checks: rejects
 /// trailing slashes and Linux cloning PTY master devices (`/dev/ptmx`),
 /// returning `(S_IFMT file-type bits, StreamId)` on match.
 fn stat_path_identity(path: &Path) -> Option<(u32, StreamId)> {
@@ -465,7 +465,7 @@ pub(crate) fn open_checked(path: &Path, forbidden: Option<StreamId>) -> crate::e
 
 /// Inner implementation of [`open_checked`] parameterized on the open call so
 /// tests can inject a post-open descriptor swap after the pre-open path check
-/// passes, proving the post-open `fstat` guard fails closed on its own (M13).
+/// passes, proving the post-open `fstat` guard fails closed on its own.
 pub(crate) fn open_checked_with(path: &Path, forbidden: Option<StreamId>, open: impl FnOnce(&Path) -> io::Result<File>) -> crate::err::Result<(File, FdMeta)> {
     if let Some(forbid) = forbidden
         && path_matches_stream(path, forbid)
@@ -631,7 +631,7 @@ pub(crate) fn pread_rest_capped(file: &mut File, buf: &mut Vec<u8>, cap: usize) 
 }
 
 /// Query the current byte offset of a seekable descriptor, propagating OS
-/// errors (`ESPIPE`, `EBADF`, etc.) instead of substituting zero (M2).
+/// errors (`ESPIPE`, `EBADF`, etc.) instead of substituting zero.
 #[cfg(any(target_os = "macos", test))]
 pub(crate) fn current_fd_offset(fd: BorrowedFd<'_>) -> io::Result<u64> {
     // Sound: `lseek(SEEK_CUR)` queries the open file description's current
@@ -644,7 +644,7 @@ pub(crate) fn current_fd_offset(fd: BorrowedFd<'_>) -> io::Result<u64> {
 }
 
 /// Set the byte offset of a seekable descriptor to `offset`, rejecting
-/// `off_t` overflow and propagating OS errors (M2).
+/// `off_t` overflow and propagating OS errors.
 #[cfg(any(target_os = "macos", test))]
 pub(crate) fn set_fd_offset(fd: BorrowedFd<'_>, offset: u64) -> io::Result<()> {
     let off = libc::off_t::try_from(offset).map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "file offset exceeds off_t"))?;
@@ -684,7 +684,7 @@ pub(crate) fn pread_at(fd: BorrowedFd<'_>, offset: &mut u64, buf: &mut [u8]) -> 
 
 /// A lifetime-bound `Read` adapter that reads sequentially from a fixed
 /// starting offset on a borrowed Unix descriptor using `pread`, never
-/// modifying the underlying open file description's cursor (M6).
+/// modifying the underlying open file description's cursor.
 pub(crate) struct PreadReader<'a> {
     fd: BorrowedFd<'a>,
     offset: u64,

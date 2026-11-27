@@ -96,7 +96,7 @@ Options:
       --num-threads <NUM>     The most threads hashing at once [default: as fast as b3sum can]
       --no-mmap               Read every file and map none: a file that another program shortens
                               while b3sum hashes it then cannot stop the run
-      --no-names              Omit filenames in the output
+      --no-names              Omit filenames in the output (ignores --tag)
       --raw                   Write raw output bytes to stdout, rather than hex
       --tag                   Output BSD-style checksums: BLAKE3 ([FILE]) = [HASH]
   -c, --check                 Read BLAKE3 sums from the [FILE]s and check them

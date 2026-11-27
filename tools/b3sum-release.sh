@@ -33,7 +33,7 @@ root=$PWD
 commit=$(git rev-parse HEAD)
 parent=$(git rev-parse "${commit}^")
 # Read [package].version from the pinned commit's Cargo.toml (not dirty working
-# tree or a stray `version =` line in another TOML table; M16).
+# tree or a stray `version =` line in another TOML table).
 pkg_version=$(git show "$commit:Cargo.toml" | python3 -c 'import sys, tomllib; print(tomllib.loads(sys.stdin.read())["package"]["version"])')
 version=$pkg_version
 if [ "${version#*+}" = "$parent" ]; then
@@ -47,7 +47,7 @@ else
 	echo "b3sum-release: HEAD is no version commit (stamp Cargo.toml and Cargo.lock to X.Y.Z+<parent-commit>)" >&2
 	exit 1
 fi
-# Reserve the fixed reproducible build path exclusively (M19): never delete an
+# Reserve the fixed reproducible build path exclusively: never delete an
 # existing directory we did not create, and remove our own reservation exactly
 # once on EXIT (signals exit nonzero so EXIT runs cleanly without racing a
 # successor).
@@ -66,7 +66,7 @@ git -C "$build/source" checkout --quiet --detach "$commit"
 
 # Query host target, rustc version, sysroot, and toolchain pin strictly inside
 # the fresh clone (`$build/source`) so caller-only `rust-toolchain.toml` or
-# dirty caller-tree edits cannot diverge from the compiler Cargo invokes (M5).
+# dirty caller-tree edits cannot diverge from the compiler Cargo invokes.
 target=$(cd "$build/source" && rustc -vV | sed -n 's/^host: //p')
 sysroot=$(cd "$build/source" && rustc --print sysroot)
 if [ "$is_release" = 1 ]; then
@@ -104,7 +104,7 @@ staged_bin="$stage/$name"
 cp "$build/target/$target/release/b3sum" "$staged_bin"
 
 # Verify exact `--version` stdout (byte-for-byte including trailing LF) and exit
-# status (M16), and for a release commit run release_artifacts.py from the clone.
+# status, and for a release commit run release_artifacts.py from the clone.
 printf '%s\n' "$expected_version" > "$stage/version.want"
 "$staged_bin" --version > "$stage/version.out"
 if ! cmp -s "$stage/version.out" "$stage/version.want"; then
@@ -116,7 +116,7 @@ if [ -n "$version" ]; then
 	python3 "$build/source/tools/release_artifacts.py" "v$version" "$staged_bin" --commit "$commit"
 fi
 # The binary checks itself against BLAKE3's published digest of nothing,
-# then both .sha256 and .b3 are written independently of the binary under
+# then both.sha256 and.b3 are written independently of the binary under
 # check (tools/blake3_ref.py from the clone) and cross-checked against it.
 test "$(printf '' | "$staged_bin" --no-names)" = af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262
 (cd "$stage" && { sha256sum "$name" 2>/dev/null || shasum -a 256 "$name"; } > "$name.sha256")

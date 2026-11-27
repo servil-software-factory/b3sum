@@ -1,6 +1,6 @@
 //! Embed `b3sum`'s own build version (`X.Y.Z+<commit>[.dirty]`) from this
 //! repository rather than the pinned `blake3-servil` library version, and
-//! enforce the supported target contract at build time (R3 M4).
+//! enforce the supported target contract at build time.
 
 #[cfg(unix)]
 mod build_version;
@@ -31,7 +31,7 @@ fn main() {
         for path in watched {
             // Cargo's build-script stdout protocol is UTF-8 and line-delimited:
             // never emit a lossily-replaced or newline-containing path that could
-            // silently watch the wrong target or inject a build directive (F7).
+            // silently watch the wrong target or inject a build directive.
             if let Some(s) = path.to_str()
                 && !s.contains('\n')
                 && !s.contains('\r')

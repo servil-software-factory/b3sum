@@ -92,7 +92,7 @@ pub(crate) fn hash_single_cold_large_file_1t(args: &Args, file: &File, hint_size
 /// Count numeric file descriptors currently open below `nofile_cap` via
 /// `/proc/self/fd` (excluding the directory FD held by `read_dir` itself), so
 /// worker/ring descriptor budgets account for inherited open FDs without
-/// letting FDs above a lowered soft limit throttle capacity (M28). Returns
+/// letting FDs above a lowered soft limit throttle capacity. Returns
 /// `None` if `/proc/self/fd` is unavailable or yields an incomplete census.
 fn count_open_fds_below(nofile_cap: usize) -> Option<usize> {
     let entries = std::fs::read_dir("/proc/self/fd").ok()?;
@@ -111,7 +111,7 @@ fn count_open_fds_below(nofile_cap: usize) -> Option<usize> {
 }
 
 /// Size multi-file I/O worker count and per-ring slot depth from the effective
-/// `RLIMIT_NOFILE` cap and live open-FD count below that cap (M28). Falls back
+/// `RLIMIT_NOFILE` cap and live open-FD count below that cap. Falls back
 /// conservatively to `(1, 1)` when the live FD census is unknown so workers
 /// cannot starve one another with `EMFILE`.
 fn size_ring_workers(nofile_cap: usize, open_fds: Option<usize>, desired_io_threads: usize, desired_slots: usize) -> (usize, usize) {
@@ -150,7 +150,7 @@ fn grow_descriptor_table(descriptors: usize) -> usize {
     if target >= 63 {
         // F_DUPFD takes the lowest free number from `target` up, so it
         // never lands on a descriptor the caller gave this process
-        // (`b3sum /dev/fd/255 ...`). dup2 did: it closed that file
+        // (`b3sum /dev/fd/255...`). dup2 did: it closed that file
         // without a word, and a later open could take its number.
         // Sound: opens `/dev/null` and closes every descriptor opened here once.
         unsafe {
@@ -432,7 +432,7 @@ impl Sink<'_> {
 }
 
 // Compile-time layout proof for `WarmBatch`'s `MaybeUninit<Block>` <-> byte
-// reinterpretation (M9).
+// reinterpretation.
 const _: () = {
     assert!(size_of::<Block>() == 64);
     assert!(align_of::<Block>() <= 64);
@@ -454,7 +454,7 @@ impl WarmBatch {
         self.arena.is_some()
     }
 
-    /// Borrow the next free arena slot for a direct read into `WarmBatch` (M9).
+    /// Borrow the next free arena slot for a direct read into `WarmBatch`.
     #[inline]
     fn next_slot_mut(&mut self) -> (usize, &mut [MaybeUninit<u8>]) {
         let slot = self.len;
@@ -462,11 +462,11 @@ impl WarmBatch {
     }
 
     /// Register `byte_len` initialized bytes written into `slot`, flushing when
-    /// full (M9).
+    /// full.
     ///
     /// # Safety
     /// The caller must have initialized at least the first `byte_len` bytes of
-    /// `slot` (obtained from [`Self::next_slot_mut`]) before calling (M7).
+    /// `slot` (obtained from [`Self::next_slot_mut`]) before calling.
     #[inline]
     unsafe fn commit_slot(&mut self, slot: usize, file_idx: usize, byte_len: usize, mode: blake3::Mode<'_>, sink: &mut Sink<'_>) {
         assert_eq!(slot, self.len, "warm batch slot committed out of order");
@@ -590,7 +590,7 @@ pub(crate) static AFTER_OPEN: std::sync::Mutex<Option<std::sync::Arc<dyn Fn(&std
 
 /// Test seam invoked immediately after the multi-reader collector closes the
 /// claim queue (`next.fetch_max(nfiles)`) on cancellation, so tests can sample
-/// `FILES_CLAIMED` and release held helpers strictly after cancellation (M26).
+/// `FILES_CLAIMED` and release held helpers strictly after cancellation.
 #[cfg(test)]
 pub(crate) static AFTER_CANCEL: std::sync::Mutex<Option<std::sync::Arc<dyn Fn() + Send + Sync>>> = std::sync::Mutex::new(None);
 
@@ -747,7 +747,7 @@ impl ColdRingState {
 
     /// Install `st` into `self.slots[sid]` and queue an `IORING_OP_READ` into
     /// its spare capacity at `st.buf.len()`. Centralizes the ownership/lifetime
-    /// order across initial queueing, `EINTR` retry, and partial reads (M8).
+    /// order across initial queueing, `EINTR` retry, and partial reads.
     fn submit_slot(&mut self, sid: usize, mut st: SmallSlot) {
         while self.ring.sq_space_left() == 0 {
             self.ring.submit_and_wait(0);
@@ -767,7 +767,7 @@ impl ColdRingState {
     }
 
     /// Close a finished slot's descriptor, return `slot_id`, and recycle its
-    /// buffer if within the 256 KiB reuse cutoff (M8, L4).
+    /// buffer if within the 256 KiB reuse cutoff.
     fn retire_slot(&mut self, slot_id: usize, mut st: SmallSlot) {
         drop(st.file);
         self.free_slot_ids.push(slot_id);
@@ -889,17 +889,6 @@ impl ColdRingState {
     }
 }
 
-/// Hash `paths` in parallel and deliver `(index, result)` in exact `0..paths.len()`
-/// order to `on_ordered` (which returns `false` to stop early).
-pub(crate) fn hash_paths(
-    args: &Args,
-    paths: &[PathBuf],
-    forbidden: Option<StreamId>,
-    on_ordered: &mut dyn FnMut(usize, crate::err::Result<blake3::Hash>) -> bool,
-) {
-    hash_paths_inner(args, paths, forbidden, false, on_ordered);
-}
-
 /// The threads that read and hash `nfiles` files, of `total_threads`:
 /// four for up to 63 files, one more for every 32 files from 64, twelve
 /// at the most. Each thread costs its start and its ring, which a hundred
@@ -921,11 +910,12 @@ fn multi_file_direct_threads(total_threads: usize, io_threads: usize) -> usize {
     (crate::DIRECT_THREADS / workers).max(1).min((total_threads / workers).max(1))
 }
 
-fn hash_paths_inner(
+/// Hash `paths` in parallel and deliver `(index, result)` in exact `0..paths.len()`
+/// order to `on_ordered` (which returns `false` to stop early).
+pub(crate) fn hash_paths(
     args: &Args,
     paths: &[PathBuf],
     forbidden: Option<StreamId>,
-    force_no_uring: bool,
     on_ordered: &mut dyn FnMut(usize, crate::err::Result<blake3::Hash>) -> bool,
 ) {
     let nfiles = paths.len();
@@ -939,7 +929,7 @@ fn hash_paths_inner(
 
     let nofile_cap = grow_descriptor_table(desired_io_threads * (desired_slots + 8) + 64);
     // Keep cross-worker descriptor usage within `RLIMIT_NOFILE`: count actually
-    // open inherited FDs below `nofile_cap` (M28) plus 3 spares for ring/misc,
+    // open inherited FDs below `nofile_cap` plus 3 spares for ring/misc,
     // collapsing to `(1, 1)` if the census is unavailable or to 1 reader when
     // free slots are tight so EMFILE draining always reclaims its own slots.
     let (io_threads, slots_per_ring) = size_ring_workers(nofile_cap, count_open_fds_below(nofile_cap), desired_io_threads, desired_slots);
@@ -949,7 +939,7 @@ fn hash_paths_inner(
     if io_threads == 1 {
         let next = AtomicUsize::new(0);
         let mut collector = crate::OrderedCollector::new(nfiles);
-        run_hybrid_worker(args, paths, forbidden, slots_per_ring, total_threads, 1, force_no_uring, &next, &mut |idx, res| {
+        run_hybrid_worker(args, paths, forbidden, slots_per_ring, total_threads, 1, &next, &mut |idx, res| {
             collector.insert_and_drain(idx, res, &mut *on_ordered, || {})
         });
         collector.finish("single-reader collector");
@@ -966,9 +956,7 @@ fn hash_paths_inner(
             }
             let (next_ref, tx) = (&next, done_tx.clone());
             scope.spawn(move || {
-                run_hybrid_worker(args, paths, forbidden, slots_per_ring, total_threads, io_threads, force_no_uring, next_ref, &mut |i, res| {
-                    tx.send((i, res)).is_ok()
-                });
+                run_hybrid_worker(args, paths, forbidden, slots_per_ring, total_threads, io_threads, next_ref, &mut |i, res| tx.send((i, res)).is_ok());
             });
         }
         drop(done_tx);
@@ -988,7 +976,7 @@ fn hash_paths_inner(
         };
 
         let mut keep_going = true;
-        run_hybrid_worker(args, paths, forbidden, slots_per_ring, total_threads, io_threads, force_no_uring, &next, &mut |i, res| {
+        run_hybrid_worker(args, paths, forbidden, slots_per_ring, total_threads, io_threads, &next, &mut |i, res| {
             while let Ok((wi, wres)) = done_rx.try_recv() {
                 if !take(wi, wres) {
                     keep_going = false;
@@ -1013,7 +1001,7 @@ fn hash_paths_inner(
     });
 }
 
-/// Worker-local lifecycle of the `io_uring` cold-file backend (M10).
+/// Worker-local lifecycle of the `io_uring` cold-file backend.
 /// Replaces paired `Option<ColdRingState>` + `bool` so contradictory states
 /// are unrepresentable.
 enum ColdRing {
@@ -1023,10 +1011,6 @@ enum ColdRing {
 }
 
 impl ColdRing {
-    fn new(force_disabled: bool) -> Self {
-        if force_disabled { Self::Disabled } else { Self::Untried }
-    }
-
     #[inline]
     fn active_mut(&mut self) -> Option<&mut ColdRingState> {
         match self {
@@ -1072,14 +1056,13 @@ fn run_hybrid_worker(
     max_slots: usize,
     total_threads: usize,
     io_threads: usize,
-    force_no_uring: bool,
     next: &AtomicUsize,
     done: &mut dyn FnMut(usize, crate::err::Result<blake3::Hash>) -> bool,
 ) {
     let mut warm_batch = WarmBatch::new();
     let mut medium_buf: Vec<u8> = Vec::new();
     let mut warm_pipe: Option<WarmLargePipe> = None;
-    let mut cold = ColdRing::new(force_no_uring);
+    let mut cold = ColdRing::Untried;
     let mut direct_piece: Option<crate::direct::Piece> = None;
     let mut probe_stack: [MaybeUninit<u8>; WARM_SLOT_BLOCKS * 64] = [MaybeUninit::uninit(); WARM_SLOT_BLOCKS * 64];
     let mut sink = Sink { done, open: true };
@@ -1145,7 +1128,7 @@ fn run_hybrid_worker(
 
         // From here on the file is the one opened above, on every path:
         // nothing opens its name again, which may name another file by now.
-        // Pass the already-queried `FdMeta` to avoid redundant `fstat` calls (M5).
+        // Pass the already-queried `FdMeta` to avoid redundant `fstat` calls.
         if !meta.is_file() {
             sink.put(i, crate::hash_open_file_with_meta(args, file, meta).map(|hr| hr.hash));
             continue;
@@ -1172,8 +1155,8 @@ fn run_hybrid_worker(
                 let res = try_pread_cached(file.as_raw_fd(), dst, 0);
                 // If we got a partial prefix into the arena slot, copy it into
                 // `probe_stack` before releasing the borrow on `warm_batch` so
-                // `cold.queue_file(..., &mut warm_batch, ...)` never aliases
-                // the arena (M9).
+                // `cold.queue_file(..., &mut warm_batch,...)` never aliases
+                // the arena.
                 if let Ok(CacheRead::NeedMore(partial_at) | CacheRead::NonSeekable(partial_at)) = res
                     && partial_at > 0
                 {
@@ -1276,7 +1259,7 @@ fn run_hybrid_worker(
                 let pool_workers = if args.num_threads().is_some() { crate::pool_threads().get() } else { total_threads };
                 // Don't start a 1-thread global pool singleton when a local
                 // hash suffices; keeps the singleton available for later
-                // parallel batches (M27).
+                // parallel batches.
                 if pool_workers <= 1 && crate::actual_pool_threads() == 0 {
                     let h = blake3::convenience::hash_with(args.mode, &map);
                     crate::hold(map);
@@ -1289,7 +1272,7 @@ fn run_hybrid_worker(
                 continue;
             }
 
-            // Cold `512 KiB .. 4 MiB`: queue into `ColdRingState` sliding window if possible!
+            // Cold `512 KiB.. 4 MiB`: queue into `ColdRingState` sliding window if possible!
             if size < COLD_RING_MAX_FILE {
                 drop(map);
                 if let Some(c) = cold.get_or_init(max_slots) {
@@ -1351,7 +1334,7 @@ fn run_hybrid_worker(
         // Skip initializing a 1-thread global pool singleton when file readers
         // temporarily occupy the thread budget (`pool_workers <= 1` and the
         // pool is still uninitialized); fall through to the local streaming
-        // reader so later parallel batches keep full width (R3 M2).
+        // reader so later parallel batches keep full width.
         let mut retire_cold_ring = false;
         let cold_pool_workers = if args.num_threads().is_some() { crate::pool_threads().get() } else { total_threads.min(COLD_RING_MAX_POOL_WORKERS) };
         let use_cold_ring = cold_pool_workers > 1 || crate::actual_pool_threads() != 0;
@@ -1530,7 +1513,7 @@ mod test {
             assert_eq!(wb_out, want, "{lens:?}");
         }
 
-        // Fault injection: exercise `force_no_uring = true` across cold evicted files of all size classes!
+        // Fault injection: disable io_uring via `uring::REFUSED` across cold evicted files of all size classes.
         let mut paths: Vec<PathBuf> = Vec::new();
         let mut want: Vec<blake3::Hash> = Vec::new();
         for (i, &len) in [0usize, 19, 4096, 16384, 90_000, 600_000].iter().enumerate() {
@@ -1549,11 +1532,13 @@ mod test {
         }
         let args = crate::Args::for_test_plain(paths.clone());
         let mut got = Vec::new();
-        super::hash_paths_inner(&args, &paths, None, true, &mut |idx, res| {
+        crate::uring::REFUSED.store(true, std::sync::atomic::Ordering::Relaxed);
+        super::hash_paths(&args, &paths, None, &mut |idx, res| {
             assert_eq!(idx, got.len());
             got.push(res.unwrap());
             true
         });
+        crate::uring::REFUSED.store(false, std::sync::atomic::Ordering::Relaxed);
         assert_eq!(got, want);
     }
 
@@ -1628,11 +1613,11 @@ mod test {
         (paths, want)
     }
 
-    /// Every result of `hash_paths_inner`, which must arrive in order.
+    /// Every result of `hash_paths`, which must arrive in order.
     fn hashes_in_order(paths: &[PathBuf]) -> Vec<blake3::Hash> {
         let args = crate::Args::for_test_plain(paths.to_vec());
         let mut got = Vec::new();
-        super::hash_paths_inner(&args, paths, None, false, &mut |index, result| {
+        super::hash_paths(&args, paths, None, &mut |index, result| {
             assert_eq!(index, got.len(), "results arrive in order");
             got.push(result.unwrap());
             true
@@ -1654,7 +1639,7 @@ mod test {
         // A listener that stops: it hears nothing after the result it refused.
         let args = crate::Args::for_test_plain(paths.clone());
         let mut heard = Vec::new();
-        super::hash_paths_inner(&args, &paths, None, false, &mut |index, result| {
+        super::hash_paths(&args, &paths, None, &mut |index, result| {
             assert_eq!(result.unwrap(), want[index]);
             heard.push(index);
             index < 7
@@ -1666,7 +1651,7 @@ mod test {
         with_missing.insert(3, dir.path().join("no-such-file"));
         let args = crate::Args::for_test_plain(with_missing.clone());
         let mut results = Vec::new();
-        super::hash_paths_inner(&args, &with_missing, None, false, &mut |index, result| {
+        super::hash_paths(&args, &with_missing, None, &mut |index, result| {
             assert_eq!(index, results.len());
             results.push(result.ok());
             true
@@ -1914,12 +1899,14 @@ mod test {
             std::fs::write(path, b"another file").unwrap();
         }));
         super::set_force_miss(true);
+        crate::uring::REFUSED.store(true, std::sync::atomic::Ordering::Relaxed);
         let args = crate::Args::for_test_plain(paths.clone());
         let mut got = Vec::new();
-        super::hash_paths_inner(&args, &paths, None, true, &mut |i, hash| {
+        super::hash_paths(&args, &paths, None, &mut |i, hash| {
             got.push((i, hash.unwrap()));
             true
         });
+        crate::uring::REFUSED.store(false, std::sync::atomic::Ordering::Relaxed);
         super::set_force_miss(false);
         *super::AFTER_OPEN.lock().unwrap() = None;
         got.sort_by_key(|(i, _)| *i);
@@ -1955,7 +1942,7 @@ mod test {
         let fifo = dir.path().join("manifest.fifo");
         assert!(std::process::Command::new("mkfifo").arg(&fifo).status().unwrap().success());
         // Open O_RDWR on the FIFO so a reader and writer stay open without blocking
-        // when `hash_paths_inner` opens `&fifo` a second time.
+        // when `hash_paths` opens `&fifo` a second time.
         let mut rw = std::fs::OpenOptions::new().read(true).write(true).open(&fifo).unwrap();
         rw.write_all(b"untouched-manifest-bytes").unwrap();
         let reader = std::fs::File::open(&fifo).unwrap();
@@ -1965,11 +1952,13 @@ mod test {
         let paths = vec![fifo.clone(), other.clone()];
         let args = crate::Args::for_test_plain(paths.clone());
         let mut results = Vec::new();
-        super::hash_paths_inner(&args, &paths, Some(meta.id), true, &mut |idx, res| {
+        crate::uring::REFUSED.store(true, std::sync::atomic::Ordering::Relaxed);
+        super::hash_paths(&args, &paths, Some(meta.id), &mut |idx, res| {
             assert_eq!(idx, results.len());
             results.push(res);
             true
         });
+        crate::uring::REFUSED.store(false, std::sync::atomic::Ordering::Relaxed);
         assert!(results[0].is_err(), "opened descriptor matching forbidden stream must be refused");
         assert_eq!(results[1].as_ref().unwrap(), &blake3::convenience::hash(b"ok"));
         // Close the write end (O_RDWR handle) and verify none of the FIFO bytes were consumed!
@@ -2062,7 +2051,7 @@ mod test {
         super::DIRECT_MULTI_SUCCEEDED.store(0, Ordering::Relaxed);
         super::set_force_miss(true);
         let mut got = vec![None; 2];
-        super::hash_paths_inner(&args, &paths, None, false, &mut |i, res| {
+        super::hash_paths(&args, &paths, None, &mut |i, res| {
             got[i] = Some(res.unwrap());
             true
         });
@@ -2095,7 +2084,7 @@ mod test {
         super::DIRECT_MULTI_LAST_THREADS.store(0, Ordering::Relaxed);
         super::set_force_miss(true);
         let mut got = vec![None; 2];
-        super::hash_paths_inner(&args, &paths, None, false, &mut |i, res| {
+        super::hash_paths(&args, &paths, None, &mut |i, res| {
             got[i] = Some(res.unwrap());
             true
         });
@@ -2114,7 +2103,7 @@ mod test {
         super::DIRECT_MULTI_SUCCEEDED.store(0, Ordering::Relaxed);
         super::set_force_miss(true);
         let mut got2 = vec![None; 2];
-        super::hash_paths_inner(&args, &paths, None, false, &mut |i, res| {
+        super::hash_paths(&args, &paths, None, &mut |i, res| {
             got2[i] = Some(res.unwrap());
             true
         });
@@ -2147,12 +2136,14 @@ mod test {
         let completed_before = super::WARM_PIPE_COMPLETED.load(Ordering::Relaxed);
         let next = std::sync::atomic::AtomicUsize::new(0);
         let mut closed_at = None;
-        super::run_hybrid_worker(&args, &paths, None, 16, 1, 1, true, &next, &mut |idx, res| {
+        crate::uring::REFUSED.store(true, Ordering::Relaxed);
+        super::run_hybrid_worker(&args, &paths, None, 16, 1, 1, &next, &mut |idx, res| {
             assert_eq!(idx, 0);
             assert_eq!(res.unwrap(), blake3::convenience::hash(&data));
             closed_at = Some(next.load(Ordering::Relaxed));
             false
         });
+        crate::uring::REFUSED.store(false, Ordering::Relaxed);
         assert_eq!(super::WARM_PIPE_COMPLETED.load(Ordering::Relaxed) - completed_before, 1, "operand 0 must complete through WarmLargePipe::drain (#568)");
         assert_eq!(closed_at, Some(1), "top-of-loop WarmLargePipe::drain must close the sink after operand 0 before claiming operand 1");
         assert_eq!(next.load(Ordering::Relaxed), 1, "worker must not claim operand 1 after WarmLargePipe::drain closes sink (#564)");
@@ -2267,7 +2258,7 @@ mod test {
         // until at least one helper has actually reached the gate, then sample
         // `FILES_CLAIMED` and release the gate from `AFTER_CANCEL` strictly
         // AFTER `next.fetch_max(nfiles)` closes the claim queue. After join,
-        // assert ZERO new operands were claimed after cancellation (M26).
+        // assert ZERO new operands were claimed after cancellation.
         let main_tid = std::thread::current().id();
         let arrived = Arc::new((Mutex::new(0usize), Condvar::new()));
         let gate = Arc::new((Mutex::new(false), Condvar::new()));
@@ -2308,7 +2299,8 @@ mod test {
         let args = crate::Args::for_test_plain_threads(paths.clone(), 4);
         super::FILES_CLAIMED.store(0, Ordering::SeqCst);
         let mut emitted = Vec::new();
-        super::hash_paths_inner(&args, &paths, None, true, &mut |idx, res| {
+        crate::uring::REFUSED.store(true, Ordering::Relaxed);
+        super::hash_paths(&args, &paths, None, &mut |idx, res| {
             emitted.push((idx, res.unwrap()));
             let (lock, cvar) = &*arrived;
             let guard = lock.lock().unwrap();
@@ -2316,6 +2308,7 @@ mod test {
             assert!(!wait_res.timed_out(), "at least one helper must reach the gate before closing sink");
             false
         });
+        crate::uring::REFUSED.store(false, Ordering::Relaxed);
         *super::AFTER_OPEN.lock().unwrap() = None;
         *super::AFTER_CANCEL.lock().unwrap() = None;
         assert!(!timed_out.load(Ordering::SeqCst), "cancellation rendezvous must complete without timing out (M26)");
@@ -2333,7 +2326,7 @@ mod test {
     fn size_ring_workers_accounts_for_inherited_fds_and_unknown_census() {
         // At RLIMIT_NOFILE=24 with 10 inherited open FDs, only 11 usable FDs
         // remain (< 16), so sizing collapses to 1 reader (the old `24 - 6 = 18`
-        // formula would have spawned 4 readers and raced on EMFILE; M28).
+        // formula would have spawned 4 readers and raced on EMFILE).
         assert_eq!(super::size_ring_workers(24, Some(10), 4, 32), (1, 10));
         // Unknown census (procfs unavailable / incomplete) falls back to (1, 1).
         assert_eq!(super::size_ring_workers(64, None, 4, 32), (1, 1));

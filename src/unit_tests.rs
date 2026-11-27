@@ -373,7 +373,7 @@ fn cloning_ptmx_is_not_classified_as_stream_alias() {
 fn record_oriented_sockets_and_packet_pipes_are_rejected() {
     blake3::initialize();
     use std::os::fd::FromRawFd;
-    // SOCK_STREAM must be accepted (assert socketpair succeeds on supported Unix targets; L10).
+    // SOCK_STREAM must be accepted (assert socketpair succeeds on supported Unix targets).
     let mut sv = [-1 as libc::c_int; 2];
     // Sound: `sv` is a valid 2-element stack array.
     assert_eq!(unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, sv.as_mut_ptr()) }, 0, "socketpair(AF_UNIX, SOCK_STREAM) failed");
@@ -564,7 +564,7 @@ fn num_threads_two_confines_eagerly() {
 
 #[test]
 fn validate_and_ensure_byte_stream_fd_fail_closed_on_os_error() {
-    // H3: failing `getsockopt(SO_TYPE)` on a socket descriptor must return an OS
+    // failing `getsockopt(SO_TYPE)` on a socket descriptor must return an OS
     // error, never treat the failure as permission to hash the descriptor.
     let err = crate::file_end::ensure_byte_stream_fd(-1, libc::S_IFSOCK).unwrap_err();
     assert!(!err.to_string().is_empty());
@@ -575,7 +575,7 @@ fn validate_and_ensure_byte_stream_fd_fail_closed_on_os_error() {
 
 #[test]
 fn collect_check_batch_enforces_retained_byte_budget() {
-    // H4: a manifest with many long lines must flush once retained path bytes
+    // a manifest with many long lines must flush once retained path bytes
     // reach `max_batch_bytes`, rather than buffering `max_entries` huge paths.
     let digest = "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262";
     let mut manifest = Vec::new();
@@ -623,7 +623,7 @@ fn collect_check_batch_enforces_retained_byte_budget() {
 
 #[test]
 fn sigbus_exits_promptly_with_full_undrained_stderr_pipe_and_writes_when_writable() {
-    // H5: fatal SIGBUS termination must neither block on an undrained full
+    // fatal SIGBUS termination must neither block on an undrained full
     // stderr pipe nor stall in `pause()`, while still emitting the explanation
     // when stderr is a writable file (and on Linux, a writable pipe/tty via
     // `/proc/self/fd/2` with independent `O_NONBLOCK`).
@@ -691,7 +691,7 @@ fn sigbus_exits_promptly_with_full_undrained_stderr_pipe_and_writes_when_writabl
         .stderr(std::process::Stdio::from(stderr_file))
         .spawn()
         .unwrap();
-    // 8 s parent deadline (documented in `.config/nextest.toml`) so the H5
+    // 8 s parent deadline (documented in `.config/nextest.toml`) so the SIGBUS
     // planted-fault control fails cleanly instead of hitting nextest's 60 s cap.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
     let status = loop {
@@ -713,7 +713,7 @@ fn sigbus_exits_promptly_with_full_undrained_stderr_pipe_and_writes_when_writabl
 #[cfg(target_os = "linux")]
 #[test]
 fn hash_open_file_ex_streams_full_file_when_file_grows_during_direct_read() {
-    // H2: if `direct::hash` observes the file grew (positive final EOF probe),
+    // if `direct::hash` observes the file grew (positive final EOF probe),
     // `hash_open_file_ex` must discard its stale mmap and stream the descriptor
     // to actual EOF instead of returning the hash of the earlier prefix.
     use std::io::Write;
@@ -765,7 +765,7 @@ fn hash_open_file_ex_streams_full_file_when_file_grows_during_direct_read() {
 #[cfg(target_os = "linux")]
 #[test]
 fn direct_read_workers_stop_claiming_pieces_after_error() {
-    // M29: once one worker records an error on piece 0 while 11 valid pieces
+    // once one worker records an error on piece 0 while 11 valid pieces
     // remain, peer workers must stop claiming remaining pieces instead of
     // reading the rest of the file (counts claims BEFORE `pread`).
     use std::os::unix::fs::OpenOptionsExt;
@@ -825,7 +825,7 @@ fn checked_fd_offset_helpers_propagate_espipe_and_overflow() {
     assert_eq!(err2.kind(), std::io::ErrorKind::InvalidInput);
 
     // Non-seekable pipe: current_fd_offset and set_fd_offset must propagate ESPIPE
-    // rather than substituting 0 (M2).
+    // rather than substituting 0.
     let mut ends = [0i32; 2];
     assert_eq!(unsafe { libc::pipe(ends.as_mut_ptr()) }, 0);
     let r = unsafe { std::fs::File::from_raw_fd(ends[0]) };
@@ -837,7 +837,7 @@ fn checked_fd_offset_helpers_propagate_espipe_and_overflow() {
 
 #[test]
 fn post_open_forbidden_stream_guard_rejects_swapped_descriptor() {
-    // M13: `ordinary` passes the pre-open `path_matches_stream` check, then
+    // `ordinary` passes the pre-open `path_matches_stream` check, then
     // the injected open returns an open descriptor for the forbidden FIFO.
     // Removing only the post-open `fstat` guard in `open_checked_with` makes
     // this test fail.
@@ -878,7 +878,7 @@ fn run_ordered_collector_emits_in_order_and_stops_claiming_on_cancel() {
     // helpers are released from the gate (`after_cancel(claimed_before_close)`),
     // proving EVERY index executed by any thread was claimed strictly BEFORE
     // `next.fetch_max(count, SeqCst)` (`max_index_executed < claimed_before_close`)
-    // — 100% scheduling-independent (M3).
+    // — 100% scheduling-independent.
     let main_tid = std::thread::current().id();
     let arrived = Arc::new((Mutex::new(0usize), Condvar::new()));
     let gate = Arc::new((Mutex::new(false), Condvar::new()));
@@ -965,7 +965,7 @@ fn streaming_small_input_does_not_allocate_second_buffer() {
 #[test]
 fn use_pool_for_respects_actual_pool_width_vs_prospective_budget() {
     // Under a fully occupied FileThreadsGuard, prospective `pool_threads()` is 1
-    // so `use_pool_for` must not attempt to start a 1-thread singleton (M27).
+    // so `use_pool_for` must not attempt to start a 1-thread singleton.
     let total = crate::threads().get();
     let _guard = crate::FileThreadsGuard::enter(total);
     assert_eq!(crate::pool_threads().get(), 1);
@@ -983,7 +983,7 @@ fn cold_ring_temporary_width_one_does_not_freeze_global_pool_at_one() {
     // Two >= 4 MiB cold files under `--num-threads 2` allocate 2 file readers
     // (`cold_pool_workers = 1`); the cold ring must fall back to local
     // streaming instead of freezing `ACTUAL_POOL_THREADS` at 1, leaving a
-    // subsequent lone large file free to initialize the pool at width 2 (R3 M2).
+    // subsequent lone large file free to initialize the pool at width 2.
     blake3::initialize();
     let dir = crate::tempfile::tempdir().unwrap();
     let a = dir.path().join("a.bin");

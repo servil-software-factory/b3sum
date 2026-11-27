@@ -42,7 +42,7 @@ fn git_bytes_with_stdin(dir: &Path, args: &[&str], index: Option<&Path>, objects
     if let Some((private_obj, alternates)) = objects {
         // Redirect all newly written Git objects (dirty blobs and synthetic
         // trees) into private build scratch while reading existing objects
-        // read-only from the resolved object store + inherited alternates (M17).
+        // read-only from the resolved object store + inherited alternates.
         command.env("GIT_OBJECT_DIRECTORY", private_obj);
         command.env("GIT_ALTERNATE_OBJECT_DIRECTORIES", alternates);
     }
@@ -134,7 +134,7 @@ pub fn build_version(krate: &Path, version: &str, scratch: &Path) -> (String, Ve
     let alternates = build_alternates_env(&real_objects);
     // The working tree as Git would commit it, through an index and object
     // directory of our own inside `scratch` so uncommitted files are never
-    // written into the repository's `.git/objects` (M17).
+    // written into the repository's `.git/objects`.
     let index = scratch.join("build-version-index");
     let private_objects = scratch.join("build-version-objects");
     let _ = std::fs::remove_file(&index);
@@ -143,8 +143,8 @@ pub fn build_version(krate: &Path, version: &str, scratch: &Path) -> (String, Ve
     let objs = Some((private_objects.as_path(), alternates.as_os_str()));
     // Always populate the scratch index from `HEAD` via `read-tree` instead of
     // copying `.git/index` so `assume-unchanged` / `skip-worktree` flags cannot
-    // hide modified source bytes as clean (M1). Hash the exact input set that
-    // `watched()` invalidates in Cargo (R3 M3): every tracked file (via
+    // hide modified source bytes as clean. Hash the exact input set that
+    // `watched()` invalidates in Cargo: every tracked file (via
     // `add -u`), every existing path currently staged in the real index (incl.
     // staged root files and force-added ignored files), and every non-ignored
     // untracked file under tracked top-level subdirectories (e.g. `src/`,
@@ -207,7 +207,7 @@ pub fn build_version(krate: &Path, version: &str, scratch: &Path) -> (String, Ve
     (name, watched(dir, &git_dir, &common, &cached_raw, &existing_top_dirs))
 }
 
-/// Minimal strict RFC 8259 JSON parser for `.cargo_vcs_info.json` (M16):
+/// Minimal strict RFC 8259 JSON parser for `.cargo_vcs_info.json`:
 /// validates the entire document with no trailing garbage and returns typed
 /// values so unrelated top-level keys cannot shadow `git.sha1` / `git.dirty`.
 #[derive(Debug)]
@@ -263,7 +263,7 @@ impl<'a> JsonParser<'a> {
                             let code = u16::from_str_radix(hex, 16).ok()?;
                             self.pos += 4;
                             if (0xD800..=0xDBFF).contains(&code) {
-                                // UTF-16 high surrogate: must be followed by `\uXXXX` low surrogate (M3).
+                                // UTF-16 high surrogate: must be followed by `\uXXXX` low surrogate.
                                 if self.bytes.get(self.pos..self.pos + 2) != Some(b"\\u") {
                                     return None;
                                 }
@@ -292,7 +292,7 @@ impl<'a> JsonParser<'a> {
                 0x00..=0x1F => return None,
                 0x20..=0x7F => out.push(b as char),
                 _ => {
-                    // Decode only the 2..=4 bytes of this single UTF-8 scalar (O(1) per char; M3).
+                    // Decode only the 2..=4 bytes of this single UTF-8 scalar (O(1) per char).
                     let start = self.pos - 1;
                     let width = match b {
                         0xC2..=0xDF => 2,
@@ -430,7 +430,7 @@ fn obj_get<'a>(val: &'a JsonVal, key: &str) -> Option<&'a JsonVal> {
 }
 
 /// A package's build: its validated 40-hex `git.sha1` and optional `git.dirty`
-/// flag as `cargo package` wrote them (M16, M3). Missing `.cargo_vcs_info.json`
+/// flag as `cargo package` wrote them. Missing `.cargo_vcs_info.json`
 /// (`ErrorKind::NotFound`) returns the bare manifest version; a *present* file
 /// that is unreadable, non-UTF-8, malformed, or truncated returns
 /// `{version}.unverified` so corrupt provenance is never mistaken for clean.
@@ -470,7 +470,7 @@ fn from_package_info(dir: &Path, version: &str) -> String {
 /// untracked files or nested subdirs trigger a rerun), and existing untracked
 /// files inside those tracked subdirectories — never the repo root itself
 /// (which would make Cargo recursively scan `target/` and `.git/` on every
-/// no-op build; M2, R3 M3).
+/// no-op build).
 fn watched(dir: &Path, git_dir: &Path, common: &Path, cached_raw: &[u8], top_dirs: &[OsString]) -> Vec<PathBuf> {
     let mut set = BTreeSet::new();
     for p in [git_dir.join("HEAD"), git_dir.join("index"), git_dir.join("logs/HEAD"), common.join("refs"), common.join("packed-refs")] {

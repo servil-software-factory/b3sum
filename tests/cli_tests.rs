@@ -1559,7 +1559,7 @@ fn test_low_nofile_budget_makes_progress_through_ring() {
         assert_eq!(String::from_utf8(out.stdout).unwrap(), expected, "flag={extra_flag:?}");
     }
 
-    // M28: even when the caller holds inherited open descriptors (fds 3..=9 on
+    // even when the caller holds inherited open descriptors (fds 3..=9 on
     // top of stdio = 10 open FDs under RLIMIT_NOFILE=15, leaving only 5 free
     // slots), worker/slot sizing accounts for actual open FDs instead of
     // assuming `RLIMIT_NOFILE - 6`.
