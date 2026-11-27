@@ -174,8 +174,7 @@ struct AbortIfInFlight<'a>(&'a Cell<usize>);
 impl Drop for AbortIfInFlight<'_> {
     fn drop(&mut self) {
         if self.0.get() != 0 {
-            use std::io::Write;
-            let _ = writeln!(std::io::stderr(), "b3sum: unwinding with {} io_uring room reads in flight; aborting", self.0.get());
+            crate::file_end::write_fatal_fmt(format_args!("b3sum: unwinding with {} io_uring room reads in flight; aborting\n", self.0.get()));
             std::process::abort();
         }
     }
@@ -1211,30 +1210,41 @@ fn run_hybrid_worker(
         // above avoids a `preadv2(RWF_NOWAIT)` probe on the descriptor before
         // an `io_uring` fallback (`--no-mmap` falls back to `direct::is_for`).
         // Honors `--num-threads` via `DirectPermits`.
+        let mut direct_changed = false;
         let want_direct = multi_file_direct_threads(total_threads, io_threads);
         if size >= COLD_DIRECT_MIN
             && want_direct >= MIN_MULTI_DIRECT_PER_FILE
             && let Ok(len) = usize::try_from(size)
             && (mapped_cold || crate::direct::is_for(&file, size))
         {
-            let direct_hash = {
+            let direct_outcome = {
                 let permits = crate::DirectPermits::acquire(want_direct.saturating_sub(1));
                 let direct_threads = 1 + permits.extra;
                 if direct_threads >= MIN_MULTI_DIRECT_PER_FILE {
-                    let h = crate::direct::hash(args.mode, &file, len, direct_threads, direct_piece.get_or_insert_with(crate::direct::Piece::new));
+                    let outcome = crate::direct::hash(args.mode, &file, len, direct_threads, direct_piece.get_or_insert_with(crate::direct::Piece::new));
                     #[cfg(test)]
-                    if h.is_some() {
+                    if outcome.is_ok() {
                         DIRECT_MULTI_SUCCEEDED.fetch_add(1, Ordering::Relaxed);
                         DIRECT_MULTI_LAST_THREADS.store(direct_threads, Ordering::Relaxed);
                     }
-                    h
+                    outcome
                 } else {
-                    None
+                    Err(crate::direct::Failure::Unavailable)
                 }
             };
-            if let Some(h) = direct_hash {
-                sink.put(i, Ok(h));
-                continue;
+            match direct_outcome {
+                Ok(h) => {
+                    sink.put(i, Ok(h));
+                    continue;
+                }
+                Err(crate::direct::Failure::Unavailable) => {}
+                Err(crate::direct::Failure::Changed) => {
+                    direct_changed = true;
+                }
+                Err(crate::direct::Failure::Err(e)) => {
+                    sink.put(i, Err(e.into()));
+                    continue;
+                }
             }
         }
 
@@ -1275,14 +1285,16 @@ fn run_hybrid_worker(
                             uring_unavailable = true;
                             retire_cold_ring = true;
                         }
-                        sink.put(i, crate::hash_open_file(args, file));
+                        let res = if direct_changed { crate::hash_open_file_streaming(args, file) } else { crate::hash_open_file(args, file) };
+                        sink.put(i, res);
                     } else {
                         sink.put(i, Err(e.into()));
                     }
                 }
             }
         } else {
-            sink.put(i, crate::hash_open_file(args, file));
+            let res = if direct_changed { crate::hash_open_file_streaming(args, file) } else { crate::hash_open_file(args, file) };
+            sink.put(i, res);
         }
         if retire_cold_ring && let Some(c) = cold.take() {
             c.finish(args, &mut warm_batch, &mut sink);

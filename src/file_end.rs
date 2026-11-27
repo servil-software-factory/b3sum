@@ -97,18 +97,127 @@ fn is_reopenable_tty_fd(fd: RawFd, rdev: libc::dev_t) -> bool {
 
 /// Refuse record-oriented sockets (non-`SOCK_STREAM` sockets such as
 /// `SOCK_SEQPACKET` / `SOCK_DGRAM`) whose short reads silently discard record
-/// tails instead of behaving like byte streams (#515).
+/// tails instead of behaving like byte streams (#515). Fails closed if
+/// `getsockopt(SO_TYPE)` fails or returns an unexpected length.
 pub(crate) fn ensure_byte_stream_fd(fd: RawFd, mode_type: libc::mode_t) -> crate::err::Result<()> {
     if mode_type == libc::S_IFSOCK {
         let mut sock_type: libc::c_int = 0;
-        let mut len = libc::socklen_t::try_from(core::mem::size_of::<libc::c_int>()).expect("c_int size fits in socklen_t");
+        let want_len = libc::socklen_t::try_from(core::mem::size_of::<libc::c_int>()).expect("c_int size fits in socklen_t");
+        let mut len = want_len;
         // Sound: `sock_type` and `len` are valid writable stack variables.
         let rc = unsafe { libc::getsockopt(fd, libc::SOL_SOCKET, libc::SO_TYPE, (&mut sock_type as *mut libc::c_int).cast(), &mut len) };
-        if rc == 0 && sock_type != libc::SOCK_STREAM {
+        if rc < 0 {
+            return Err(io::Error::last_os_error().into());
+        }
+        if len != want_len {
+            crate::bail!("could not determine socket type for descriptor");
+        }
+        if sock_type != libc::SOCK_STREAM {
             crate::bail!("record-oriented socket input is not supported; use a byte-stream socket or pipe");
         }
     }
     Ok(())
+}
+
+/// Stat `fd` and verify it is safe to read as a byte stream, failing closed on
+/// either `fstat` or `getsockopt(SO_TYPE)` errors.
+pub(crate) fn validate_byte_stream_fd(fd: RawFd) -> crate::err::Result<FdMeta> {
+    let meta = fstat_fd(fd)?;
+    ensure_byte_stream_fd(fd, meta.mode_type)?;
+    Ok(meta)
+}
+
+/// Best-effort non-blocking write of a short fatal diagnostic (`<= 512` bytes)
+/// to fd 2 without locking `std::io::stderr()`, allocating, or mutating fd 2's
+/// open-file flags. Async-signal-safe: uses only `fcntl`, `fstat`, `open`,
+/// `write`, `send`, and `close`.
+///
+/// Checks that fd 2 is actually open for writing (`F_GETFL` access mode is not
+/// `O_RDONLY`), then classifies fd 2 with `fstat(2)`:
+/// - `S_IFREG`: writes directly to fd 2 (preserves the caller's file offset and
+///   `O_APPEND` mode, and regular-file writes never wait on a pipe reader).
+/// - `S_IFSOCK`: uses per-call `send(2, ..., MSG_DONTWAIT)` (atomic non-blocking
+///   without mutating fd flags).
+/// - `S_IFIFO` (pipes/FIFOs have no seek offset and no `TOSTOP`/`SIGTTOU`): on
+///   Linux, reopens `/proc/self/fd/2` with `O_WRONLY | O_NONBLOCK | O_CLOEXEC`
+///   for an independent non-blocking open file description that never blocks or
+///   races peer writers; if unavailable (or on non-Linux), omits the diagnostic.
+/// - Everything else (including `S_IFCHR` devices/terminals that may have seek
+///   offsets or `TOSTOP`): omits the diagnostic so fatal termination
+///   (`_exit`/`abort`) is never delayed or stopped by stderr.
+pub(crate) fn write_fatal_nonblocking(msg: &[u8]) {
+    if msg.is_empty() {
+        return;
+    }
+    let msg = &msg[..msg.len().min(512)];
+    // Sound: `fcntl(F_GETFL)` is async-signal-safe; refuse to write or reopen
+    // a read-only fd 2 (e.g. read end of a pipe passed as stderr).
+    let fl = unsafe { libc::fcntl(2, libc::F_GETFL) };
+    if fl < 0 || (fl & libc::O_ACCMODE) == libc::O_RDONLY {
+        return;
+    }
+    let mut st = core::mem::MaybeUninit::<libc::stat>::zeroed();
+    // Sound: `st` is valid writable storage for `libc::stat`; `fstat` is async-signal-safe.
+    if unsafe { libc::fstat(2, st.as_mut_ptr()) } < 0 {
+        return;
+    }
+    // Sound: `fstat` returned 0 and initialized `st`.
+    let mode_type = unsafe { st.assume_init() }.st_mode & libc::S_IFMT;
+    match mode_type {
+        libc::S_IFREG => {
+            // Sound: `msg` is valid readable memory; writing directly to fd 2
+            // preserves its offset and `O_APPEND`, and regular files do not
+            // wait on a reader. `write` is async-signal-safe.
+            let _ = unsafe { libc::write(2, msg.as_ptr().cast(), msg.len()) };
+        }
+        libc::S_IFSOCK => {
+            #[cfg(target_os = "linux")]
+            let flags = libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL;
+            #[cfg(not(target_os = "linux"))]
+            let flags = libc::MSG_DONTWAIT;
+            // Sound: `msg` is valid readable memory; `send` with `MSG_DONTWAIT`
+            // never blocks and is async-signal-safe.
+            let _ = unsafe { libc::send(2, msg.as_ptr().cast(), msg.len(), flags) };
+        }
+        libc::S_IFIFO => {
+            #[cfg(target_os = "linux")]
+            {
+                const PROC_STDERR: &[u8] = b"/proc/self/fd/2\0";
+                // Sound: NUL-terminated static path on a verified-writable
+                // pipe/FIFO (no seek offset, no `TOSTOP`/`SIGTTOU`); `open`,
+                // `write`, `close` are async-signal-safe and `O_NONBLOCK` lives
+                // on the new open file description without mutating fd 2 flags.
+                let nb_fd = unsafe { libc::open(PROC_STDERR.as_ptr().cast(), libc::O_WRONLY | libc::O_NONBLOCK | libc::O_CLOEXEC) };
+                if nb_fd >= 0 {
+                    let _ = unsafe { libc::write(nb_fd, msg.as_ptr().cast(), msg.len()) };
+                    let _ = unsafe { libc::close(nb_fd) };
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Format a short fatal diagnostic into a fixed stack buffer (no heap
+/// allocation, no `stderr` mutex) and emit it via [`write_fatal_nonblocking`].
+#[cfg(target_os = "linux")]
+pub(crate) fn write_fatal_fmt(args: core::fmt::Arguments<'_>) {
+    struct StackBuf {
+        buf: [u8; 256],
+        len: usize,
+    }
+    impl core::fmt::Write for StackBuf {
+        fn write_str(&mut self, s: &str) -> core::fmt::Result {
+            let room = self.buf.len() - self.len;
+            let take = s.len().min(room);
+            self.buf[self.len..self.len + take].copy_from_slice(&s.as_bytes()[..take]);
+            self.len += take;
+            Ok(())
+        }
+    }
+    let mut out = StackBuf { buf: [0u8; 256], len: 0 };
+    let _ = core::fmt::Write::write_fmt(&mut out, args);
+    write_fatal_nonblocking(&out.buf[..out.len]);
 }
 
 /// Read a stream completely into `out` using read requests at least one kernel

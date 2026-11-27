@@ -79,6 +79,54 @@ pub(crate) fn is_for(file: &std::fs::File, len: u64) -> bool {
 /// does not end at `len` (a last piece with fewer bytes or more, or bytes
 /// after a last whole piece): the caller then reads the file another way.
 /// The reads say where the file ends, and `len` only where to look.
+/// Why an `O_DIRECT` read or hash attempt did not complete directly.
+///
+/// Separating `Unavailable` (reopen failed or `EINVAL` alignment/filesystem
+/// refusal) from `Changed` (the file shrank during reads or grew past `len`
+/// at the EOF probe) and `Err` (real I/O error) ensures callers never fall back
+/// to a stale `mmap` after observing that the file's extent changed, never
+/// fail a readable file merely because `O_DIRECT` is unsupported, and never
+/// swallow real read errors.
+#[derive(Debug)]
+pub(crate) enum Failure {
+    Unavailable,
+    Changed,
+    Err(std::io::Error),
+}
+
+impl Failure {
+    fn priority(&self) -> u8 {
+        match self {
+            Failure::Unavailable => 1,
+            Failure::Changed => 2,
+            Failure::Err(_) => 3,
+        }
+    }
+}
+
+#[cfg(test)]
+std::thread_local! {
+    /// Test-only hook invoked right before the final 1-byte EOF probe in
+    /// `direct::read` so tests can deterministically grow the file after all
+    /// `O_DIRECT` piece reads complete.
+    pub(crate) static BEFORE_EOF_PROBE: std::cell::RefCell<Option<Box<dyn FnMut()>>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) static CLAIMED_PIECES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+pub(crate) static INJECT_EIO_PIECE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(usize::MAX);
+
+#[cfg(test)]
+pub(crate) static INJECT_EIO_RECORDED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Read `file` directly, PIECE bytes at a time, across `threads` threads
+/// (this one using `mine`, the rest owning a piece each). For each piece
+/// `i`, calls `each` with the piece's bytes and its `per` slots of `outs`.
+/// Returns `Err(Failure::Unavailable)` if `O_DIRECT` cannot be opened or is
+/// refused (`EINVAL`/`EOPNOTSUPP`), `Err(Failure::Changed)` if the file shrank
+/// or grew past `len`, and `Err(Failure::Err)` on a real I/O error.
 pub(crate) fn read<T: Send>(
     file: &std::fs::File,
     len: usize,
@@ -87,7 +135,7 @@ pub(crate) fn read<T: Send>(
     outs: &mut [T],
     per: usize,
     each: impl Fn(usize, &[u8], &mut [T]) + Sync,
-) -> Option<()> {
+) -> Result<(), Failure> {
     use std::os::fd::AsRawFd;
     use std::os::unix::fs::OpenOptionsExt;
     assert!(per > 0, "direct::read requires at least one output slot per piece");
@@ -100,19 +148,61 @@ pub(crate) fn read<T: Send>(
     // a rename; changing flags on a dup would change the caller's too.
     // Without procfs, the caller uses its original descriptor another way.
     let direct = format!("/proc/self/fd/{}", file.as_raw_fd());
-    let file = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_DIRECT).open(direct).ok()?;
+    let Ok(file) = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_DIRECT).open(direct) else {
+        return Err(Failure::Unavailable);
+    };
     let threads = threads.min(len.div_ceil(PIECE)).max(1);
-    let pieces = std::sync::Mutex::new(outs.chunks_mut(per).enumerate());
-    let failed = std::sync::atomic::AtomicBool::new(false);
+    struct Shared<'a, T> {
+        pieces: core::iter::Enumerate<core::slice::ChunksMut<'a, T>>,
+        failure: Option<Failure>,
+    }
+    let shared = std::sync::Mutex::new(Shared { pieces: outs.chunks_mut(per).enumerate(), failure: None });
+    let record_failure = |fail: Failure| {
+        let mut s = shared.lock().unwrap();
+        if s.failure.as_ref().is_none_or(|cur| fail.priority() > cur.priority()) {
+            s.failure = Some(fail);
+        }
+    };
     let work = |buffer: &mut Piece| {
         loop {
-            let Some((i, outs)) = pieces.lock().unwrap().next() else { return };
+            let next_piece = {
+                let mut s = shared.lock().unwrap();
+                if s.failure.is_some() {
+                    return;
+                }
+                s.pieces.next()
+            };
+            let Some((i, outs)) = next_piece else { return };
+            #[cfg(test)]
+            CLAIMED_PIECES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            #[cfg(test)]
+            if i == INJECT_EIO_PIECE.load(std::sync::atomic::Ordering::Relaxed) {
+                record_failure(Failure::Err(std::io::Error::from_raw_os_error(libc::EIO)));
+                INJECT_EIO_RECORDED.store(true, std::sync::atomic::Ordering::Release);
+                return;
+            }
             let want = PIECE.min(len - i * PIECE);
-            // Sound: the buffer holds PIECE writable bytes. A piece
-            // starts on a multiple of PIECE, so of the drive's blocks.
-            let got = unsafe { libc::pread(file.as_raw_fd(), buffer.as_mut_ptr().cast(), PIECE, (i * PIECE) as libc::off_t) };
+            let got = loop {
+                // Sound: the buffer holds PIECE writable bytes. A piece
+                // starts on a multiple of PIECE, so of the drive's blocks.
+                let rc = unsafe { libc::pread(file.as_raw_fd(), buffer.as_mut_ptr().cast(), PIECE, (i * PIECE) as libc::off_t) };
+                if rc == -1 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                break rc;
+            };
+            if got < 0 {
+                let err = std::io::Error::last_os_error();
+                if matches!(err.raw_os_error(), Some(libc::EINVAL | libc::EOPNOTSUPP)) {
+                    record_failure(Failure::Unavailable);
+                } else {
+                    record_failure(Failure::Err(err));
+                }
+                return;
+            }
             if got != want as isize {
-                return failed.store(true, std::sync::atomic::Ordering::Relaxed);
+                record_failure(Failure::Changed);
+                return;
             }
             // Sound: `want` initialized bytes of the buffer.
             each(i, unsafe { core::slice::from_raw_parts(buffer.as_mut_ptr(), want) }, outs);
@@ -128,9 +218,15 @@ pub(crate) fn read<T: Send>(
             work(mine);
         });
     }
-    if failed.into_inner() {
-        return None;
+    if let Some(fail) = shared.into_inner().unwrap().failure {
+        return Err(fail);
     }
+    #[cfg(test)]
+    BEFORE_EOF_PROBE.with(|slot| {
+        if let Some(mut f) = slot.borrow_mut().take() {
+            f();
+        }
+    });
     // The reads above found `len` bytes; one read more says there are no
     // others. A last piece that is whole was asked for no byte more than
     // it has, so its read does not say the file ends there (BLAKE3 #424:
@@ -147,15 +243,21 @@ pub(crate) fn read<T: Send>(
         if more == -1 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
             continue;
         }
-        return (more == 0).then_some(());
+        return if more == 0 {
+            Ok(())
+        } else if more > 0 {
+            Err(Failure::Changed)
+        } else {
+            Err(Failure::Err(std::io::Error::last_os_error()))
+        };
     }
 }
 
 /// The hash of the open `file`, of `len` bytes (PIECE or more), read
 /// directly: each piece's subtree hashed by the thread that read it, on
 /// its own core's kernels, then the pieces' parents a layer at a time.
-/// None as [`read`] says.
-pub(crate) fn hash(mode: blake3::Mode, file: &std::fs::File, len: usize, threads: usize, mine: &mut Piece) -> Option<blake3::Hash> {
+/// Propagates [`Failure`] as [`read`] says.
+pub(crate) fn hash(mode: blake3::Mode, file: &std::fs::File, len: usize, threads: usize, mine: &mut Piece) -> Result<blake3::Hash, Failure> {
     assert!(len > PIECE, "two pieces or more");
     #[cfg(test)]
     HASHED.with(|h| h.set(h.get() + 1));
@@ -191,7 +293,7 @@ pub(crate) fn hash(mode: blake3::Mode, file: &std::fs::File, len: usize, threads
         cvs.truncate(pairs);
         cvs.copy_from_slice(&next[..pairs]);
     }
-    Some(tree.root_hash(&cvs[0], &last, len as u64))
+    Ok(tree.root_hash(&cvs[0], &last, len as u64))
 }
 
 #[cfg(test)]
@@ -223,15 +325,16 @@ mod test {
             for mode in [blake3::Mode::Plain, blake3::Mode::Keyed(&key)] {
                 let want = blake3::convenience::hash_with(mode, &all[..len]);
                 for threads in [1, 2, 5] {
-                    assert_eq!(hash(mode, &file, len, threads, &mut piece), Some(want), "len={len} threads={threads}");
+                    assert!(matches!(hash(mode, &file, len, threads, &mut piece), Ok(h) if h == want), "len={len} threads={threads}");
                 }
                 // Any other length, one that ends a piece too: the file's
-                // end is where its reads say.
+                // end is where its reads say (`Err(Failure::Changed)`, distinct
+                // from `Err(Failure::Unavailable)`).
                 for wrong in [len + 1, len - 1, len + PIECE, len - PIECE, len.next_multiple_of(PIECE) - PIECE] {
                     if wrong == len || wrong <= PIECE {
                         continue;
                     }
-                    assert_eq!(hash(mode, &file, wrong, 2, &mut piece), None, "len={len} read as {wrong}");
+                    assert!(matches!(hash(mode, &file, wrong, 2, &mut piece), Err(Failure::Changed)), "len={len} read as {wrong}");
                 }
             }
         }

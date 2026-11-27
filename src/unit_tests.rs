@@ -8,78 +8,69 @@ fn test_parse_check_line() {
     // =========================
 
     // the basic case
-    let crate::ParsedCheckLine { file_string, is_escaped, file_path, expected_hash } =
-        crate::parse_check_line("0909090909090909090909090909090909090909090909090909090909090909  foo").unwrap();
-    assert_eq!(expected_hash, blake3::Hash::from([0x09; 32]));
-    assert!(!is_escaped);
-    assert_eq!(file_string, "foo");
-    assert_eq!(file_path, Path::new("foo"));
+    let parsed = crate::parse_check_line("0909090909090909090909090909090909090909090909090909090909090909  foo").unwrap();
+    assert_eq!(parsed.expected_hash, blake3::Hash::from([0x09; 32]));
+    assert!(parsed.escaped_display.is_none());
+    assert_eq!(parsed.display_str(), "foo");
+    assert_eq!(parsed.file_path, Path::new("foo"));
 
     // regular whitespace
-    let crate::ParsedCheckLine { file_string, is_escaped, file_path, expected_hash } =
-        crate::parse_check_line("fafafafafafafafafafafafafafafafafafafafafafafafafafafafafafafafa   \t\r\n\n\r \t\r\n\n\r").unwrap();
-    assert_eq!(expected_hash, blake3::Hash::from([0xfa; 32]));
-    assert!(!is_escaped);
-    assert_eq!(file_string, " \t\r\n\n\r \t");
-    assert_eq!(file_path, Path::new(" \t\r\n\n\r \t"));
+    let parsed = crate::parse_check_line("fafafafafafafafafafafafafafafafafafafafafafafafafafafafafafafafa   \t\r\n\n\r \t\r\n\n\r").unwrap();
+    assert_eq!(parsed.expected_hash, blake3::Hash::from([0xfa; 32]));
+    assert!(parsed.escaped_display.is_none());
+    assert_eq!(parsed.display_str(), " \t\r\n\n\r \t");
+    assert_eq!(parsed.file_path, Path::new(" \t\r\n\n\r \t"));
 
     // path is one space
-    let crate::ParsedCheckLine { file_string, is_escaped, file_path, expected_hash } =
-        crate::parse_check_line("4242424242424242424242424242424242424242424242424242424242424242   ").unwrap();
-    assert_eq!(expected_hash, blake3::Hash::from([0x42; 32]));
-    assert!(!is_escaped);
-    assert_eq!(file_string, " ");
-    assert_eq!(file_path, Path::new(" "));
+    let parsed = crate::parse_check_line("4242424242424242424242424242424242424242424242424242424242424242   ").unwrap();
+    assert_eq!(parsed.expected_hash, blake3::Hash::from([0x42; 32]));
+    assert!(parsed.escaped_display.is_none());
+    assert_eq!(parsed.display_str(), " ");
+    assert_eq!(parsed.file_path, Path::new(" "));
 
     // *Unescaped* backslashes. Note that this line does *not* start with a
     // backslash, so something like "\" + "n" is interpreted as *two*
     // characters.
-    let crate::ParsedCheckLine { file_string, is_escaped, file_path, expected_hash } =
-        crate::parse_check_line("4343434343434343434343434343434343434343434343434343434343434343  fo\\a\\no").unwrap();
-    assert_eq!(expected_hash, blake3::Hash::from([0x43; 32]));
-    assert!(!is_escaped);
-    assert_eq!(file_string, "fo\\a\\no");
-    assert_eq!(file_path, Path::new("fo\\a\\no"));
+    let parsed = crate::parse_check_line("4343434343434343434343434343434343434343434343434343434343434343  fo\\a\\no").unwrap();
+    assert_eq!(parsed.expected_hash, blake3::Hash::from([0x43; 32]));
+    assert!(parsed.escaped_display.is_none());
+    assert_eq!(parsed.display_str(), "fo\\a\\no");
+    assert_eq!(parsed.file_path, Path::new("fo\\a\\no"));
 
     // escaped newlines
-    let crate::ParsedCheckLine { file_string, is_escaped, file_path, expected_hash } =
-        crate::parse_check_line("\\4444444444444444444444444444444444444444444444444444444444444444  fo\\r\\n\\n\\ro").unwrap();
-    assert_eq!(expected_hash, blake3::Hash::from([0x44; 32]));
-    assert!(is_escaped);
-    assert_eq!(file_string, "fo\\r\\n\\n\\ro");
-    assert_eq!(file_path, Path::new("fo\r\n\n\ro"));
+    let parsed = crate::parse_check_line("\\4444444444444444444444444444444444444444444444444444444444444444  fo\\r\\n\\n\\ro").unwrap();
+    assert_eq!(parsed.expected_hash, blake3::Hash::from([0x44; 32]));
+    assert_eq!(parsed.escaped_display.as_deref(), Some("\\fo\\r\\n\\n\\ro"));
+    assert_eq!(parsed.display_str(), "\\fo\\r\\n\\n\\ro");
+    assert_eq!(parsed.file_path, Path::new("fo\r\n\n\ro"));
 
     // Escaped newline and backslash.
-    let crate::ParsedCheckLine { file_string, is_escaped, file_path, expected_hash } =
-        crate::parse_check_line("\\4545454545454545454545454545454545454545454545454545454545454545  fo\\n\\\\o").unwrap();
-    assert_eq!(expected_hash, blake3::Hash::from([0x45; 32]));
-    assert!(is_escaped);
-    assert_eq!(file_string, "fo\\n\\\\o");
-    assert_eq!(file_path, Path::new("fo\n\\o"));
+    let parsed = crate::parse_check_line("\\4545454545454545454545454545454545454545454545454545454545454545  fo\\n\\\\o").unwrap();
+    assert_eq!(parsed.expected_hash, blake3::Hash::from([0x45; 32]));
+    assert_eq!(parsed.escaped_display.as_deref(), Some("\\fo\\n\\\\o"));
+    assert_eq!(parsed.display_str(), "\\fo\\n\\\\o");
+    assert_eq!(parsed.file_path, Path::new("fo\n\\o"));
 
     // non-ASCII path
-    let crate::ParsedCheckLine { file_string, is_escaped, file_path, expected_hash } =
-        crate::parse_check_line("4646464646464646464646464646464646464646464646464646464646464646  否认").unwrap();
-    assert_eq!(expected_hash, blake3::Hash::from([0x46; 32]));
-    assert!(!is_escaped);
-    assert_eq!(file_string, "否认");
-    assert_eq!(file_path, Path::new("否认"));
+    let parsed = crate::parse_check_line("4646464646464646464646464646464646464646464646464646464646464646  否认").unwrap();
+    assert_eq!(parsed.expected_hash, blake3::Hash::from([0x46; 32]));
+    assert!(parsed.escaped_display.is_none());
+    assert_eq!(parsed.display_str(), "否认");
+    assert_eq!(parsed.file_path, Path::new("否认"));
 
     // untagged separator "  " in the file name
-    let crate::ParsedCheckLine { file_string, is_escaped, file_path, expected_hash } =
-        crate::parse_check_line("4747474747474747474747474747474747474747474747474747474747474747  foo  bar").unwrap();
-    assert_eq!(expected_hash, blake3::Hash::from([0x47; 32]));
-    assert!(!is_escaped);
-    assert_eq!(file_string, "foo  bar");
-    assert_eq!(file_path, Path::new("foo  bar"));
+    let parsed = crate::parse_check_line("4747474747474747474747474747474747474747474747474747474747474747  foo  bar").unwrap();
+    assert_eq!(parsed.expected_hash, blake3::Hash::from([0x47; 32]));
+    assert!(parsed.escaped_display.is_none());
+    assert_eq!(parsed.display_str(), "foo  bar");
+    assert_eq!(parsed.file_path, Path::new("foo  bar"));
 
     // tagged separator ") = " in the file name
-    let crate::ParsedCheckLine { file_string, is_escaped, file_path, expected_hash } =
-        crate::parse_check_line("BLAKE3 (foo) = bar) = 4848484848484848484848484848484848484848484848484848484848484848").unwrap();
-    assert_eq!(expected_hash, blake3::Hash::from([0x48; 32]));
-    assert!(!is_escaped);
-    assert_eq!(file_string, "foo) = bar");
-    assert_eq!(file_path, Path::new("foo) = bar"));
+    let parsed = crate::parse_check_line("BLAKE3 (foo) = bar) = 4848484848484848484848484848484848484848484848484848484848484848").unwrap();
+    assert_eq!(parsed.expected_hash, blake3::Hash::from([0x48; 32]));
+    assert!(parsed.escaped_display.is_none());
+    assert_eq!(parsed.display_str(), "foo) = bar");
+    assert_eq!(parsed.file_path, Path::new("foo) = bar"));
 
     // =========================
     // ===== Failure Cases =====
@@ -562,4 +553,242 @@ fn num_threads_two_confines_eagerly() {
     assert_eq!(crate::threads().get(), 2);
     #[cfg(target_os = "linux")]
     assert_eq!(crate::CONFINEMENT_CALLS.load(std::sync::atomic::Ordering::Relaxed), 1);
+}
+
+#[test]
+fn validate_and_ensure_byte_stream_fd_fail_closed_on_os_error() {
+    // H3: failing `getsockopt(SO_TYPE)` on a socket descriptor must return an OS
+    // error, never treat the failure as permission to hash the descriptor.
+    let err = crate::file_end::ensure_byte_stream_fd(-1, libc::S_IFSOCK).unwrap_err();
+    assert!(!err.to_string().is_empty());
+    // Failing `fstat` must likewise fail closed.
+    let err = crate::file_end::validate_byte_stream_fd(-1).unwrap_err();
+    assert!(!err.to_string().is_empty());
+}
+
+#[test]
+fn collect_check_batch_enforces_retained_byte_budget() {
+    // H4: a manifest with many long lines must flush once retained path bytes
+    // reach `max_batch_bytes`, rather than buffering `max_entries` huge paths.
+    let digest = "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262";
+    let mut manifest = Vec::new();
+    let count = 10usize;
+    for i in 0..count {
+        let name = format!("path_{i:02}_{}", "a".repeat(90));
+        manifest.extend_from_slice(format!("{digest}  {name}\n").as_bytes());
+    }
+    let mut reader = std::io::BufReader::new(&manifest[..]);
+    let mut raw = Vec::new();
+    let mut pending = None;
+    let mut entries = Vec::new();
+    let mut batch_paths = Vec::new();
+    let stdin_ctx = crate::file_end::StdinContext::current();
+    let never_own = |_: &std::path::Path| false;
+
+    let mut batches = 0usize;
+    let mut total_entries = 0usize;
+    let mut eof = false;
+    while !eof {
+        eof = crate::collect_check_batch(
+            &mut reader,
+            &mut raw,
+            &mut pending,
+            &mut entries,
+            &mut batch_paths,
+            100, // high entry count cap so byte budget decides
+            256, // tight retained byte budget (strict cap: at most 2 * 98 = 196 <= 256 bytes!)
+            1024,
+            &stdin_ctx,
+            &never_own,
+        )
+        .unwrap();
+        if !entries.is_empty() {
+            batches += 1;
+            total_entries += entries.len();
+            let batch_bytes: usize = batch_paths.iter().map(|p| p.as_os_str().len()).sum();
+            assert!(batch_bytes <= 256, "batch retained {batch_bytes} bytes, exceeding strict 256-byte budget");
+            assert!(batch_paths.len() <= 2, "strict 256-byte budget fits at most 2 98-byte paths, got {}", batch_paths.len());
+        }
+    }
+    assert_eq!(total_entries, count);
+    assert_eq!(batches, 5, "10 x 98-byte paths under 256-byte cap must yield 5 batches of 2");
+}
+
+#[test]
+fn sigbus_exits_promptly_with_full_undrained_stderr_pipe_and_writes_when_writable() {
+    // H5: fatal SIGBUS termination must neither block on an undrained full
+    // stderr pipe nor stall in `pause()`, while still emitting the explanation
+    // when stderr is a writable file (and on Linux, a writable pipe/tty via
+    // `/proc/self/fd/2` with independent `O_NONBLOCK`).
+    use std::os::fd::FromRawFd;
+    const CHILD: &str = "B3SUM_TEST_SIGBUS_HANDLER";
+    if std::env::var_os(CHILD).is_some() {
+        crate::explain_sigbus();
+        unsafe { libc::raise(libc::SIGBUS) };
+        std::process::exit(0);
+    }
+
+    // Subcase A: append-mode regular file (`2>>job.log`) preserves existing
+    // bytes at offset 0 and appends the explanation on every OS.
+    let dir = crate::tempfile::tempdir().unwrap();
+    let err_path = dir.path().join("sigbus.err");
+    std::fs::write(&err_path, b"EXISTING_LOG_PREFIX\n").unwrap();
+    let err_file = std::fs::OpenOptions::new().append(true).open(&err_path).unwrap();
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "unit_tests::sigbus_exits_promptly_with_full_undrained_stderr_pipe_and_writes_when_writable", "--nocapture"])
+        .env(CHILD, "1")
+        .stderr(std::process::Stdio::from(err_file))
+        .status()
+        .unwrap();
+    assert_eq!(status.code(), Some(1), "expected exit 1 on SIGBUS, got {status:?}");
+    let err_text = std::fs::read_to_string(&err_path).unwrap();
+    assert!(err_text.starts_with("EXISTING_LOG_PREFIX\n"), "fatal diagnostic must not overwrite existing log prefix, got {err_text:?}");
+    assert!(err_text.contains("bus error while reading a mapped file"), "expected SIGBUS diagnostic appended to regular-file stderr, got {err_text:?}");
+
+    // On Linux (when `/proc/self/fd/2` is reopenable for writing), a writable
+    // pipe also receives the explanation via independent `O_NONBLOCK`.
+    #[cfg(target_os = "linux")]
+    if std::fs::OpenOptions::new().write(true).open("/proc/self/fd/2").is_ok() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "unit_tests::sigbus_exits_promptly_with_full_undrained_stderr_pipe_and_writes_when_writable", "--nocapture"])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1), "expected exit 1 on SIGBUS pipe, got {:?}", output.status);
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("bus error while reading a mapped file"),
+            "expected SIGBUS diagnostic on writable Linux pipe, got {:?}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    // Subcase B: completely stuffed, undrained stderr pipe whose reader stays
+    // open must still exit 1 promptly (bounded 2s deadline so regressions fail fast).
+    let mut ends = [0i32; 2];
+    assert_eq!(unsafe { libc::pipe(ends.as_mut_ptr()) }, 0);
+    let flags = unsafe { libc::fcntl(ends[1], libc::F_GETFL) };
+    assert!(flags >= 0);
+    assert_eq!(unsafe { libc::fcntl(ends[1], libc::F_SETFL, flags | libc::O_NONBLOCK) }, 0);
+    let chunk = [b'x'; 4096];
+    loop {
+        let n = unsafe { libc::write(ends[1], chunk.as_ptr().cast(), chunk.len()) };
+        if n <= 0 {
+            break;
+        }
+    }
+    assert_eq!(unsafe { libc::fcntl(ends[1], libc::F_SETFL, flags) }, 0);
+    let stderr_file = unsafe { std::fs::File::from_raw_fd(ends[1]) };
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "unit_tests::sigbus_exits_promptly_with_full_undrained_stderr_pipe_and_writes_when_writable", "--nocapture"])
+        .env(CHILD, "1")
+        .stderr(std::process::Stdio::from(stderr_file))
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            unsafe { libc::close(ends[0]) };
+            panic!("child hung on full undrained stderr pipe during SIGBUS");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
+    unsafe { libc::close(ends[0]) };
+    assert_eq!(status.code(), Some(1), "expected immediate exit 1 with full stderr, got {status:?}");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn hash_open_file_ex_streams_full_file_when_file_grows_during_direct_read() {
+    // H2: if `direct::hash` observes the file grew (positive final EOF probe),
+    // `hash_open_file_ex` must discard its stale mmap and stream the descriptor
+    // to actual EOF instead of returning the hash of the earlier prefix.
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    blake3::initialize();
+    let dir = crate::tempfile::tempdir().unwrap();
+    let path = dir.path().join("growing-direct.bin");
+    let initial_len = 2 * crate::direct::PIECE;
+    let initial: Vec<u8> = (0..initial_len).map(|i| (i.wrapping_mul(17) ^ (i >> 9)) as u8).collect();
+    let suffix = b"GROWN_AFTER_DIRECT_READ_TAIL_BYTES";
+    std::fs::write(&path, &initial).unwrap();
+    if std::fs::OpenOptions::new().read(true).custom_flags(libc::O_DIRECT).open(&path).is_err() {
+        eprintln!("no O_DIRECT in {}", dir.path().display());
+        return;
+    }
+
+    let crate::args::ParseOutcome::Parsed(raw) = crate::args::parse_from(["b3sum", "--num-threads", "2", "a"]).unwrap() else {
+        panic!("expected parsed");
+    };
+    let args =
+        crate::Args { inner: raw, mode: blake3::Mode::Plain, base_hasher: blake3::convenience::Hasher::new(blake3::Mode::Plain, None), file_args: Vec::new() };
+    crate::configure_threads(&args);
+    let file = std::fs::File::open(&path).unwrap();
+
+    let grow_path = path.clone();
+    crate::direct::BEFORE_EOF_PROBE.with(|slot| {
+        *slot.borrow_mut() = Some(Box::new(move || {
+            let mut f = std::fs::OpenOptions::new().append(true).open(&grow_path).unwrap();
+            f.write_all(suffix).unwrap();
+            f.flush().unwrap();
+        }));
+    });
+    let before_direct = crate::direct::HASHED.with(std::cell::Cell::get);
+    crate::linux_pipe::set_force_miss(true);
+    crate::direct::TAKE_FOR_COLD.with(|c| c.set(true));
+    let res = crate::hash_open_file_ex(&args, file);
+    crate::direct::TAKE_FOR_COLD.with(|c| c.set(false));
+    crate::linux_pipe::set_force_miss(false);
+    crate::direct::BEFORE_EOF_PROBE.with(|slot| {
+        slot.borrow_mut().take();
+    });
+    assert!(crate::direct::HASHED.with(std::cell::Cell::get) > before_direct, "test must actually enter direct::hash before growing the file");
+
+    let hr = res.unwrap();
+    let mut full = initial;
+    full.extend_from_slice(suffix);
+    let want = blake3::convenience::hash_with(blake3::Mode::Plain, &full);
+    assert_eq!(hr.bytes_hashed, full.len() as u64, "must hash the grown file to real EOF, not stale mmap prefix");
+    assert_eq!(hr.hash, want, "must return full grown digest, not stale mmap prefix");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn direct_read_workers_stop_claiming_pieces_after_error() {
+    // M29: once one worker records an error on piece 0 while 11 valid pieces
+    // remain, peer workers must stop claiming remaining pieces instead of
+    // reading the rest of the file (counts claims BEFORE `pread`).
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::sync::atomic::Ordering;
+
+    let dir = crate::tempfile::tempdir().unwrap();
+    let path = dir.path().join("cancel-direct.bin");
+    let pieces = 12usize;
+    std::fs::write(&path, vec![0x5au8; pieces * crate::direct::PIECE]).unwrap();
+    if std::fs::OpenOptions::new().read(true).custom_flags(libc::O_DIRECT).open(&path).is_err() {
+        eprintln!("no O_DIRECT in {}", dir.path().display());
+        return;
+    }
+    let file = std::fs::File::open(&path).unwrap();
+    crate::direct::CLAIMED_PIECES.store(0, Ordering::SeqCst);
+    crate::direct::INJECT_EIO_RECORDED.store(false, Ordering::SeqCst);
+    crate::direct::INJECT_EIO_PIECE.store(0, Ordering::SeqCst);
+    let mut outs = vec![0u8; pieces];
+    let mut mine = crate::direct::Piece::new();
+    let res = crate::direct::read(&file, pieces * crate::direct::PIECE, 2, &mut mine, &mut outs, 1, |_, _, _| {
+        // Deterministically wait until piece 0's worker has recorded its error
+        // before looping back to claim the next piece (no scheduler race).
+        while !crate::direct::INJECT_EIO_RECORDED.load(Ordering::Acquire) {
+            std::thread::yield_now();
+        }
+    });
+    crate::direct::INJECT_EIO_PIECE.store(usize::MAX, Ordering::SeqCst);
+    assert!(matches!(res, Err(crate::direct::Failure::Err(ref e)) if e.raw_os_error() == Some(libc::EIO)));
+    let claimed = crate::direct::CLAIMED_PIECES.load(Ordering::SeqCst);
+    assert!(claimed <= 2, "at most piece 0 (failing) and one in-flight peer piece may be claimed, got {claimed} of {pieces}");
 }
