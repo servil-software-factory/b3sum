@@ -28,6 +28,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 STAGE_ENTRIES = (
     "Cargo.toml",
     "Cargo.lock",
+    "README.md",
     "build.rs",
     "build_version.rs",
     "src",

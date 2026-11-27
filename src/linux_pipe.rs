@@ -224,7 +224,7 @@ fn stream_fd_into_rooms(
             // else, until its completion is reaped: the room sits in `window`
             // as Reading until then, and `_unwind_guard` aborts before `window`
             // drops if anything unwinds while a read is in flight.
-            let ok = unsafe { ring.push_read(fd, room.bytes_mut().as_mut_ptr(), ROOM_LEN, off, 0, user_data) };
+            let ok = unsafe { ring.push_read(fd, room.bytes_mut().as_mut_ptr(), ROOM_LEN, off, user_data) };
             // In every build: a read the full ring did not take would be
             // counted in flight and waited for without end.
             assert!(ok, "the ring has room for every read in flight");
@@ -261,7 +261,7 @@ fn stream_fd_into_rooms(
                     }
                     // Sound: as the first read of this room, above; it goes
                     // back into `window`.
-                    let ok = unsafe { ring.push_read(fd, room.bytes_mut().as_mut_ptr(), ROOM_LEN, off, 0, USER_LARGE_BIT | seq) };
+                    let ok = unsafe { ring.push_read(fd, room.bytes_mut().as_mut_ptr(), ROOM_LEN, off, USER_LARGE_BIT | seq) };
                     assert!(ok, "the ring has room for every read in flight");
                     window[idx] = Some(WindowSlot::Reading(room));
                     in_flight_uring.set(in_flight_uring.get() + 1);
@@ -395,6 +395,13 @@ impl Sink<'_> {
     }
 }
 
+// Compile-time layout proof for `WarmBatch`'s `MaybeUninit<Block>` <-> byte
+// reinterpretation (M9).
+const _: () = {
+    assert!(size_of::<Block>() == 64);
+    assert!(align_of::<Block>() <= 64);
+};
+
 struct WarmBatch {
     arena: Option<Box<[MaybeUninit<Block>]>>,
     entries: [(usize, usize); WARM_BATCH_SLOTS],
@@ -411,6 +418,25 @@ impl WarmBatch {
         self.arena.is_some()
     }
 
+    /// Borrow the next free arena slot for a direct read into `WarmBatch` (M9).
+    #[inline]
+    fn next_slot_mut(&mut self) -> (usize, &mut [MaybeUninit<u8>]) {
+        let slot = self.len;
+        (slot, self.slot_bytes_mut(slot))
+    }
+
+    /// Register `byte_len` bytes just written into `slot`, flushing when full (M9).
+    #[inline]
+    fn commit_slot(&mut self, slot: usize, file_idx: usize, byte_len: usize, mode: blake3::Mode<'_>, sink: &mut Sink<'_>) {
+        assert_eq!(slot, self.len, "warm batch slot committed out of order");
+        assert!(byte_len <= WARM_SLOT_BLOCKS * 64, "warm batch slot length fits slot");
+        self.entries[slot] = (file_idx, byte_len);
+        self.len += 1;
+        if self.len == WARM_BATCH_SLOTS {
+            self.flush(mode, sink);
+        }
+    }
+
     #[inline]
     fn slot_bytes_mut(&mut self, slot: usize) -> &mut [MaybeUninit<u8>] {
         assert!(slot < WARM_BATCH_SLOTS, "warm batch slot out of range");
@@ -418,8 +444,8 @@ impl WarmBatch {
         let start = slot * WARM_SLOT_BLOCKS;
         let blocks = &mut arena[start..start + WARM_SLOT_BLOCKS];
         // Sound: `MaybeUninit<Block>` is 64 bytes with no padding or validity
-        // restrictions; reinterpreting it as `WARM_SLOT_BLOCKS * 64` uninit
-        // bytes stays strictly within the checked slice `blocks`.
+        // restrictions (asserted at compile time above); reinterpreting it as
+        // `WARM_SLOT_BLOCKS * 64` uninit bytes stays strictly within `blocks`.
         unsafe { core::slice::from_raw_parts_mut(blocks.as_mut_ptr().cast::<MaybeUninit<u8>>(), WARM_SLOT_BLOCKS * 64) }
     }
 
@@ -430,18 +456,13 @@ impl WarmBatch {
         // further than the slot.
         let byte_len = src.len();
         assert!(byte_len <= WARM_SLOT_BLOCKS * 64, "a batched file fits its slot");
-        let slot = self.len;
-        let dst = self.slot_bytes_mut(slot);
+        let (slot, dst) = self.next_slot_mut();
         if byte_len > 0 {
             // Sound: `src` is `&[u8]` of `byte_len` initialized bytes and `dst`
             // is a disjoint `&mut [MaybeUninit<u8>]` of at least `byte_len`.
             unsafe { core::ptr::copy_nonoverlapping(src.as_ptr(), dst.as_mut_ptr().cast::<u8>(), byte_len) };
         }
-        self.entries[slot] = (file_idx, byte_len);
-        self.len += 1;
-        if self.len == WARM_BATCH_SLOTS {
-            self.flush(mode, sink);
-        }
+        self.commit_slot(slot, file_idx, byte_len, mode, sink);
     }
 
     fn flush(&mut self, mode: blake3::Mode<'_>, sink: &mut Sink<'_>) {
@@ -660,7 +681,6 @@ struct ColdRingState {
     free_bufs: Vec<Vec<u8>>,
     deferred_cqes: VecDeque<IoUringCqe>,
     ring_in_flight: usize,
-    max_slots: usize,
 }
 
 impl ColdRingState {
@@ -671,11 +691,42 @@ impl ColdRingState {
             cold_large_pipe: None,
             slots: (0..max_slots).map(|_| None).collect(),
             free_slot_ids: (0..max_slots).rev().collect(),
-            free_bufs: Vec::with_capacity(max_slots * 2),
+            free_bufs: Vec::with_capacity(max_slots),
             deferred_cqes: VecDeque::new(),
             ring_in_flight: 0,
-            max_slots,
         })
+    }
+
+    /// Install `st` into `self.slots[sid]` and queue an `IORING_OP_READ` into
+    /// its spare capacity at `st.buf.len()`. Centralizes the ownership/lifetime
+    /// order across initial queueing, `EINTR` retry, and partial reads (M8).
+    fn submit_slot(&mut self, sid: usize, mut st: SmallSlot) {
+        while self.ring.sq_space_left() == 0 {
+            self.ring.submit_and_wait(0);
+        }
+        let fd = st.file.as_raw_fd();
+        let off = st.buf.len() as u64;
+        let spare = st.buf.spare_capacity_mut();
+        let ptr = spare.as_mut_ptr().cast::<u8>();
+        let room = spare.len();
+        self.slots[sid] = Some(st);
+        // Sound: `st` lives in `self.slots[sid]` untouched until the matching
+        // CQE is reaped, so `ptr[..room]` stays valid and exclusively writable
+        // by the kernel for the entire read.
+        let ok = unsafe { self.ring.push_read(fd, ptr, room, off, sid as u64) };
+        assert!(ok, "the ring has room for every read in flight");
+        self.ring_in_flight += 1;
+    }
+
+    /// Close a finished slot's descriptor, return `slot_id`, and recycle its
+    /// buffer if within the 256 KiB reuse cutoff (M8, L4).
+    fn retire_slot(&mut self, slot_id: usize, mut st: SmallSlot) {
+        drop(st.file);
+        self.free_slot_ids.push(slot_id);
+        st.buf.clear();
+        if st.buf.capacity() <= (256 << 10) {
+            self.free_bufs.push(st.buf);
+        }
     }
 
     fn queue_file(
@@ -692,20 +743,9 @@ impl ColdRingState {
             self.step_ring(true, args, warm_batch, sink);
         }
         let mut buf = self.free_bufs.pop().unwrap_or_default();
-        let partial_at = buffer_with_start(&mut buf, hint, partial_src);
+        let _partial_at = buffer_with_start(&mut buf, hint, partial_src);
         let sid = self.free_slot_ids.pop().unwrap();
-        let fd = file.as_raw_fd();
-        let spare = buf.spare_capacity_mut();
-        let ptr = spare.as_mut_ptr().cast::<u8>();
-        let room = spare.len();
-        self.slots[sid] = Some(SmallSlot { file_idx, file, buf });
-        // Sound: the read's buffer stays where it is, written by no one else,
-        // until its completion is reaped: the buffer goes into `slots[sid]`
-        // and is not touched until then.
-        let ok = unsafe { self.ring.push_read(fd, ptr, room, partial_at as u64, 0, sid as u64) };
-        // In every build, as the large file's read above.
-        assert!(ok, "the ring has room for every read in flight");
-        self.ring_in_flight += 1;
+        self.submit_slot(sid, SmallSlot { file_idx, file, buf });
     }
 
     fn step_ring(&mut self, wait: bool, args: &Args, warm_batch: &mut WarmBatch, sink: &mut Sink<'_>) {
@@ -733,20 +773,7 @@ impl ColdRingState {
             if cqe.res < 0 {
                 let errno = -cqe.res;
                 if errno == libc::EINTR {
-                    while self.ring.sq_space_left() == 0 {
-                        self.ring.submit_and_wait(0);
-                    }
-                    let fd = st.file.as_raw_fd();
-                    let off = st.buf.len() as u64;
-                    let spare = st.buf.spare_capacity_mut();
-                    let ptr = spare.as_mut_ptr().cast::<u8>();
-                    let room = spare.len();
-                    self.slots[slot_id] = Some(st);
-                    // Sound: as queue_file's read; the slot goes back into
-                    // `slots`.
-                    let ok = unsafe { self.ring.push_read(fd, ptr, room, off, 0, slot_id as u64) };
-                    assert!(ok, "the ring has room for every read in flight");
-                    self.ring_in_flight += 1;
+                    self.submit_slot(slot_id, st);
                     continue;
                 }
                 // Unsupported ring READ (`EINVAL`/`EOPNOTSUPP`/`EBADF`): finish via
@@ -754,24 +781,17 @@ impl ColdRingState {
                 // already read. `ESPIPE` falls back to sequential `read` at offset 0.
                 if matches!(errno, libc::EINVAL | libc::EOPNOTSUPP | libc::EBADF) || (st.buf.is_empty() && errno == libc::ESPIPE) {
                     let res = finish_sync_hash(mode, &mut st.file, &mut st.buf);
-                    drop(st.file);
-                    self.free_slot_ids.push(slot_id);
+                    let file_idx = st.file_idx;
+                    self.retire_slot(slot_id, st);
                     match res {
-                        Ok(h) => sink.put(st.file_idx, Ok(h)),
-                        Err(e) => sink.put(st.file_idx, Err(e.into())),
-                    }
-                    st.buf.clear();
-                    if self.free_bufs.len() < self.max_slots * 2 && st.buf.capacity() <= (256 << 10) {
-                        self.free_bufs.push(st.buf);
+                        Ok(h) => sink.put(file_idx, Ok(h)),
+                        Err(e) => sink.put(file_idx, Err(e.into())),
                     }
                     continue;
                 }
-                st.buf.clear();
-                if st.buf.capacity() <= (256 << 10) && self.free_bufs.len() < self.max_slots * 2 {
-                    self.free_bufs.push(st.buf);
-                }
-                self.free_slot_ids.push(slot_id);
-                sink.put(st.file_idx, Err(io::Error::from_raw_os_error(errno).into()));
+                let file_idx = st.file_idx;
+                self.retire_slot(slot_id, st);
+                sink.put(file_idx, Err(io::Error::from_raw_os_error(errno).into()));
                 continue;
             }
 
@@ -779,8 +799,6 @@ impl ColdRingState {
             // The file's end is where a read gives no byte, and nowhere
             // its size said (README.md, "What b3sum reads").
             if n == 0 {
-                drop(st.file);
-                self.free_slot_ids.push(slot_id);
                 if sink.open {
                     if st.buf.len() <= WARM_BATCH_MAX_FILE {
                         warm_batch.push_slice(st.file_idx, &st.buf, mode, sink);
@@ -789,10 +807,7 @@ impl ColdRingState {
                         sink.put(st.file_idx, Ok(h));
                     }
                 }
-                st.buf.clear();
-                if st.buf.capacity() <= (256 << 10) && self.free_bufs.len() < self.max_slots * 2 {
-                    self.free_bufs.push(st.buf);
-                }
+                self.retire_slot(slot_id, st);
             } else {
                 assert!(n <= st.buf.capacity() - st.buf.len(), "kernel read did not exceed spare capacity");
                 // Sound: the ring read wrote `n` initialized bytes into `st.buf.spare_capacity_mut()[..n]`.
@@ -802,9 +817,9 @@ impl ColdRingState {
                 // past SMALL_MEM_CAP, promote to streaming incremental hashing.
                 if st.buf.len() >= SMALL_MEM_CAP {
                     let res = file_end::finish_hash_streaming_from_prefix(mode, &st.buf, &mut st.file, false).map(|hr| hr.hash);
-                    drop(st.file);
-                    self.free_slot_ids.push(slot_id);
-                    sink.put(st.file_idx, res.map_err(Into::into));
+                    let file_idx = st.file_idx;
+                    self.retire_slot(slot_id, st);
+                    sink.put(file_idx, res.map_err(Into::into));
                     continue;
                 }
 
@@ -812,20 +827,7 @@ impl ColdRingState {
                     let grow = st.buf.capacity().max(8192).min(SMALL_MEM_CAP - st.buf.len());
                     st.buf.reserve(grow);
                 }
-                while self.ring.sq_space_left() == 0 {
-                    self.ring.submit_and_wait(0);
-                }
-                let fd = st.file.as_raw_fd();
-                let off = st.buf.len() as u64;
-                let spare = st.buf.spare_capacity_mut();
-                let ptr = spare.as_mut_ptr().cast::<u8>();
-                let room = spare.len();
-                self.slots[slot_id] = Some(st);
-                // Sound: as queue_file's read; the slot goes back into
-                // `slots`.
-                let ok = unsafe { self.ring.push_read(fd, ptr, room, off, 0, slot_id as u64) };
-                assert!(ok, "the ring has room for every read in flight");
-                self.ring_in_flight += 1;
+                self.submit_slot(slot_id, st);
             }
         }
     }
@@ -978,6 +980,48 @@ fn hash_paths_inner(
     });
 }
 
+/// Worker-local lifecycle of the `io_uring` cold-file backend (M10).
+/// Replaces paired `Option<ColdRingState>` + `bool` so contradictory states
+/// are unrepresentable.
+enum ColdRing {
+    Untried,
+    Active(ColdRingState),
+    Disabled,
+}
+
+impl ColdRing {
+    fn new(force_disabled: bool) -> Self {
+        if force_disabled { Self::Disabled } else { Self::Untried }
+    }
+
+    #[inline]
+    fn active_mut(&mut self) -> Option<&mut ColdRingState> {
+        match self {
+            Self::Active(c) => Some(c),
+            Self::Untried | Self::Disabled => None,
+        }
+    }
+
+    /// Return the active ring, trying `ColdRingState::new` at most once.
+    fn get_or_init(&mut self, max_slots: usize) -> Option<&mut ColdRingState> {
+        if matches!(self, Self::Untried) {
+            *self = match ColdRingState::new(max_slots) {
+                Some(state) => Self::Active(state),
+                None => Self::Disabled,
+            };
+        }
+        self.active_mut()
+    }
+
+    /// Drain and release any active ring, leaving the backend permanently
+    /// disabled for this worker.
+    fn retire_and_disable(&mut self, args: &Args, warm_batch: &mut WarmBatch, sink: &mut Sink<'_>) {
+        if let Self::Active(state) = core::mem::replace(self, Self::Disabled) {
+            state.finish(args, warm_batch, sink);
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_hybrid_worker(
     args: &Args,
@@ -986,14 +1030,14 @@ fn run_hybrid_worker(
     max_slots: usize,
     total_threads: usize,
     io_threads: usize,
-    mut uring_unavailable: bool,
+    force_no_uring: bool,
     next: &AtomicUsize,
     done: &mut dyn FnMut(usize, crate::err::Result<blake3::Hash>) -> bool,
 ) {
     let mut warm_batch = WarmBatch::new();
     let mut medium_buf: Vec<u8> = Vec::new();
     let mut warm_pipe: Option<WarmLargePipe> = None;
-    let mut cold: Option<ColdRingState> = None;
+    let mut cold = ColdRing::new(force_no_uring);
     let mut direct_piece: Option<crate::direct::Piece> = None;
     let mut probe_stack: [MaybeUninit<u8>; WARM_SLOT_BLOCKS * 64] = [MaybeUninit::uninit(); WARM_SLOT_BLOCKS * 64];
     let mut sink = Sink { done, open: true };
@@ -1002,7 +1046,7 @@ fn run_hybrid_worker(
         if let Some(ref mut wp) = warm_pipe {
             wp.drain(&mut sink);
         }
-        if let Some(ref mut c) = cold {
+        if let Some(c) = cold.active_mut() {
             let submit_batch = if c.ring_in_flight <= 8 { 4 } else { 16 };
             if c.ring.unsubmitted() >= submit_batch {
                 c.step_ring(false, args, &mut warm_batch, &mut sink);
@@ -1032,7 +1076,7 @@ fn run_hybrid_worker(
                 Err(e) => {
                     let is_fd_limit = matches!(e.raw_os_error(), Some(libc::EMFILE | libc::ENFILE));
                     if is_fd_limit
-                        && let Some(ref mut c) = cold
+                        && let Some(c) = cold.active_mut()
                         && c.ring_in_flight > 0
                     {
                         let before_free = c.free_slot_ids.len();
@@ -1066,7 +1110,7 @@ fn run_hybrid_worker(
         // Fast path once `cold` ring is already active on this worker: push `< 4 MiB`
         // files straight onto `Uring` without an extra `preadv2(RWF_NOWAIT)` syscall
         // (kernel `io_read` serves cached hits inline and arms async NVMe reads on misses!).
-        if let Some(ref mut c) = cold
+        if let Some(c) = cold.active_mut()
             && size < COLD_RING_MAX_FILE
         {
             c.queue_file(i, file, usize::try_from(size).expect("size < COLD_RING_MAX_FILE"), None, args, &mut warm_batch, &mut sink);
@@ -1077,23 +1121,28 @@ fn run_hybrid_worker(
         if size <= WARM_BATCH_MAX_FILE as u64 {
             let hint = usize::try_from(size).expect("size <= WARM_BATCH_MAX_FILE");
             let in_arena = warm_batch.has_arena();
-            let dst = if in_arena {
-                let s = warm_batch.len;
-                warm_batch.slot_bytes_mut(s)
+            let (direct_slot, probe_res) = if in_arena {
+                let (slot, dst) = warm_batch.next_slot_mut();
+                let res = try_pread_cached(file.as_raw_fd(), dst, 0);
+                // If we got a partial prefix into the arena slot, copy it into
+                // `probe_stack` before releasing the borrow on `warm_batch` so
+                // `cold.queue_file(..., &mut warm_batch, ...)` never aliases
+                // the arena (M9).
+                if let Ok(CacheRead::NeedMore(partial_at) | CacheRead::NonSeekable(partial_at)) = res
+                    && partial_at > 0
+                {
+                    probe_stack[..partial_at].copy_from_slice(&dst[..partial_at]);
+                }
+                (Some(slot), res)
             } else {
-                &mut probe_stack[..]
+                (None, try_pread_cached(file.as_raw_fd(), &mut probe_stack[..], 0))
             };
 
-            match try_pread_cached(file.as_raw_fd(), dst, 0) {
+            match probe_res {
                 Ok(CacheRead::Eof(n)) => {
                     drop(file);
-                    if in_arena {
-                        let s = warm_batch.len;
-                        warm_batch.entries[s] = (i, n);
-                        warm_batch.len += 1;
-                        if warm_batch.len == WARM_BATCH_SLOTS {
-                            warm_batch.flush(args.mode, &mut sink);
-                        }
+                    if let Some(slot) = direct_slot {
+                        warm_batch.commit_slot(slot, i, n, args.mode, &mut sink);
                     } else {
                         // Sound: `try_pread_cached` initialized `probe_stack[..n]`.
                         let bytes = unsafe { core::slice::from_raw_parts(probe_stack.as_ptr().cast::<u8>(), n) };
@@ -1106,15 +1155,11 @@ fn run_hybrid_worker(
                     continue;
                 }
                 Ok(CacheRead::NeedMore(partial_at) | CacheRead::NonSeekable(partial_at)) => {
-                    // Sound: `try_pread_cached` initialized `dst[..partial_at]`.
-                    let partial_slice = unsafe { core::slice::from_raw_parts(dst.as_ptr().cast::<u8>(), partial_at) };
-                    if !uring_unavailable && cold.is_none() {
-                        cold = ColdRingState::new(max_slots);
-                        if cold.is_none() {
-                            uring_unavailable = true;
-                        }
-                    }
-                    if let Some(ref mut c) = cold {
+                    // Sound: either `try_pread_cached` wrote `probe_stack[..partial_at]`
+                    // directly, or we copied `dst[..partial_at]` into `probe_stack`
+                    // immediately above; `probe_stack` is disjoint from `warm_batch`.
+                    let partial_slice = unsafe { core::slice::from_raw_parts(probe_stack.as_ptr().cast::<u8>(), partial_at) };
+                    if let Some(c) = cold.get_or_init(max_slots) {
                         c.queue_file(i, file, hint, Some(partial_slice), args, &mut warm_batch, &mut sink);
                     } else {
                         let mut buf = Vec::new();
@@ -1152,13 +1197,7 @@ fn run_hybrid_worker(
                 Ok(CacheRead::NeedMore(partial_at) | CacheRead::NonSeekable(partial_at)) => {
                     // Sound: try_pread_cached wrote the first `partial_at` bytes.
                     unsafe { medium_buf.set_len(partial_at) };
-                    if !uring_unavailable && cold.is_none() {
-                        cold = ColdRingState::new(max_slots);
-                        if cold.is_none() {
-                            uring_unavailable = true;
-                        }
-                    }
-                    if let Some(ref mut c) = cold {
+                    if let Some(c) = cold.get_or_init(max_slots) {
                         c.queue_file(i, file, hint, Some(&medium_buf), args, &mut warm_batch, &mut sink);
                         medium_buf.clear();
                     } else {
@@ -1196,13 +1235,7 @@ fn run_hybrid_worker(
             // Cold `512 KiB .. 4 MiB`: queue into `ColdRingState` sliding window if possible!
             if size < COLD_RING_MAX_FILE {
                 drop(map);
-                if !uring_unavailable && cold.is_none() {
-                    cold = ColdRingState::new(max_slots);
-                    if cold.is_none() {
-                        uring_unavailable = true;
-                    }
-                }
-                if let Some(ref mut c) = cold {
+                if let Some(c) = cold.get_or_init(max_slots) {
                     c.queue_file(i, file, usize::try_from(size).expect("size < COLD_RING_MAX_FILE"), None, args, &mut warm_batch, &mut sink);
                     continue;
                 }
@@ -1258,15 +1291,8 @@ fn run_hybrid_worker(
 
         // Cold `>= 4 MiB`: stream into 64 KiB `Pipeline` rooms
         // at ~20 MiB RSS, overlapping NVMe DMA with multi-core hashing!
-        if !uring_unavailable && cold.is_none() {
-            cold = ColdRingState::new(max_slots);
-            if cold.is_none() {
-                uring_unavailable = true;
-            }
-        }
-
         let mut retire_cold_ring = false;
-        if let Some(ref mut c) = cold {
+        if let Some(c) = cold.get_or_init(max_slots) {
             let pool_workers = if args.num_threads().is_some() { (total_threads - io_threads + 1).max(1) } else { total_threads.min(16) };
             crate::init_pool_once(pool_workers);
             let cpipe = c.cold_large_pipe.get_or_insert_with(|| Pipeline::<usize, ()>::new(args.mode, Limits { messages: 2, rooms: LARGE_WINDOW }));
@@ -1290,7 +1316,6 @@ fn run_hybrid_worker(
                     }
                     if !committed_any && matches!(e.raw_os_error(), Some(libc::EINVAL | libc::EOPNOTSUPP | libc::ESPIPE)) {
                         if matches!(e.raw_os_error(), Some(libc::EINVAL | libc::EOPNOTSUPP)) {
-                            uring_unavailable = true;
                             retire_cold_ring = true;
                         }
                         let res = if direct_changed { crate::hash_open_file_streaming(args, file) } else { crate::hash_open_file(args, file) };
@@ -1304,14 +1329,12 @@ fn run_hybrid_worker(
             let res = if direct_changed { crate::hash_open_file_streaming(args, file) } else { crate::hash_open_file(args, file) };
             sink.put(i, res);
         }
-        if retire_cold_ring && let Some(c) = cold.take() {
-            c.finish(args, &mut warm_batch, &mut sink);
+        if retire_cold_ring {
+            cold.retire_and_disable(args, &mut warm_batch, &mut sink);
         }
     }
 
-    if let Some(c) = cold {
-        c.finish(args, &mut warm_batch, &mut sink);
-    }
+    cold.retire_and_disable(args, &mut warm_batch, &mut sink);
     warm_batch.flush(args.mode, &mut sink);
     if let Some(mut wp) = warm_pipe {
         wp.finish(&mut sink);
