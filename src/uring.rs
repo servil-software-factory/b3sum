@@ -619,10 +619,10 @@ mod test {
     use super::Uring;
     use std::os::fd::AsRawFd;
 
-    /// On a host where raw `io_uring_setup` succeeds, `Uring::new` must also
-    /// succeed (proving `IORING_REGISTER_PROBE` does not spuriously disable
-    /// rings), while `REFUSE_OP_READ` causes `Uring::new` to fail with
-    /// `EOPNOTSUPP`.
+    /// On a host where raw `io_uring_setup` succeeds and an independent raw
+    /// `IORING_REGISTER_PROBE` reports `IORING_OP_READ` supported, `Uring::new`
+    /// must succeed (so an always-false `probe_op_read` fails this test!), while
+    /// `REFUSE_OP_READ` causes `Uring::new` to fail with `EOPNOTSUPP` (L10).
     #[test]
     fn uring_probe_accepts_op_read_and_refuse_seam_rejects_it() {
         let mut params = super::IoUringParams::default();
@@ -630,7 +630,27 @@ mod test {
         if raw_fd < 0 {
             return;
         }
+        // Independent kernel probe (not calling production `probe_op_read`).
+        let mut probe = super::IoUringProbe { last_op: 0, ops_len: 0, resv: 0, resv2: [0; 3], ops: [super::IoUringProbeOp::default(); super::PROBE_OPS] };
+        let rc = unsafe {
+            libc::syscall(
+                libc::SYS_io_uring_register,
+                raw_fd as std::os::fd::RawFd,
+                super::IORING_REGISTER_PROBE,
+                (&raw mut probe).cast::<libc::c_void>(),
+                super::PROBE_OPS as libc::c_uint,
+            )
+        };
+        let op_read_ok = rc == 0
+            && (probe.ops_len as usize) > (super::IORING_OP_READ as usize)
+            && (probe.last_op as usize) >= (super::IORING_OP_READ as usize)
+            && (probe.ops[super::IORING_OP_READ as usize].flags & super::IO_URING_OP_SUPPORTED) != 0;
         unsafe { libc::close(raw_fd as std::os::fd::RawFd) };
+        if !op_read_ok {
+            // Older Linux 5.1..5.5 or restricted rings: production probe must decline.
+            assert_eq!(Uring::new(8).err().and_then(|e| e.raw_os_error()), Some(libc::EOPNOTSUPP));
+            return;
+        }
         assert!(Uring::new(8).is_ok(), "probe must accept IORING_OP_READ on a capable kernel");
         super::REFUSE_OP_READ.store(true, std::sync::atomic::Ordering::Relaxed);
         let err = Uring::new(8).err().expect("REFUSE_OP_READ must reject ring setup");

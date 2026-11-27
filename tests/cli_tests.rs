@@ -479,12 +479,8 @@ fn test_newline_and_backslash_escaping_on_unix() {
     let dir = tempfile::tempdir().unwrap();
     fs::create_dir(dir.path().join("subdir")).unwrap();
     let names = ["abcdef", "abc\ndef", "abc\\def", "abc\rdef", "abc\r\ndef", "subdir/foo"];
-    let mut paths = Vec::new();
     for name in &names {
-        let path = dir.path().join(name);
-        println!("creating file at {:?}", path);
-        fs::write(&path, b"").unwrap();
-        paths.push(path);
+        fs::write(dir.path().join(name), b"").unwrap();
     }
     let output = cmd(b3sum_exe(), &names).dir(dir.path()).read().unwrap();
     let expected = format!(
@@ -497,14 +493,6 @@ fn test_newline_and_backslash_escaping_on_unix() {
 {0}  subdir/foo",
         empty_hash,
     );
-    println!("output");
-    println!("======");
-    println!("{}", output);
-    println!();
-    println!("expected");
-    println!("========");
-    println!("{}", expected);
-    println!();
     assert_eq!(expected, output);
 }
 
@@ -517,10 +505,8 @@ fn test_invalid_unicode_on_unix() {
     let empty_hash = blake3::convenience::hash(b"").to_hex();
     let dir = tempfile::tempdir().unwrap();
     let names = ["abcdef".into(), OsString::from_vec(b"abc\xffdef".to_vec())];
-    let mut paths = Vec::new();
     for name in &names {
         let path = dir.path().join(name);
-        println!("creating file at {:?}", path);
         // Note: Some operating systems, macOS in particular, simply don't
         // allow invalid Unicode in filenames. On those systems, this write
         // will fail. That's fine, we'll just short-circuit this test in that
@@ -531,7 +517,6 @@ fn test_invalid_unicode_on_unix() {
         } else if write_result.is_err() {
             return;
         }
-        paths.push(path);
     }
     let output = cmd(b3sum_exe(), &names).dir(dir.path()).read().unwrap();
     let expected = format!(
@@ -540,14 +525,6 @@ fn test_invalid_unicode_on_unix() {
 {0}  abc�def",
         empty_hash,
     );
-    println!("output");
-    println!("======");
-    println!("{}", output);
-    println!();
-    println!("expected");
-    println!("========");
-    println!("{}", expected);
-    println!();
     assert_eq!(expected, output);
 }
 
@@ -744,8 +721,7 @@ fn test_globbing() {
     //       about it if it comes up.
     let expected = format!("{}  file1\n{}  file2", foo_hash.to_hex(), bar_hash.to_hex());
 
-    let star_command = format!("{} *", b3sum_exe().to_str().unwrap());
-    let output = cmd!("/bin/sh", "-c", star_command).dir(dir.path()).read().unwrap();
+    let output = cmd!("/bin/sh", "-c", "exec \"$1\" *", "sh", b3sum_exe()).dir(dir.path()).read().unwrap();
     assert_eq!(expected, output);
 }
 
@@ -1223,8 +1199,13 @@ fn test_stdin_from_an_empty_file_that_reports_a_size_and_with_no_descriptor_to_s
     fs::write(dir.path().join("data"), &data).unwrap();
     // Descriptors the test's runner left open are closed first: the
     // system's loader needs one free to load the program's libraries.
-    let script = format!("exec < data 3<&- 4<&- 5<&- 6<&- 7<&- 8<&- 9<&-; ulimit -n 4; exec '{}'", b3sum_exe().display());
-    let out = cmd!("sh", "-c", script).dir(dir.path()).stdout_capture().stderr_capture().unchecked().run().unwrap();
+    let out = cmd!("sh", "-c", "exec < data 3<&- 4<&- 5<&- 6<&- 7<&- 8<&- 9<&-; ulimit -n 4; exec \"$1\"", "sh", b3sum_exe())
+        .dir(dir.path())
+        .stdout_capture()
+        .stderr_capture()
+        .unchecked()
+        .run()
+        .unwrap();
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     assert_eq!(String::from_utf8(out.stdout).unwrap(), format!("{}  -\n", blake3::convenience::hash(&data).to_hex()));
 }
@@ -1330,7 +1311,7 @@ fn test_a_checkfile_on_a_pipe_cannot_check_that_pipe() {
     // A checkfile that is a pipe named `-` in the directory still checks
     // standard input by the entry `-`.
     let dash = dir.path().join("-");
-    assert!(std::process::Command::new("mkfifo").arg(&dash).status().unwrap().success());
+    pty_helpers::make_fifo(&dash);
     let writer = std::thread::spawn({
         let (dash, list) = (dash.clone(), format!("{foo}  -\n"));
         move || fs::write(dash, list).unwrap()
@@ -1341,7 +1322,7 @@ fn test_a_checkfile_on_a_pipe_cannot_check_that_pipe() {
     fs::remove_file(&dash).unwrap();
     // A checkfile that is another pipe cannot check that pipe either.
     let fifo = dir.path().join("fifo");
-    assert!(std::process::Command::new("mkfifo").arg(&fifo).status().unwrap().success());
+    pty_helpers::make_fifo(&fifo);
     let list = format!("{foo}  {}\n{foo}  f\n", fifo.display());
     let writer = std::thread::spawn({
         let (fifo, list) = (fifo.clone(), list.clone());
@@ -1503,7 +1484,7 @@ fn test_unix_socket_and_named_fifo_stdin_aliases() {
     // 2. Named FIFO on stdin with a single finite writer that closes.
     let dir = tempfile::tempdir().unwrap();
     let fifo = dir.path().join("in.fifo");
-    assert!(std::process::Command::new("mkfifo").arg(&fifo).status().unwrap().success());
+    pty_helpers::make_fifo(&fifo);
     let writer = std::thread::spawn({
         let fifo = fifo.clone();
         move || {
@@ -1568,12 +1549,42 @@ fn test_low_nofile_budget_makes_progress_through_ring() {
         expected.push_str(&format!("{}  {name}\n", blake3::convenience::hash(body.as_bytes()).to_hex()));
         names.push(name);
     }
-    let files_arg = names.join(" ");
     for extra_flag in ["--num-threads=1", ""] {
-        let script = format!("exec 3<&- 4<&- 5<&- 6<&- 7<&- 8<&- 9<&-; ulimit -n 8; exec '{}' --no-mmap {extra_flag} {files_arg}", b3sum_exe().display());
-        let out = cmd!("sh", "-c", script).dir(dir.path()).stdout_capture().stderr_capture().unchecked().run().unwrap();
+        let mut sh_args: Vec<OsString> = vec![
+            "-c".into(),
+            "exec 3<&- 4<&- 5<&- 6<&- 7<&- 8<&- 9<&-; ulimit -n 8; exe=\"$1\"; shift; exec \"$exe\" --no-mmap \"$@\"".into(),
+            "sh".into(),
+            b3sum_exe().into(),
+        ];
+        if !extra_flag.is_empty() {
+            sh_args.push(extra_flag.into());
+        }
+        sh_args.extend(names.iter().map(Into::into));
+        let out = cmd("sh", sh_args).dir(dir.path()).stdout_capture().stderr_capture().unchecked().run().unwrap();
         assert!(out.status.success(), "flag={extra_flag:?} stderr={}", String::from_utf8_lossy(&out.stderr));
         assert_eq!(String::from_utf8(out.stdout).unwrap(), expected, "flag={extra_flag:?}");
+    }
+
+    // M28: even when the caller holds inherited open descriptors (fds 3..=9 on
+    // top of stdio = 10 open FDs under RLIMIT_NOFILE=15, leaving only 5 free
+    // slots), worker/slot sizing accounts for actual open FDs instead of
+    // assuming `RLIMIT_NOFILE - 6`.
+    for extra_flag in ["--num-threads=1", ""] {
+        let mut sh_args: Vec<OsString> = vec![
+            "-c".into(),
+            "exec 3</dev/null 4</dev/null 5</dev/null 6</dev/null 7</dev/null 8</dev/null 9</dev/null; \
+             ulimit -n 15; exe=\"$1\"; shift; exec \"$exe\" --no-mmap \"$@\""
+                .into(),
+            "sh".into(),
+            b3sum_exe().into(),
+        ];
+        if !extra_flag.is_empty() {
+            sh_args.push(extra_flag.into());
+        }
+        sh_args.extend(names.iter().map(Into::into));
+        let out = cmd("sh", sh_args).dir(dir.path()).stdout_capture().stderr_capture().unchecked().run().unwrap();
+        assert!(out.status.success(), "inherited-fd flag={extra_flag:?} stderr={}", String::from_utf8_lossy(&out.stderr));
+        assert_eq!(String::from_utf8(out.stdout).unwrap(), expected, "inherited-fd flag={extra_flag:?}");
     }
 }
 
@@ -1611,8 +1622,13 @@ fn test_lexical_dev_stdin_does_not_override_os_stat() {
         let real_file = dir.path().join("stdin");
         let real_body = b"real-file-not-stdin";
         fs::write(&real_file, real_body).unwrap();
-        let script = format!("exec 7<'{}'; exec '{}' --no-names /dev/fd/7/../../stdin", sub.display(), b3sum_exe().display());
-        let out = cmd!("sh", "-c", script).stdin_bytes("from-stdin").stdout_capture().stderr_capture().unchecked().run().unwrap();
+        let out = cmd!("sh", "-c", "exec 7<\"$1\"; exec \"$2\" --no-names /dev/fd/7/../../stdin", "sh", &sub, b3sum_exe())
+            .stdin_bytes("from-stdin")
+            .stdout_capture()
+            .stderr_capture()
+            .unchecked()
+            .run()
+            .unwrap();
         assert!(out.status.success(), "stderr={}", String::from_utf8_lossy(&out.stderr));
         assert_eq!(String::from_utf8(out.stdout).unwrap().trim(), blake3::convenience::hash(real_body).to_hex().as_str());
     }

@@ -49,7 +49,7 @@ CONTROLS = [
     (
         "--no-mmap maps no file (#432)",
         "src/main.rs",
-        "        if self.inner.no_mmap {\n            return None;\n        }\n",
+        "        if self.no_mmap {\n            return None;\n        }\n",
         "",
         "unit_tests::test_no_mmap_maps_no_file",
     ),

@@ -64,7 +64,9 @@ and writes `.sha256` and `.b3` digest files beside the binary.
 b3sum foo.txt
 ```
 
-To time hashing a 1 GB file on your machine:
+Quick smoke example on a 1 GB file (for reproducible, cache-controlled native
+benchmarks across warm/cold files and directory trees, see
+[bench-hashes](https://github.com/servil-software-factory/bench-hashes/blob/main/METHODOLOGY.md)):
 
 ```bash
 head -c 1000000000 /dev/zero > /tmp/bigfile
@@ -109,10 +111,10 @@ files in parallel and splits large files across threads. (`--raw` and `--tag`
 cannot be combined.) When stdout is a
 terminal, `b3sum` hashes and flushes each completed line in order so results
 appear promptly; when stdout is redirected to a pipe or file, output is
-buffered in 32 KiB chunks. On a Linux machine
-with several memory nodes, runs that use multiple threads (or pass
-`--num-threads` > 1) keep to one node, the one that holds the most of the CPUs
-the process is allowed (the library's README says more); single-threaded runs
+buffered in 32 KiB chunks. On a Linux machine with several memory nodes, runs that use multiple threads
+(or pass `--num-threads` > 1) apply best-effort CPU affinity to stay on one
+node: the current node unless another valid node exposes at least twice as many
+allowed CPUs (the library's README says more); single-threaded runs
 (`--num-threads 1` or single-threaded paths such as one small regular file)
 skip topology discovery and bind nothing. Pass `--num-threads 1` to use a
 single thread. On Linux, `taskset -c LIST b3sum ...` pins `b3sum` to specific
@@ -191,14 +193,19 @@ in-place overwrites.
 
 ## Direct I/O for large cold files
 
-On Linux, `b3sum` reads cold files with direct I/O (bypassing the page cache)
-when hashing a single file of 4 MiB or more, multiple files of 32 MiB or more
-when at least 4 direct-I/O threads per file worker are available (or 4 MiB or
-more when `io_uring` is unavailable), or any file of 4 MiB or more with
-`--outboard`. Bypassing the cache avoids extra memory copies and leaves the
-page cache undisturbed when hashing large sets of files once. On a Ryzen 9700X
-with NVMe storage, hashing a cold 1 GiB file drops from 0.22 s through the page
-cache to 0.10 s with direct I/O.
+On Linux, `b3sum` can read cold regular files with direct I/O (bypassing the
+page cache) as an eligible optimization for standard digests (`--seek 0` with
+length `<= 32`, when memory mapping is enabled on single files or on the
+no-ring multi-file fallback) or `--outboard`, subject to size, thread-budget,
+and filesystem support: a single cold file of 4 MiB or more with multiple
+threads, multiple cold files of 32 MiB or more when at least 4 direct-I/O
+threads per file worker are available (or 4 MiB or more with multiple threads
+and mapping enabled when `io_uring` is unavailable), or any eligible cold file
+of 4 MiB or more with `--outboard`. Bypassing the cache avoids extra memory
+copies and leaves the page cache undisturbed when hashing large sets of files
+once. On a Ryzen 9700X with NVMe storage, hashing a cold 1 GiB file drops from
+0.22 s through the page cache to 0.10 s with direct I/O (measured with
+`bench-hashes`).
 
 ## Outboards for verified streaming
 
@@ -224,3 +231,26 @@ $ mkdir outboards && b3sum --outboard outboards big.iso
 $ ls outboards
 5da5ad397cd129294c30f415b7d4e091b155a5faa37ba0b154ed10a5e5dbfca9.obao4
 ```
+
+## Quality, testing, and security
+
+This standalone CLI crate (`b3sums`) is pre-1.0 software maintained under the
+[Servil Software Factory Manual](https://github.com/servil-software-factory/.github/blob/main/manual/01-philosophy.md).
+Supported build targets are `x86_64-unknown-linux-gnu`,
+`aarch64-unknown-linux-gnu`, and `aarch64-apple-darwin` (for other platforms,
+see official upstream [BLAKE3 `b3sum`](https://github.com/BLAKE3-team/BLAKE3)).
+
+Run the local verification checks from a checkout:
+
+```bash
+cargo fmt --all -- --check
+cargo clippy --locked --bins -- -D warnings
+cargo nextest run --locked --release
+python3 tools/unsafe_reasons.py
+python3 tools/b3sum_controls.py         # Linux: 18 staged planted-fault controls
+python3 tools/test_dependency_policy.py
+python3 tools/test_release_artifacts.py
+```
+
+Please report suspected security vulnerabilities privately via
+[GitHub private vulnerability reporting](https://github.com/servil-software-factory/b3sum/security/advisories/new).

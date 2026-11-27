@@ -180,6 +180,35 @@ mod test {
     }
 
     #[test]
+    fn largest_keeps_current_node_unless_other_has_at_least_twice_as_many_cpus() {
+        let dir = crate::tempfile::tempdir().unwrap();
+        let sys = dir.path();
+        std::fs::create_dir_all(sys.join("node/node0")).unwrap();
+        std::fs::create_dir_all(sys.join("node/node1")).unwrap();
+        std::fs::write(sys.join("node/online"), "0-1\n").unwrap();
+        // Node 0: CPUs 0..=1 (2 CPUs); Node 1: CPUs 2..=5 (4 CPUs).
+        std::fs::write(sys.join("node/node0/cpulist"), "0-1\n").unwrap();
+        std::fs::write(sys.join("node/node1/cpulist"), "2-5\n").unwrap();
+        for c in 0..=1 {
+            std::fs::create_dir_all(sys.join(format!("cpu/cpu{c}/node0"))).unwrap();
+        }
+        for c in 2..=5 {
+            std::fs::create_dir_all(sys.join(format!("cpu/cpu{c}/node1"))).unwrap();
+        }
+        let online = online_nodes(std::fs::read_to_string(sys.join("node/online"))).unwrap();
+
+        // Allowed = 0-4 -> node0 has 2 CPUs, node1 has 3 CPUs (< 2*2): keep current node0.
+        let allowed_less_than_2x = cpu_set("0-4").unwrap();
+        let stay = largest(sys, &online, 0, allowed_less_than_2x).expect("confinement mask");
+        assert_eq!(bits(&stay), vec![0, 1], "must keep current node when other node has < 2x allowed CPUs (M25)");
+
+        // Allowed = 0-5 -> node0 has 2 CPUs, node1 has 4 CPUs (>= 2*2): move to node1.
+        let allowed_at_least_2x = cpu_set("0-5").unwrap();
+        let switch = largest(sys, &online, 0, allowed_at_least_2x).expect("confinement mask");
+        assert_eq!(bits(&switch), vec![2, 3, 4, 5], "must switch to other node with >= 2x allowed CPUs (M25)");
+    }
+
+    #[test]
     fn the_cli_mask_binds_to_a_pretended_node() {
         std::thread::spawn(|| {
             let before = affinity().unwrap();
