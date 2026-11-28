@@ -128,8 +128,8 @@ pub(crate) fn validate_byte_stream_fd(fd: RawFd) -> crate::err::Result<FdMeta> {
     Ok(meta)
 }
 
-/// Best-effort non-blocking write of a short fatal diagnostic (`<= 512` bytes)
-/// to fd 2 without locking `std::io::stderr()`, allocating, or mutating fd 2's
+/// Best-effort write of a short fatal diagnostic (`<= 512` bytes) to fd 2
+/// without locking `std::io::stderr()`, allocating, or mutating fd 2's
 /// open-file flags. Async-signal-safe: uses only `fcntl`, `fstat`, `open`,
 /// `write`, `send`, and `close`.
 ///
@@ -138,8 +138,9 @@ pub(crate) fn validate_byte_stream_fd(fd: RawFd) -> crate::err::Result<FdMeta> {
 /// - `S_IFREG`: writes directly to fd 2 (preserves the caller's file offset and
 ///   `O_APPEND` mode, and never waits on a pipe reader; on local storage this
 ///   completes promptly, though a stalled FUSE or network mount can still wait
-///   on regular-file `write(2)` — an intentional trade-off so stderr redirected
-///   to a log file still captures the fatal message before `_exit`/`abort`).
+///   on regular-file `write(2)` — an intentional best-effort trade-off so
+///   stderr redirected to a log file still captures the fatal message before
+///   `_exit`/`abort`).
 /// - `S_IFSOCK`: uses per-call `send(2,..., MSG_DONTWAIT)` (atomic non-blocking
 ///   without mutating fd flags).
 /// - `S_IFIFO` (pipes/FIFOs have no seek offset and no `TOSTOP`/`SIGTTOU`): on
@@ -149,7 +150,7 @@ pub(crate) fn validate_byte_stream_fd(fd: RawFd) -> crate::err::Result<FdMeta> {
 /// - Everything else (including `S_IFCHR` devices/terminals that may have seek
 ///   offsets or `TOSTOP`): omits the diagnostic so fatal termination
 ///   (`_exit`/`abort`) is never delayed or stopped by stderr.
-pub(crate) fn write_fatal_nonblocking(msg: &[u8]) {
+pub(crate) fn write_fatal_best_effort(msg: &[u8]) {
     if msg.is_empty() {
         return;
     }
@@ -203,7 +204,7 @@ pub(crate) fn write_fatal_nonblocking(msg: &[u8]) {
 }
 
 /// Format a short fatal diagnostic into a fixed stack buffer (no heap
-/// allocation, no `stderr` mutex) and emit it via [`write_fatal_nonblocking`].
+/// allocation, no `stderr` mutex) and emit it via [`write_fatal_best_effort`].
 #[cfg(target_os = "linux")]
 pub(crate) fn write_fatal_fmt(args: core::fmt::Arguments<'_>) {
     struct StackBuf {
@@ -221,7 +222,7 @@ pub(crate) fn write_fatal_fmt(args: core::fmt::Arguments<'_>) {
     }
     let mut out = StackBuf { buf: [0u8; 256], len: 0 };
     let _ = core::fmt::Write::write_fmt(&mut out, args);
-    write_fatal_nonblocking(&out.buf[..out.len]);
+    write_fatal_best_effort(&out.buf[..out.len]);
 }
 
 #[cfg(test)]
@@ -466,6 +467,9 @@ pub(crate) fn open_checked(path: &Path, forbidden: Option<StreamId>) -> crate::e
 /// Inner implementation of [`open_checked`] parameterized on the open call so
 /// tests can inject a post-open descriptor swap after the pre-open path check
 /// passes, proving the post-open `fstat` guard fails closed on its own.
+/// Also validates the opened descriptor with [`ensure_byte_stream_fd`] so
+/// record-oriented sockets (e.g. non-stdin Darwin `/dev/fd/<N>` `SOCK_DGRAM`)
+/// are refused uniformly across digest, XOF, and `--outboard` modes.
 pub(crate) fn open_checked_with(path: &Path, forbidden: Option<StreamId>, open: impl FnOnce(&Path) -> io::Result<File>) -> crate::err::Result<(File, FdMeta)> {
     if let Some(forbid) = forbidden
         && path_matches_stream(path, forbid)
@@ -480,6 +484,7 @@ pub(crate) fn open_checked_with(path: &Path, forbidden: Option<StreamId>, open: 
     {
         crate::bail!("this checkfile is a stream, and cannot also be a file to check");
     }
+    ensure_byte_stream_fd(file.as_raw_fd(), meta.mode_type)?;
     Ok((file, meta))
 }
 

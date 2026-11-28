@@ -1945,3 +1945,93 @@ fn check_stdin_and_dup_socket_fd_preserves_manifest_order() {
     assert!(out.status.success(), "expected --check pass on stdin + /dev/fd/3:\nstdout:\n{stdout}\nstderr:\n{stderr}");
     assert_eq!(stdout, "-: OK\n/dev/fd/3: OK\n");
 }
+
+#[test]
+fn test_outboard_redirected_streams_prefix_before_gated_fifo() {
+    use std::io::{Read, Write};
+    blake3::initialize();
+    let dir = tempfile::tempdir().unwrap();
+    let ob_dir = dir.path().join("ob");
+    fs::create_dir(&ob_dir).unwrap();
+    // 600 short files produce > 50 KiB of stdout (> 32 KiB OutBuf), so a
+    // redirected `--outboard` run without an all-operands barrier must flush
+    // completed prefix lines before opening or finishing the final gated FIFO.
+    let mut args: Vec<std::ffi::OsString> = vec!["--outboard".into(), ob_dir.as_os_str().to_os_string()];
+    for i in 0..600usize {
+        let p = dir.path().join(format!("item-{i:04}.txt"));
+        fs::write(&p, format!("payload-{i}")).unwrap();
+        args.push(p.into_os_string());
+    }
+    let fifo = dir.path().join("tail.fifo");
+    assert!(std::process::Command::new("mkfifo").arg(&fifo).status().unwrap().success());
+    args.push(fifo.as_os_str().to_os_string());
+
+    let mut child =
+        std::process::Command::new(b3sum_exe()).args(&args).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn().unwrap();
+    let mut stdout = child.stdout.take().unwrap();
+    let mut got = Vec::new();
+    let mut buf = [0u8; 4096];
+    // Read at least one flushed chunk while the final FIFO still has no writer;
+    // an all-operands barrier would deadlock here until nextest's hang timeout.
+    while !got.contains(&b'\n') {
+        let n = stdout.read(&mut buf).unwrap();
+        assert!(n > 0, "b3sum --outboard exited before emitting prefix lines");
+        got.extend_from_slice(&buf[..n]);
+    }
+    // Unblock the final FIFO in a helper thread while draining the rest of stdout.
+    let fifo_for_writer = fifo.clone();
+    let writer = std::thread::spawn(move || {
+        let mut f = fs::OpenOptions::new().write(true).open(&fifo_for_writer).unwrap();
+        f.write_all(b"tail-fifo-bytes").unwrap();
+    });
+    stdout.read_to_end(&mut got).unwrap();
+    writer.join().unwrap();
+    let status = child.wait().unwrap();
+    assert!(status.success(), "b3sum --outboard failed: {status:?}");
+    let lines: Vec<&str> = std::str::from_utf8(&got).unwrap().lines().collect();
+    assert_eq!(lines.len(), 601, "expected 600 files + 1 FIFO line");
+    assert!(lines[0].ends_with("item-0000.txt"));
+    assert!(lines[599].ends_with("item-0599.txt"));
+    assert!(lines[600].ends_with("tail.fifo"));
+    assert!(lines[600].starts_with(blake3::convenience::hash(b"tail-fifo-bytes").to_hex().as_str()));
+}
+
+#[test]
+fn test_inherited_dgram_socket_rejected_across_digest_xof_and_outboard() {
+    use std::os::unix::net::UnixDatagram;
+    use std::os::unix::process::CommandExt;
+
+    let (sock_a, sock_b) = UnixDatagram::pair().unwrap();
+    sock_b.send(b"dgram-payload").unwrap();
+    let ob_dir = tempfile::tempdir().unwrap();
+    let raw_fd = std::os::fd::AsRawFd::as_raw_fd(&sock_a);
+
+    let cases: [(&str, Vec<std::ffi::OsString>); 3] = [
+        ("digest", vec!["/dev/fd/3".into()]),
+        ("xof", vec!["--length".into(), "64".into(), "/dev/fd/3".into()]),
+        ("outboard", vec!["--outboard".into(), ob_dir.path().as_os_str().to_os_string(), "/dev/fd/3".into()]),
+    ];
+    for (label, args) in cases {
+        let mut cmd = std::process::Command::new(b3sum_exe());
+        cmd.args(&args).stdin(std::process::Stdio::null());
+        // Sound: `pre_exec` calls only async-signal-safe `dup2` and `fcntl` to
+        // expose the non-stdin datagram socket on fd 3 with FD_CLOEXEC cleared
+        // (including when `raw_fd == 3`, where `dup2(3, 3)` is a no-op).
+        unsafe {
+            cmd.pre_exec(move || {
+                if raw_fd != 3 && libc::dup2(raw_fd, 3) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::fcntl(3, libc::F_SETFD, 0) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let out = cmd.output().unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success(), "{label}: datagram /dev/fd/3 must fail; stderr={stderr}");
+        #[cfg(target_os = "macos")]
+        assert!(stderr.contains("record-oriented socket input is not supported"), "{label}: expected socket refusal on macOS, got stderr={stderr}");
+    }
+}
