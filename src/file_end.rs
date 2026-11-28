@@ -141,14 +141,18 @@ pub(crate) fn validate_byte_stream_fd(fd: RawFd) -> crate::err::Result<FdMeta> {
 ///   on regular-file `write(2)` — an intentional best-effort trade-off so
 ///   stderr redirected to a log file still captures the fatal message before
 ///   `_exit`/`abort`).
-/// - `S_IFSOCK`: uses per-call `send(2,..., MSG_DONTWAIT)` (atomic non-blocking
+/// - `S_IFSOCK`: uses per-call `send(2, ..., MSG_DONTWAIT)` (atomic non-blocking
 ///   without mutating fd flags).
 /// - `S_IFIFO` (pipes/FIFOs have no seek offset and no `TOSTOP`/`SIGTTOU`): on
 ///   Linux, reopens `/proc/self/fd/2` with `O_WRONLY | O_NONBLOCK | O_CLOEXEC`
 ///   for an independent non-blocking open file description that never blocks or
 ///   races peer writers; if unavailable (or on non-Linux), omits the diagnostic.
-/// - Everything else (including `S_IFCHR` devices/terminals that may have seek
-///   offsets or `TOSTOP`): omits the diagnostic so fatal termination
+/// - `S_IFCHR` (terminals/character devices): on Linux, temporarily blocks
+///   `SIGTTOU` with `sigprocmask` (async-signal-safe) around reopening
+///   `/proc/self/fd/2` with `O_WRONLY | O_NONBLOCK | O_NOCTTY | O_CLOEXEC` and
+///   writing, so interactive terminal users still see the fatal explanation
+///   without stopping on `SIGTTOU` or blocking on flow-stopped terminals.
+/// - Everything else: omits the diagnostic so fatal termination
 ///   (`_exit`/`abort`) is never delayed or stopped by stderr.
 pub(crate) fn write_fatal_best_effort(msg: &[u8]) {
     if msg.is_empty() {
@@ -196,6 +200,32 @@ pub(crate) fn write_fatal_best_effort(msg: &[u8]) {
                 if nb_fd >= 0 {
                     let _ = unsafe { libc::write(nb_fd, msg.as_ptr().cast(), msg.len()) };
                     let _ = unsafe { libc::close(nb_fd) };
+                }
+            }
+        }
+        libc::S_IFCHR => {
+            #[cfg(target_os = "linux")]
+            {
+                const PROC_STDERR: &[u8] = b"/proc/self/fd/2\0";
+                // Sound: `sigemptyset`, `sigaddset`, `sigprocmask`, `open`,
+                // `write`, and `close` are async-signal-safe; blocking
+                // `SIGTTOU` prevents background jobs with `TOSTOP` from
+                // stopping during teardown, and `O_NONBLOCK` prevents blocking
+                // on a flow-stopped terminal.
+                unsafe {
+                    let mut mask = core::mem::MaybeUninit::<libc::sigset_t>::uninit();
+                    let mut prev = core::mem::MaybeUninit::<libc::sigset_t>::uninit();
+                    let masked = libc::sigemptyset(mask.as_mut_ptr()) == 0
+                        && libc::sigaddset(mask.as_mut_ptr(), libc::SIGTTOU) == 0
+                        && libc::sigprocmask(libc::SIG_BLOCK, mask.as_ptr(), prev.as_mut_ptr()) == 0;
+                    if masked {
+                        let nb_fd = libc::open(PROC_STDERR.as_ptr().cast(), libc::O_WRONLY | libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_CLOEXEC);
+                        if nb_fd >= 0 {
+                            let _ = libc::write(nb_fd, msg.as_ptr().cast(), msg.len());
+                            let _ = libc::close(nb_fd);
+                        }
+                        let _ = libc::sigprocmask(libc::SIG_SETMASK, prev.as_ptr(), core::ptr::null_mut());
+                    }
                 }
             }
         }

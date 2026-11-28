@@ -17,24 +17,17 @@ unsafe impl Send for Mmap {}
 unsafe impl Sync for Mmap {}
 
 impl Mmap {
-    /// Map `file` read-only from offset 0 through its current length.
+    /// Map `len` bytes of `file` read-only from offset 0 using the caller's
+    /// already-queried `FdMeta.len` (single source of truth, avoiding a second
+    /// `fstat` syscall).
     ///
     /// # Safety
     ///
     /// The underlying file must not be modified or truncated concurrently
     /// while the mapping is live (see `README.md`, `--no-mmap`).
-    pub(crate) unsafe fn map(file: &impl AsRawFd) -> io::Result<Self> {
+    pub(crate) unsafe fn map(file: &impl AsRawFd, len: u64) -> io::Result<Self> {
         let fd = file.as_raw_fd();
-        // Sound: `libc::stat` is a plain C struct of integers initialized by `fstat`.
-        let mut st: libc::stat = unsafe { core::mem::zeroed() };
-        // Sound: `st` is valid for writes by `fstat(2)` on `fd`.
-        if unsafe { libc::fstat(fd, &raw mut st) } != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        if st.st_size < 0 {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "negative file size"));
-        }
-        let Ok(len) = usize::try_from(st.st_size) else {
+        let Ok(len) = usize::try_from(len) else {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "file size overflows usize"));
         };
         if len > isize::MAX as usize {
@@ -111,16 +104,16 @@ mod test {
         let nonempty = dir.path().join("data");
         fs::write(&nonempty, b"hello mmap").unwrap();
         let f = File::open(&nonempty).unwrap();
-        let m = unsafe { Mmap::map(&f) }.unwrap();
+        let m = unsafe { Mmap::map(&f, 10) }.unwrap();
         assert_eq!(&*m, b"hello mmap");
         drop(m);
 
         let empty = dir.path().join("empty");
         fs::write(&empty, b"").unwrap();
         let ef = File::open(&empty).unwrap();
-        let em = unsafe { Mmap::map(&ef) }.unwrap();
+        let em = unsafe { Mmap::map(&ef, 0) }.unwrap();
         assert_eq!(&*em, b"");
 
-        assert!(unsafe { Mmap::map(&BadFd(-1)) }.is_err());
+        assert!(unsafe { Mmap::map(&BadFd(-1), 16) }.is_err());
     }
 }

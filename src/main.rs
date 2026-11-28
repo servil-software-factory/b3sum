@@ -210,7 +210,7 @@ impl Args {
     /// shortened file stops the process when its lost pages are read
     /// (`explain_sigbus`). (BLAKE3 #432: the option was accepted and did
     /// nothing.)
-    pub(crate) fn map(&self, file: &impl std::os::fd::AsRawFd) -> Option<mmap::Mmap> {
+    pub(crate) fn map(&self, file: &impl std::os::fd::AsRawFd, len: u64) -> Option<mmap::Mmap> {
         if self.no_mmap {
             return None;
         }
@@ -219,7 +219,7 @@ impl Args {
         // Sound: the mapping is read-only and the CLI documents that files
         // must not be modified concurrently while hashed (pass `--no-mmap`
         // for mutable inputs; truncation triggers `explain_sigbus`).
-        unsafe { mmap::Mmap::map(file) }.ok()
+        unsafe { mmap::Mmap::map(file, len) }.ok()
     }
 
     fn keyed(&self) -> bool {
@@ -408,10 +408,6 @@ pub(crate) fn stdin_named_twice(paths: &[PathBuf], stdin_ctx: &StdinContext) -> 
     stream_refs > 1
 }
 
-/// Hash a regular-file Darwin `/dev/fd/<N>` (or `/dev/stdin`) operand from
-/// offset 0 via `mmap` or positioned `pread`, after opening `path` normally to
-/// preserve OS lookup errors and permissions, without moving the underlying
-/// open-file description's shared offset (#515).
 /// Unified opened input descriptor produced once by [`open_input`] for standard
 /// hashing, extended output, and `--outboard`: keyed-stdin refusal, forbidden
 /// checkfile-stream checks, and byte-stream validation happen in one place.
@@ -478,7 +474,7 @@ fn hash_darwin_regular_dev_fd_hash(args: &Args, mut file: File, meta: file_end::
     }
     if let Ok(len) = usize::try_from(meta.len)
         && len >= MAP_LEN
-        && let Some(map) = args.map(&file)
+        && let Some(map) = args.map(&file, meta.len)
     {
         if resident(&map) {
             let h = hash_slice_32(args.mode, &map);
@@ -589,7 +585,7 @@ pub(crate) fn hash_open_file_with_meta(args: &Args, mut file: File, fd_meta: fil
         if let Ok(len) = usize::try_from(size)
             && len >= MAP_LEN
         {
-            let map = args.map(&file);
+            let map = args.map(&file, size);
             if let Some(ref map_ref) = map {
                 let warm = resident(map_ref);
                 // The tests' seam: a file just written is in the cache.
@@ -693,7 +689,7 @@ fn hash_path(args: &Args, path: &Path, stdin_ctx: &StdinContext) -> err::Result<
         OpenedInput::DarwinRegularDevFd(file, meta) => {
             use std::os::fd::AsFd;
             if meta.len >= MAP_LEN as u64
-                && let Some(map) = args.map(&file)
+                && let Some(map) = args.map(&file, meta.len)
                 && resident(&map)
             {
                 update(&mut hasher, &map);
@@ -711,7 +707,9 @@ fn hash_path(args: &Args, path: &Path, stdin_ctx: &StdinContext) -> err::Result<
                 if !reached_eof {
                     update_from(&mut hasher, file)?;
                 }
-            } else if let Some(map) = mapped(args, &file) {
+            } else if fd_meta.is_file()
+                && let Some(map) = mapped(args, &file, fd_meta.len)
+            {
                 update(&mut hasher, &map);
                 hold(map);
             } else {
@@ -761,12 +759,11 @@ pub(crate) fn set_hold_budget_remaining_for_test(remaining_pages: u64) {
 #[cfg(test)]
 pub(crate) static MAPPED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-fn mapped(args: &Args, file: &File) -> Option<mmap::Mmap> {
-    let len = usize::try_from(file.metadata().ok()?.len()).ok()?;
-    if len < MAP_LEN {
+fn mapped(args: &Args, file: &File, len: u64) -> Option<mmap::Mmap> {
+    if len < MAP_LEN as u64 {
         return None;
     }
-    let map = args.map(file)?;
+    let map = args.map(file, len)?;
     if cfg!(target_os = "linux") {
         return Some(map);
     }
@@ -774,9 +771,12 @@ fn mapped(args: &Args, file: &File) -> Option<mmap::Mmap> {
 }
 
 pub(crate) fn resident(map: &mmap::Mmap) -> bool {
+    if map.is_empty() {
+        return false;
+    }
     let mut vec = 0u8;
-    // Sound: one page of the map (a map is at least one byte here, the
-    // callers') and one byte for the answer.
+    // Sound: `map` is non-empty (at least one mapped page) and `vec` is a valid
+    // 1-byte output buffer; `mincore` queries residency without dereferencing.
     let rc = unsafe { libc::mincore(map.as_ptr() as *mut libc::c_void, 1, (&mut vec as *mut u8).cast()) };
     rc == 0 && vec & 1 == 1
 }
@@ -1537,6 +1537,37 @@ const OUTBOARD_WRITERS: usize = 2;
 /// written to DIR/<hash>.obao4 (outboard.rs).
 ///
 /// The files are shared out among threads started once for the run, each
+/// Record one operand failure, flush buffered stdout before writing the
+/// diagnostic to stderr, and return `false` if stdout is now poisoned (caller
+/// must stop). Shared by every operand driver.
+fn report_failure(path: &Path, err: impl core::fmt::Display, out: &mut OutBuf, failed: &mut u64) -> bool {
+    *failed = failed.saturating_add(1);
+    let _ = out.flush();
+    eprintln_safe!("{}: {}: {}", NAME, path.to_string_lossy(), err);
+    !out.is_poisoned()
+}
+
+fn run_outboard_sequential(args: &Args, dir: &Path, stdin_ctx: &StdinContext, in_a_file: Option<usize>, out: &mut OutBuf) -> u64 {
+    let mut rooms = outboard::Rooms::new();
+    let mut nodes = Vec::new();
+    let mut failed = 0u64;
+    for path in &args.file_args {
+        nodes.clear();
+        let res = outboard_of(args, path, stdin_ctx, in_a_file, &mut rooms, &mut nodes).and_then(|hash| {
+            if !nodes.is_empty() {
+                outboard::write_in(dir, &hash, &nodes)?;
+            }
+            print_hash_output(hash, path, args, out)
+        });
+        if let Err(e) = res
+            && !report_failure(path, e, out, &mut failed)
+        {
+            break;
+        }
+    }
+    failed
+}
+
 /// with rooms of its own for a file's bytes and chaining values; where
 /// there are fewer files than threads, each file takes several. A thread
 /// hands each non-empty outboard to the writers and takes the next file.
@@ -1561,53 +1592,13 @@ fn outboard_inputs(args: &Args, dir: &Path, stdin_ctx: &StdinContext, out: &mut 
     // operands sequentially and emit each line immediately without eager
     // thread discovery (only large files query `threads()` inside `outboard_of`).
     if paths.len() <= 1 || out.is_line_flushed() || stdin_named_twice(paths, stdin_ctx) {
-        let mut rooms = outboard::Rooms::new();
-        let mut nodes = Vec::new();
-        let mut failed = 0u64;
-        for path in paths {
-            nodes.clear();
-            let res = outboard_of(args, path, stdin_ctx, None, &mut rooms, &mut nodes).and_then(|hash| {
-                if !nodes.is_empty() {
-                    outboard::write_in(dir, &hash, &nodes)?;
-                }
-                print_hash_output(hash, path, args, out)
-            });
-            if let Err(e) = res {
-                failed = failed.saturating_add(1);
-                let _ = out.flush();
-                eprintln_safe!("{}: {}: {}", NAME, path.to_string_lossy(), e);
-                if out.is_poisoned() {
-                    break;
-                }
-            }
-        }
-        return failed;
+        return run_outboard_sequential(args, dir, stdin_ctx, None, out);
     }
     let total = threads().get();
     let max_workers = if args.num_threads().is_some() { max_file_threads(total) } else { total };
     let workers = max_workers.min(paths.len());
     if workers <= 1 {
-        let mut rooms = outboard::Rooms::new();
-        let mut nodes = Vec::new();
-        let mut failed = 0u64;
-        for path in paths {
-            nodes.clear();
-            let res = outboard_of(args, path, stdin_ctx, Some(1), &mut rooms, &mut nodes).and_then(|hash| {
-                if !nodes.is_empty() {
-                    outboard::write_in(dir, &hash, &nodes)?;
-                }
-                print_hash_output(hash, path, args, out)
-            });
-            if let Err(e) = res {
-                failed = failed.saturating_add(1);
-                let _ = out.flush();
-                eprintln_safe!("{}: {}: {}", NAME, path.to_string_lossy(), e);
-                if out.is_poisoned() {
-                    break;
-                }
-            }
-        }
-        return failed;
+        return run_outboard_sequential(args, dir, stdin_ctx, Some(1), out);
     }
     let in_a_file = (total / workers).max(1);
     let next = AtomicUsize::new(0);
@@ -1683,15 +1674,10 @@ fn outboard_inputs(args: &Args, dir: &Path, stdin_ctx: &StdinContext, out: &mut 
         let mut collector = OrderedCollector::new(paths.len());
         let mut on_ordered = |idx: usize, res: err::Result<blake3::Hash>| -> bool {
             let path = &paths[idx];
-            if let Err(e) = res.and_then(|hash| print_hash_output(hash, path, args, out)) {
-                failed = failed.saturating_add(1);
-                let _ = out.flush();
-                eprintln_safe!("{}: {}: {}", NAME, path.to_string_lossy(), e);
-                if out.is_poisoned() {
-                    return false;
-                }
+            match res.and_then(|hash| print_hash_output(hash, path, args, out)) {
+                Ok(()) => true,
+                Err(e) => report_failure(path, e, out, &mut failed),
             }
-            true
         };
         while let Ok((i, res)) = done_rx.recv() {
             if !collector.insert_and_drain(i, res, &mut on_ordered, || {
@@ -1733,7 +1719,7 @@ fn outboard_of(
         OpenedInput::DarwinRegularDevFd(file, meta) => {
             use std::os::fd::AsFd;
             if meta.len >= MAP_LEN as u64
-                && let Some(map) = args.map(&file)
+                && let Some(map) = args.map(&file, meta.len)
             {
                 let hash = outboard::outboard(mode, &map, resolve_threads(), &mut rooms.cvs, nodes);
                 hold(map);
@@ -1767,13 +1753,25 @@ fn outboard_of(
     if fd_meta.is_file()
         && fd_meta.len > 0
         && !skip_map_after_change
-        && let Some(map) = args.map(&file)
+        && let Some(map) = args.map(&file, fd_meta.len)
     {
         let hash = outboard::outboard(mode, &map, resolve_threads(), &mut rooms.cvs, nodes);
         hold(map);
         return Ok(hash);
     }
     Ok(outboard::outboard_from_reader(mode, &mut file, &mut rooms.cvs, nodes)?)
+}
+
+fn run_xof_sequential(args: &Args, stdin_ctx: &StdinContext, out: &mut OutBuf) -> u64 {
+    let mut failed = 0u64;
+    for path in &args.file_args {
+        if let Err(e) = hash_path(args, path, stdin_ctx).and_then(|output| print_output(output, path, args, out))
+            && !report_failure(path, e, out, &mut failed)
+        {
+            break;
+        }
+    }
+    failed
 }
 
 fn hash_inputs(args: &Args, stdin_ctx: &StdinContext, out: &mut OutBuf) -> u64 {
@@ -1784,7 +1782,7 @@ fn hash_inputs(args: &Args, stdin_ctx: &StdinContext, out: &mut OutBuf) -> u64 {
         // Interactive terminal output: hash and flush each operand in order
         // before opening the next so a later blocking FIFO/stream never holds
         // back earlier ready hashes (while each large file still uses all
-        // hashing threads). Redirected runs stay on the batched pipelines (#465).
+        // hashing threads). Redirected runs stay on the batched pipelines (BLAKE3 #465).
         let mut failed = 0u64;
         for path in &args.file_args {
             let res = if args.is_standard_32() {
@@ -1792,13 +1790,10 @@ fn hash_inputs(args: &Args, stdin_ctx: &StdinContext, out: &mut OutBuf) -> u64 {
             } else {
                 hash_path(args, path, stdin_ctx).and_then(|o| print_output(o, path, args, out))
             };
-            if let Err(e) = res {
-                failed = failed.saturating_add(1);
-                let _ = out.flush();
-                eprintln_safe!("{}: {}: {}", NAME, path.to_string_lossy(), e);
-                if out.is_poisoned() {
-                    break;
-                }
+            if let Err(e) = res
+                && !report_failure(path, e, out, &mut failed)
+            {
+                break;
             }
         }
         return failed;
@@ -1807,15 +1802,10 @@ fn hash_inputs(args: &Args, stdin_ctx: &StdinContext, out: &mut OutBuf) -> u64 {
         let mut failed = 0u64;
         hash_paths_32(args, &args.file_args, stdin_ctx, None, &mut |idx, res| {
             let path = &args.file_args[idx];
-            if let Err(e) = res.and_then(|h| print_hash_output(h, path, args, out)) {
-                failed = failed.saturating_add(1);
-                let _ = out.flush();
-                eprintln_safe!("{}: {}: {}", NAME, path.to_string_lossy(), e);
-                if out.is_poisoned() {
-                    return false;
-                }
+            match res.and_then(|h| print_hash_output(h, path, args, out)) {
+                Ok(()) => true,
+                Err(e) => report_failure(path, e, out, &mut failed),
             }
-            true
         });
         return failed;
     }
@@ -1823,53 +1813,27 @@ fn hash_inputs(args: &Args, stdin_ctx: &StdinContext, out: &mut OutBuf) -> u64 {
     // Single operand or repeated stdin aliases: stream directly without
     // triggering thread discovery or NUMA confinement for small files.
     if args.file_args.len() <= 1 || stdin_named_twice(&args.file_args, stdin_ctx) {
-        let mut failed = 0u64;
-        for path in &args.file_args {
-            if let Err(e) = hash_path(args, path, stdin_ctx).and_then(|output| print_output(output, path, args, out)) {
-                failed = failed.saturating_add(1);
-                let _ = out.flush();
-                eprintln_safe!("{}: {}: {}", NAME, path.to_string_lossy(), e);
-                if out.is_poisoned() {
-                    break;
-                }
-            }
-        }
-        return failed;
+        return run_xof_sequential(args, stdin_ctx, out);
     }
 
     let total = threads().get();
     let max_workers = if args.num_threads().is_some() { max_file_threads(total) } else { total };
     let worker_threads = max_workers.min(args.file_args.len());
     let _file_threads_guard = args.num_threads().map(|_| FileThreadsGuard::enter(worker_threads));
-    let mut failed = 0u64;
     if worker_threads <= 1 {
-        for path in &args.file_args {
-            if let Err(e) = hash_path(args, path, stdin_ctx).and_then(|output| print_output(output, path, args, out)) {
-                failed = failed.saturating_add(1);
-                let _ = out.flush();
-                eprintln_safe!("{}: {}: {}", NAME, path.to_string_lossy(), e);
-                if out.is_poisoned() {
-                    break;
-                }
-            }
-        }
-        return failed;
+        return run_xof_sequential(args, stdin_ctx, out);
     }
+    let mut failed = 0u64;
     run_ordered_collector(
         args.file_args.len(),
         worker_threads,
         |i| hash_path(args, &args.file_args[i], stdin_ctx),
         |idx, res| {
             let path = &args.file_args[idx];
-            if let Err(e) = res.and_then(|output| print_output(output, path, args, out)) {
-                failed = failed.saturating_add(1);
-                let _ = out.flush();
-                eprintln_safe!("{}: {}: {}", NAME, path.to_string_lossy(), e);
-                if out.is_poisoned() {
-                    return false;
-                }
+            match res.and_then(|output| print_output(output, path, args, out)) {
+                Ok(()) => true,
+                Err(e) => report_failure(path, e, out, &mut failed),
             }
-            true
         },
     );
     failed

@@ -387,7 +387,7 @@ impl Uring {
         self.unsubmitted = 0;
 
         let need_getevents = min_complete > 0 || (self.ring_flags & IORING_SETUP_DEFER_TASKRUN) != 0;
-        if to_submit == 0 && min_complete == 0 && !need_getevents {
+        if to_submit == 0 && !need_getevents {
             return;
         }
         let enter_flags = if need_getevents { IORING_ENTER_GETEVENTS } else { 0 };
@@ -464,8 +464,7 @@ pub(crate) fn run_submit_loop(
 }
 
 /// Reconcile remaining SQEs after a non-negative `io_uring_enter` return,
-/// rejecting contradictory over-counts and unexplained zero-progress loops
-///.
+/// rejecting contradictory over-counts and unexplained zero-progress loops.
 pub(crate) fn reconcile_submit_progress(
     to_submit: u32,
     submitted: u32,

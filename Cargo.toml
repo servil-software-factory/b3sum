@@ -16,9 +16,7 @@ path = "src/main.rs"
 
 [dependencies]
 blake3 = { git = "https://github.com/servil-software-factory/BLAKE3", rev = "d332acb52bd38ed2f758087efca2e5d520db7c2d", package = "blake3-servil" }
-
 # Unix syscalls: memory-mapped reads, direct I/O, io_uring, signals, fstat.
-[target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
 # A panic stops the process at once (crash-only): nothing unwinds past a

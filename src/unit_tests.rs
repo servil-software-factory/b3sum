@@ -670,8 +670,9 @@ fn sigbus_exits_promptly_with_full_undrained_stderr_pipe_and_writes_when_writabl
     assert!(err_text.starts_with("EXISTING_LOG_PREFIX\n"), "fatal diagnostic must not overwrite existing log prefix, got {err_text:?}");
     assert!(err_text.contains("bus error while reading a mapped file"), "expected SIGBUS diagnostic appended to regular-file stderr, got {err_text:?}");
 
-    // On Linux (when `/proc/self/fd/2` is reopenable for writing), a writable
-    // pipe also receives the explanation via independent `O_NONBLOCK`.
+    // On Linux (when `/proc/self/fd/2` is reopenable for writing), both a
+    // writable pipe and an interactive PTY receive the explanation via
+    // independent `O_NONBLOCK`.
     #[cfg(target_os = "linux")]
     if std::fs::OpenOptions::new().write(true).open("/proc/self/fd/2").is_ok() {
         let output = std::process::Command::new(std::env::current_exe().unwrap())
@@ -685,10 +686,46 @@ fn sigbus_exits_promptly_with_full_undrained_stderr_pipe_and_writes_when_writabl
             "expected SIGBUS diagnostic on writable Linux pipe, got {:?}",
             String::from_utf8_lossy(&output.stderr)
         );
+
+        // PTY subcase: interactive Linux terminal (`S_IFCHR`) receives SIGBUS explanation.
+        use std::io::Read as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let (mut master, slave_path) = unsafe {
+            let mfd = libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY);
+            assert!(mfd >= 0);
+            assert_eq!(libc::grantpt(mfd), 0);
+            assert_eq!(libc::unlockpt(mfd), 0);
+            let name = libc::ptsname(mfd);
+            assert!(!name.is_null());
+            let path = std::ffi::CStr::from_ptr(name).to_str().unwrap().to_owned();
+            (std::fs::File::from_raw_fd(mfd), path)
+        };
+        let slave = std::fs::OpenOptions::new().read(true).write(true).custom_flags(libc::O_NOCTTY).open(&slave_path).unwrap();
+        let pty_status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "unit_tests::sigbus_exits_promptly_with_full_undrained_stderr_pipe_and_writes_when_writable", "--nocapture"])
+            .env(CHILD, "1")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::from(slave))
+            .status()
+            .unwrap();
+        assert_eq!(pty_status.code(), Some(1), "expected exit 1 on SIGBUS PTY, got {pty_status:?}");
+        let mut pty_text = Vec::new();
+        let mut tmp = [0u8; 512];
+        loop {
+            match master.read(&mut tmp) {
+                Ok(0) => break,
+                Ok(n) => pty_text.extend_from_slice(&tmp[..n]),
+                Err(e) if e.raw_os_error() == Some(libc::EIO) => break,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => panic!("PTY read error: {e}"),
+            }
+        }
+        let pty_str = String::from_utf8_lossy(&pty_text);
+        assert!(pty_str.contains("bus error while reading a mapped file"), "expected SIGBUS diagnostic on Linux PTY, got {pty_str:?}");
     }
 
     // Subcase B: completely stuffed, undrained stderr pipe whose reader stays
-    // open must still exit 1 promptly (bounded 2s deadline so regressions fail fast).
+    // open must still exit 1 promptly (bounded 8s deadline so regressions fail fast).
     let mut ends = [0i32; 2];
     assert_eq!(unsafe { libc::pipe(ends.as_mut_ptr()) }, 0);
     let flags = unsafe { libc::fcntl(ends[1], libc::F_GETFL) };

@@ -177,7 +177,7 @@ What happens when a file changes during the run:
 | The file... | Read (including `--no-mmap` and `O_DIRECT`) | Mapped (`mmap`) |
 |---|---|---|
 | grows at its end | the added bytes are hashed if they arrive before `b3sum` reaches EOF | the added bytes are not hashed (mapped length is fixed at open) |
-| is cut short | if `b3sum` had already read past the new end (or across parallel `O_DIRECT` regions), it prints the hash of the bytes it read: a file that never existed | `b3sum` stops with `SIGBUS` and prints no hash, unless the cut falls inside the file's last memory page (4 KiB on most x86-64/Linux hosts, 16 KiB on Apple Silicon): then the missing bytes read as zeros, and it prints the hash of a file that never existed |
+| is cut short | if `b3sum` had already read past the new end (or across parallel `O_DIRECT` regions), it prints the hash of the bytes it read: a file that never existed | `b3sum` catches `SIGBUS`, writes a best-effort explanation to stderr (files, sockets, and on Linux pipes/terminals), and exits with status 1 without printing a hash, unless the cut falls inside the file's last memory page (4 KiB on most x86-64/Linux hosts, 16 KiB on Apple Silicon): then the missing bytes read as zeros, and it prints the hash of a file that never existed |
 | is overwritten in place | old bytes and new bytes may be mixed (and parallel `O_DIRECT` readers can visit different regions concurrently) | old bytes and new bytes may be mixed (and external writes into a live shared mapping violate `&[u8]` immutability) |
 
 **Why `b3sum` does not try to detect concurrent modification automatically:**
