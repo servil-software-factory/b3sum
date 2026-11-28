@@ -1248,7 +1248,7 @@ fn run_hybrid_worker(
         // 3. Large files `>= 512 KiB`: check `resident(&map)` BEFORE creating any `Uring`!
         warm_batch.flush(args.mode, &mut sink);
         let mut mapped_cold = false;
-        if let Some(map) = args.map(&file) {
+        if let Some(map) = args.map(&file, size) {
             if !force_miss() && crate::resident(&map) {
                 if size < COLD_RING_MAX_FILE {
                     let h = crate::hash_slice_32(args.mode, &map);
@@ -1272,7 +1272,7 @@ fn run_hybrid_worker(
                 continue;
             }
 
-            // Cold `512 KiB.. 4 MiB`: queue into `ColdRingState` sliding window if possible!
+            // Cold `512 KiB..4 MiB`: queue into `ColdRingState` sliding window if possible!
             if size < COLD_RING_MAX_FILE {
                 drop(map);
                 if let Some(c) = cold.get_or_init(max_slots) {
@@ -2199,7 +2199,8 @@ mod test {
         let mut sink = super::Sink { done: &mut done, open: true };
         for (idx, p) in paths.iter().enumerate() {
             let file = std::fs::File::open(p).unwrap();
-            let map = args.map(&file).expect("mmap warm 4 MiB file");
+            let len = file.metadata().unwrap().len();
+            let map = args.map(&file, len).expect("mmap warm 4 MiB file");
             drop(file);
             wp.submit_owned(idx, map.len() as u64, map, &mut sink);
         }
@@ -2226,7 +2227,7 @@ mod test {
         };
         let mut sink2 = super::Sink { done: &mut done2, open: true };
         let file = std::fs::File::open(&probe_path).unwrap();
-        let map = args.map(&file).expect("mmap probe file");
+        let map = args.map(&file, probe_buf.len() as u64).expect("mmap probe file");
         drop(file);
         wp2.submit_owned(0, map.len() as u64, map, &mut sink2);
         wp2.finish(&mut sink2);

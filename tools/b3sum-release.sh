@@ -116,7 +116,7 @@ if [ -n "$version" ]; then
 	python3 "$build/source/tools/release_artifacts.py" "v$version" "$staged_bin" --commit "$commit"
 fi
 # The binary checks itself against BLAKE3's published digest of nothing,
-# then both.sha256 and.b3 are written independently of the binary under
+# then both .sha256 and .b3 are written independently of the binary under
 # check (tools/blake3_ref.py from the clone) and cross-checked against it.
 test "$(printf '' | "$staged_bin" --no-names)" = af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262
 (cd "$stage" && { sha256sum "$name" 2>/dev/null || shasum -a 256 "$name"; } > "$name.sha256")

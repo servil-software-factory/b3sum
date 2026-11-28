@@ -505,7 +505,7 @@ class Published(Repository):
         self.assertTrue(all(line.startswith("clean      ") for line in lines), lines)
 
     def test_a_digest_file_of_other_bytes_or_of_nothing_here_or_of_another_kind_fails(self):
-        # BLAKE3 #439, #446: both.sha256 and.b3 digest files are held to their artifacts.
+        # BLAKE3 #439, #446: both .sha256 and .b3 digest files are held to their artifacts.
         program = f"b3sum-{self.tag}-x86_64-unknown-linux-gnu"
         bad_sha = f"{hashlib.sha256(b'another program').hexdigest()}  {program}\n".encode()
         bad_b3 = f"{ra.blake3_ref.blake3_hex(b'another program')}  {program}\n".encode()
@@ -1162,7 +1162,7 @@ class StandaloneB3sum(unittest.TestCase):
             with open(os.path.join(tmp, ".cargo", "config.toml"), "w", encoding="utf-8") as f:
                 f.write('[build]\nrustc = "/nonexistent/poison-rustc"\n')
 
-            # Positive run #1: packages clean reproducible.crate +.sha256 +.b3 and self-verifies.
+            # Positive run #1: packages clean reproducible .crate + .sha256 + .b3 and self-verifies.
             ok1 = subprocess.run(["sh", "tools/crates-release.sh", "--no-verify"], cwd=tmp, capture_output=True, text=True)
             self.assertEqual(ok1.returncode, 0, ok1.stdout + ok1.stderr)
             crate_name = f"b3sums-{version}.crate"

@@ -471,7 +471,7 @@ def _test_item_spans(code):
                 rest_pos += 1
             # Any `const` item (`const NAME:`, `const r#match:`, `const Δ:`,
             # `const _:`) ends at `;`; `const fn` / `const unsafe` / `const
-            # extern` are brace-terminated items; inline `const {... }` is an
+            # extern` are brace-terminated items; inline `const { ... }` is an
             # expression (so inside arrays/tuples/calls it stops at top-level `,`).
             is_const_block = rest_pos < n and code[rest_pos] == "{"
             if is_const_block:
@@ -555,7 +555,7 @@ def _test_item_spans(code):
                         seen_top_brace = False
                         j = m_else.end()
                         continue
-                    # For inline `const {... }` block expressions, keep
+                    # For inline `const { ... }` block expressions, keep
                     # scanning if followed by a postfix continuation (`.foo`,
                     # `?`, NOT a `..` range expression starting the next
                     # statement) or consume a trailing `;` or `,` (even on the

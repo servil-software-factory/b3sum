@@ -529,7 +529,7 @@ pub(crate) mod test {
         ),
     ];
 
-    /// Non-uniform key `[0x00, 0x01,..., 0x1f]` golden from `bao-tree 0.17.0`
+    /// Non-uniform key `[0x00, 0x01, ..., 0x1f]` golden from `bao-tree 0.17.0`
     /// at `5 * GROUP + 1` (81,921 bytes, ragged multi-group tree) so both byte
     /// and word ordering in keyed mode are pinned independently.
     const BAO_TREE_0_17_0_NONUNIFORM_KEY: (usize, &str, usize, &str) = (

@@ -104,7 +104,7 @@ class Reasons(unittest.TestCase):
         self.assertEqual([n for n, _ in ur.debug_assert_without_reason(split_bang)], [2])
 
     def test_cfg_test_skipping_preserves_adjacent_shipped_code_and_cfg_attr(self):
-        # Closure braces inside parens (`#[cfg(test)] NOTED.with(|n| {... });`)
+        # Closure braces inside parens (`#[cfg(test)] NOTED.with(|n| { ... });`)
         # must stop at `;` and never hide following shipped code (lanes.rs).
         closure_stmt = (
             "fn noted() {\n"
@@ -378,7 +378,7 @@ class Reasons(unittest.TestCase):
             "pub fn read(p: &u8) -> u8 { unsafe { *p } }\n"
         )
         self.assertEqual(ur.without_reason(doc_after_block), [])
-        # Inline `#[cfg(test)] const {... }` block statement ends at `}` (no
+        # Inline `#[cfg(test)] const { ... }` block statement ends at `}` (no
         # semicolon required) and must NEVER swallow the next shipped statement.
         inline_const_block = (
             "fn f(p: *const u8) -> u8 {\n"
@@ -438,7 +438,7 @@ class Reasons(unittest.TestCase):
         )
         self.assertEqual([n for n, _ in ur.without_reason(const_block_bare_range)], [3])
         # Nested generics ending with `>>>` on a test-only generic parameter
-        # (`fn bounded<#[cfg(test)] T: Into<Vec<u8>>>() {... }`) must stop
+        # (`fn bounded<#[cfg(test)] T: Into<Vec<u8>>>() { ... }`) must stop
         # before the enclosing `>` and still check the shipped function body.
         nested_generic_param = (
             "pub fn bounded<#[cfg(test)] T: Into<Vec<u8>>>(p: &u8) -> u8 {\n"
@@ -504,7 +504,7 @@ class Reasons(unittest.TestCase):
         self.assertEqual(ur.without_reason(multiline), [])
         self.assertEqual(ur.debug_assert_without_reason(multiline), [])
 
-        # Inline `#[cfg(test)] const {... }` inside an array/tuple with postfix
+        # Inline `#[cfg(test)] const { ... }` inside an array/tuple with postfix
         # `.wrapping_add(2),` must stop at `,` (never masking the next shipped
         # element), a plain `const { 1u8 }, // Sound:` must mask its trailing
         # comment, and Pattern_White_Space (`\u200E`) between `const` and `{`
